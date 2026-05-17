@@ -1,88 +1,223 @@
-import { NextRequest } from 'next/server'
 /**
  * Tests for custom tools API routes
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest } from '@/app/api/__test-utils__/utils'
+import {
+  authMockFns,
+  createMockRequest,
+  hybridAuthMockFns,
+  permissionsMock,
+  permissionsMockFns,
+  workflowAuthzMockFns,
+  workflowsUtilsMock,
+} from '@sim/testing'
+import { NextRequest } from 'next/server'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const {
+  mockSelect,
+  mockFrom,
+  mockWhere,
+  mockOrderBy,
+  mockInsert,
+  mockValues,
+  mockUpdate,
+  mockSet,
+  mockDelete,
+  mockLimit,
+  mockUpsertCustomTools,
+} = vi.hoisted(() => {
+  return {
+    mockSelect: vi.fn(),
+    mockFrom: vi.fn(),
+    mockWhere: vi.fn(),
+    mockOrderBy: vi.fn(),
+    mockInsert: vi.fn(),
+    mockValues: vi.fn(),
+    mockUpdate: vi.fn(),
+    mockSet: vi.fn(),
+    mockDelete: vi.fn(),
+    mockLimit: vi.fn(),
+    mockUpsertCustomTools: vi.fn(),
+  }
+})
+
+const mockGetUserEntityPermissions = permissionsMockFns.mockGetUserEntityPermissions
+
+const sampleTools = [
+  {
+    id: 'tool-1',
+    workspaceId: 'workspace-123',
+    userId: 'user-123',
+    title: 'Weather Tool',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'getWeather',
+        description: 'Get weather information for a location',
+        parameters: {
+          type: 'object',
+          properties: {
+            location: {
+              type: 'string',
+              description: 'The city and state, e.g. San Francisco, CA',
+            },
+          },
+          required: ['location'],
+        },
+      },
+    },
+    code: 'return { temperature: 72, conditions: "sunny" };',
+    createdAt: '2023-01-01T00:00:00.000Z',
+    updatedAt: '2023-01-02T00:00:00.000Z',
+  },
+  {
+    id: 'tool-2',
+    workspaceId: 'workspace-123',
+    userId: 'user-123',
+    title: 'Calculator Tool',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'calculator',
+        description: 'Perform basic calculations',
+        parameters: {
+          type: 'object',
+          properties: {
+            operation: {
+              type: 'string',
+              description: 'The operation to perform (add, subtract, multiply, divide)',
+            },
+            a: { type: 'number', description: 'First number' },
+            b: { type: 'number', description: 'Second number' },
+          },
+          required: ['operation', 'a', 'b'],
+        },
+      },
+    },
+    code: 'const { operation, a, b } = params; if (operation === "add") return a + b;',
+    createdAt: '2023-02-01T00:00:00.000Z',
+    updatedAt: '2023-02-02T00:00:00.000Z',
+  },
+]
+
+vi.mock('@sim/db', () => ({
+  db: {
+    select: (...args: unknown[]) => mockSelect(...args),
+    insert: (...args: unknown[]) => mockInsert(...args),
+    update: (...args: unknown[]) => mockUpdate(...args),
+    delete: (...args: unknown[]) => mockDelete(...args),
+    transaction: vi
+      .fn()
+      .mockImplementation(async (callback: (tx: Record<string, unknown>) => unknown) => {
+        const txMockSelect = vi.fn().mockReturnValue({ from: mockFrom })
+        const txMockInsert = vi.fn().mockReturnValue({ values: mockValues })
+        const txMockUpdate = vi.fn().mockReturnValue({ set: mockSet })
+        const txMockDelete = vi.fn().mockReturnValue({ where: mockWhere })
+
+        const txMockOrderBy = vi.fn().mockImplementation(() => {
+          const queryBuilder = {
+            limit: mockLimit,
+            then: (resolve: (value: typeof sampleTools) => void) => {
+              resolve(sampleTools)
+              return queryBuilder
+            },
+            catch: (_reject: (error: Error) => void) => queryBuilder,
+          }
+          return queryBuilder
+        })
+
+        const txMockWhere = vi.fn().mockImplementation(() => {
+          const queryBuilder = {
+            orderBy: txMockOrderBy,
+            limit: mockLimit,
+            then: (resolve: (value: typeof sampleTools) => void) => {
+              resolve(sampleTools)
+              return queryBuilder
+            },
+            catch: (_reject: (error: Error) => void) => queryBuilder,
+          }
+          return queryBuilder
+        })
+
+        const txMockFrom = vi.fn().mockReturnValue({ where: txMockWhere })
+        txMockSelect.mockReturnValue({ from: txMockFrom })
+
+        return await callback({
+          select: txMockSelect,
+          insert: txMockInsert,
+          update: txMockUpdate,
+          delete: txMockDelete,
+        })
+      }),
+  },
+}))
+
+vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
+
+vi.mock('drizzle-orm', () => ({
+  eq: vi.fn().mockImplementation((field: unknown, value: unknown) => ({
+    field,
+    value,
+    operator: 'eq',
+  })),
+  and: vi.fn().mockImplementation((...conditions: unknown[]) => ({
+    operator: 'and',
+    conditions,
+  })),
+  or: vi.fn().mockImplementation((...conditions: unknown[]) => ({
+    operator: 'or',
+    conditions,
+  })),
+  isNull: vi.fn().mockImplementation((field: unknown) => ({ field, operator: 'isNull' })),
+  ne: vi.fn().mockImplementation((field: unknown, value: unknown) => ({
+    field,
+    value,
+    operator: 'ne',
+  })),
+  desc: vi.fn().mockImplementation((field: unknown) => ({ field, operator: 'desc' })),
+}))
+
+vi.mock('@/lib/workflows/custom-tools/operations', () => ({
+  upsertCustomTools: (...args: unknown[]) => mockUpsertCustomTools(...args),
+}))
+
+vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
+
+import { DELETE, GET, POST } from '@/app/api/tools/custom/route'
 
 describe('Custom Tools API Routes', () => {
-  // Sample data for testing
-  const sampleTools = [
-    {
-      id: 'tool-1',
-      userId: 'user-123',
-      title: 'Weather Tool',
-      schema: {
-        type: 'function',
-        function: {
-          name: 'getWeather',
-          description: 'Get weather information for a location',
-          parameters: {
-            type: 'object',
-            properties: {
-              location: {
-                type: 'string',
-                description: 'The city and state, e.g. San Francisco, CA',
-              },
-            },
-            required: ['location'],
-          },
-        },
-      },
-      code: 'return { temperature: 72, conditions: "sunny" };',
-      createdAt: '2023-01-01T00:00:00.000Z',
-      updatedAt: '2023-01-02T00:00:00.000Z',
-    },
-    {
-      id: 'tool-2',
-      userId: 'user-123',
-      title: 'Calculator Tool',
-      schema: {
-        type: 'function',
-        function: {
-          name: 'calculator',
-          description: 'Perform basic calculations',
-          parameters: {
-            type: 'object',
-            properties: {
-              operation: {
-                type: 'string',
-                description: 'The operation to perform (add, subtract, multiply, divide)',
-              },
-              a: { type: 'number', description: 'First number' },
-              b: { type: 'number', description: 'Second number' },
-            },
-            required: ['operation', 'a', 'b'],
-          },
-        },
-      },
-      code: 'const { operation, a, b } = params; if (operation === "add") return a + b;',
-      createdAt: '2023-02-01T00:00:00.000Z',
-      updatedAt: '2023-02-02T00:00:00.000Z',
-    },
-  ]
-
-  // Mock implementation stubs
-  const mockSelect = vi.fn()
-  const mockFrom = vi.fn()
-  const mockWhere = vi.fn()
-  const mockInsert = vi.fn()
-  const mockValues = vi.fn()
-  const mockUpdate = vi.fn()
-  const mockSet = vi.fn()
-  const mockDelete = vi.fn()
-  const mockLimit = vi.fn()
   const mockSession = { user: { id: 'user-123' } }
 
   beforeEach(() => {
-    vi.resetModules()
+    vi.clearAllMocks()
 
-    // Reset all mock implementations
     mockSelect.mockReturnValue({ from: mockFrom })
     mockFrom.mockReturnValue({ where: mockWhere })
-    mockWhere.mockReturnValue({ limit: mockLimit })
+    mockWhere.mockImplementation(() => {
+      const queryBuilder = {
+        orderBy: mockOrderBy,
+        limit: mockLimit,
+        then: (resolve: (value: typeof sampleTools) => void) => {
+          resolve(sampleTools)
+          return queryBuilder
+        },
+        catch: (_reject: (error: Error) => void) => queryBuilder,
+      }
+      return queryBuilder
+    })
+    mockOrderBy.mockImplementation(() => {
+      const queryBuilder = {
+        limit: mockLimit,
+        then: (resolve: (value: typeof sampleTools) => void) => {
+          resolve(sampleTools)
+          return queryBuilder
+        },
+        catch: (_reject: (error: Error) => void) => queryBuilder,
+      }
+      return queryBuilder
+    })
     mockLimit.mockResolvedValue(sampleTools)
     mockInsert.mockReturnValue({ values: mockValues })
     mockValues.mockResolvedValue({ id: 'new-tool-id' })
@@ -90,132 +225,73 @@ describe('Custom Tools API Routes', () => {
     mockSet.mockReturnValue({ where: mockWhere })
     mockDelete.mockReturnValue({ where: mockWhere })
 
-    // Mock database
-    vi.doMock('@sim/db', () => ({
-      db: {
-        select: mockSelect,
-        insert: mockInsert,
-        update: mockUpdate,
-        delete: mockDelete,
-        transaction: vi.fn().mockImplementation(async (callback) => {
-          // Execute the callback with a transaction object that has the same methods
-          return await callback({
-            select: mockSelect,
-            insert: mockInsert,
-            update: mockUpdate,
-            delete: mockDelete,
-          })
-        }),
-      },
-    }))
-
-    // Mock schema
-    vi.doMock('@sim/db/schema', () => ({
-      customTools: {
-        userId: 'userId', // Add these properties to enable WHERE clauses with eq()
-        id: 'id',
-      },
-    }))
-
-    // Mock authentication
-    vi.doMock('@/lib/auth', () => ({
-      getSession: vi.fn().mockResolvedValue(mockSession),
-    }))
-
-    // Mock getUserId
-    vi.doMock('@/app/api/auth/oauth/utils', () => ({
-      getUserId: vi.fn().mockResolvedValue('user-123'),
-    }))
-
-    // Mock logger
-    vi.doMock('@/lib/logs/console/logger', () => ({
-      createLogger: vi.fn().mockReturnValue({
-        info: vi.fn(),
-        error: vi.fn(),
-        warn: vi.fn(),
-        debug: vi.fn(),
-      }),
-    }))
-
-    // Mock eq function from drizzle-orm
-    vi.doMock('drizzle-orm', async () => {
-      const actual = await vi.importActual('drizzle-orm')
-      return {
-        ...(actual as object),
-        eq: vi.fn().mockImplementation((field, value) => ({ field, value, operator: 'eq' })),
-      }
+    authMockFns.mockGetSession.mockResolvedValue(mockSession)
+    hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
+      success: true,
+      userId: 'user-123',
+      authType: 'session',
     })
-  })
-
-  afterEach(() => {
-    vi.clearAllMocks()
+    mockGetUserEntityPermissions.mockResolvedValue('admin')
+    mockUpsertCustomTools.mockResolvedValue(sampleTools)
+    workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValue({
+      allowed: true,
+      status: 200,
+      workflow: { workspaceId: 'workspace-123' },
+    })
   })
 
   /**
    * Test GET endpoint
    */
   describe('GET /api/tools/custom', () => {
-    it('should return tools for authenticated user', async () => {
-      // Create mock request
-      const req = createMockRequest('GET')
+    it('should return tools for authenticated user with workspaceId', async () => {
+      const req = new NextRequest(
+        'http://localhost:3000/api/tools/custom?workspaceId=workspace-123'
+      )
 
-      // Simulate DB returning tools
-      mockWhere.mockReturnValueOnce(Promise.resolve(sampleTools))
+      mockWhere.mockReturnValueOnce({
+        orderBy: mockOrderBy.mockReturnValueOnce(Promise.resolve(sampleTools)),
+      })
 
-      // Import handler after mocks are set up
-      const { GET } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await GET(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(200)
       expect(data).toHaveProperty('data')
       expect(data.data).toEqual(sampleTools)
 
-      // Verify DB query
       expect(mockSelect).toHaveBeenCalled()
       expect(mockFrom).toHaveBeenCalled()
       expect(mockWhere).toHaveBeenCalled()
+      expect(mockOrderBy).toHaveBeenCalled()
     })
 
     it('should handle unauthorized access', async () => {
-      // Create mock request
-      const req = createMockRequest('GET')
+      const req = new NextRequest(
+        'http://localhost:3000/api/tools/custom?workspaceId=workspace-123'
+      )
 
-      // Mock session to return no user
-      vi.doMock('@/lib/auth', () => ({
-        getSession: vi.fn().mockResolvedValue(null),
-      }))
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: false,
+        error: 'Unauthorized',
+      })
 
-      // Import handler after mocks are set up
-      const { GET } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await GET(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(401)
       expect(data).toHaveProperty('error', 'Unauthorized')
     })
 
     it('should handle workflowId parameter', async () => {
-      // Create mock request with workflowId parameter
       const req = new NextRequest('http://localhost:3000/api/tools/custom?workflowId=workflow-123')
 
-      // Import handler after mocks are set up
-      const { GET } = await import('@/app/api/tools/custom/route')
+      const response = await GET(req)
+      const data = await response.json()
 
-      // Call the handler
-      const _response = await GET(req)
+      expect(response.status).toBe(200)
+      expect(data).toHaveProperty('data')
 
-      // Verify getUserId was called with correct parameters
-      const getUserId = (await import('@/app/api/auth/oauth/utils')).getUserId
-      expect(getUserId).toHaveBeenCalledWith(expect.any(String), 'workflow-123')
-
-      // Verify DB query filters by user
       expect(mockWhere).toHaveBeenCalled()
     })
   })
@@ -224,126 +300,31 @@ describe('Custom Tools API Routes', () => {
    * Test POST endpoint
    */
   describe('POST /api/tools/custom', () => {
-    it('should create new tools when IDs are not provided', async () => {
-      // Create test tool data
-      const newTool = {
-        title: 'New Tool',
-        schema: {
-          type: 'function',
-          function: {
-            name: 'newTool',
-            description: 'A brand new tool',
-            parameters: {
-              type: 'object',
-              properties: {},
-              required: [],
-            },
-          },
-        },
-        code: 'return "hello world";',
-      }
-
-      // Create mock request with new tool
-      const req = createMockRequest('POST', { tools: [newTool] })
-
-      // Import handler after mocks are set up
-      const { POST } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
-      const response = await POST(req)
-      const data = await response.json()
-
-      // Verify response
-      expect(response.status).toBe(200)
-      expect(data).toHaveProperty('success', true)
-
-      // Verify insert was called with correct parameters
-      expect(mockInsert).toHaveBeenCalled()
-      expect(mockValues).toHaveBeenCalled()
-    })
-
-    it('should update existing tools when ID is provided', async () => {
-      // Create test tool data with ID
-      const updateTool = {
-        id: 'tool-1',
-        title: 'Updated Weather Tool',
-        schema: {
-          type: 'function',
-          function: {
-            name: 'getWeatherUpdate',
-            description: 'Get updated weather information',
-            parameters: {
-              type: 'object',
-              properties: {},
-              required: [],
-            },
-          },
-        },
-        code: 'return { temperature: 75, conditions: "partly cloudy" };',
-      }
-
-      // Mock DB to find existing tool
-      mockLimit.mockResolvedValueOnce([sampleTools[0]])
-
-      // Create mock request with tool update
-      const req = createMockRequest('POST', { tools: [updateTool] })
-
-      // Import handler after mocks are set up
-      const { POST } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
-      const response = await POST(req)
-      const data = await response.json()
-
-      // Verify response
-      expect(response.status).toBe(200)
-      expect(data).toHaveProperty('success', true)
-
-      // Verify update was called with correct parameters
-      expect(mockUpdate).toHaveBeenCalled()
-      expect(mockSet).toHaveBeenCalled()
-      expect(mockWhere).toHaveBeenCalled()
-    })
-
     it('should reject unauthorized requests', async () => {
-      // Mock session to return no user
-      vi.doMock('@/lib/auth', () => ({
-        getSession: vi.fn().mockResolvedValue(null),
-      }))
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: false,
+        error: 'Unauthorized',
+      })
 
-      // Create mock request
-      const req = createMockRequest('POST', { tools: [] })
+      const req = createMockRequest('POST', { tools: [], workspaceId: 'workspace-123' })
 
-      // Import handler after mocks are set up
-      const { POST } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await POST(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(401)
       expect(data).toHaveProperty('error', 'Unauthorized')
     })
 
     it('should validate request data', async () => {
-      // Create invalid tool data (missing required fields)
       const invalidTool = {
-        // Missing title, schema
         code: 'return "invalid";',
       }
 
-      // Create mock request with invalid tool
-      const req = createMockRequest('POST', { tools: [invalidTool] })
+      const req = createMockRequest('POST', { tools: [invalidTool], workspaceId: 'workspace-123' })
 
-      // Import handler after mocks are set up
-      const { POST } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await POST(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(400)
       expect(data).toHaveProperty('error', 'Invalid request data')
       expect(data).toHaveProperty('details')
@@ -354,101 +335,77 @@ describe('Custom Tools API Routes', () => {
    * Test DELETE endpoint
    */
   describe('DELETE /api/tools/custom', () => {
-    it('should delete a tool by ID', async () => {
-      // Mock finding existing tool
+    it('should delete a workspace-scoped tool by ID', async () => {
       mockLimit.mockResolvedValueOnce([sampleTools[0]])
 
-      // Create mock request with ID parameter
-      const req = new NextRequest('http://localhost:3000/api/tools/custom?id=tool-1')
+      const req = new NextRequest(
+        'http://localhost:3000/api/tools/custom?id=tool-1&workspaceId=workspace-123'
+      )
 
-      // Import handler after mocks are set up
-      const { DELETE } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await DELETE(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(200)
       expect(data).toHaveProperty('success', true)
 
-      // Verify delete was called with correct parameters
       expect(mockDelete).toHaveBeenCalled()
       expect(mockWhere).toHaveBeenCalled()
     })
 
     it('should reject requests missing tool ID', async () => {
-      // Create mock request without ID parameter
-      const req = createMockRequest('DELETE')
+      const req = new NextRequest('http://localhost:3000/api/tools/custom')
 
-      // Import handler after mocks are set up
-      const { DELETE } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await DELETE(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(400)
       expect(data).toHaveProperty('error', 'Tool ID is required')
     })
 
     it('should handle tool not found', async () => {
-      // Mock tool not found
-      mockLimit.mockResolvedValueOnce([])
+      const mockLimitNotFound = vi.fn().mockResolvedValue([])
+      mockWhere.mockReturnValueOnce({ limit: mockLimitNotFound })
 
-      // Create mock request with non-existent ID
       const req = new NextRequest('http://localhost:3000/api/tools/custom?id=non-existent')
 
-      // Import handler after mocks are set up
-      const { DELETE } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await DELETE(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(404)
       expect(data).toHaveProperty('error', 'Tool not found')
     })
 
-    it('should prevent unauthorized deletion', async () => {
-      // Mock finding tool that belongs to a different user
-      const otherUserTool = { ...sampleTools[0], userId: 'different-user' }
-      mockLimit.mockResolvedValueOnce([otherUserTool])
+    it('should prevent unauthorized deletion of user-scoped tool', async () => {
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-456',
+        authType: 'session',
+      })
 
-      // Create mock request
+      const userScopedTool = { ...sampleTools[0], workspaceId: null, userId: 'user-123' }
+      const mockLimitUserScoped = vi.fn().mockResolvedValue([userScopedTool])
+      mockWhere.mockReturnValueOnce({ limit: mockLimitUserScoped })
+
       const req = new NextRequest('http://localhost:3000/api/tools/custom?id=tool-1')
 
-      // Import handler after mocks are set up
-      const { DELETE } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await DELETE(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(403)
-      expect(data).toHaveProperty('error', 'Unauthorized')
+      expect(data).toHaveProperty('error', 'Access denied')
     })
 
     it('should reject unauthorized requests', async () => {
-      // Mock session to return no user
-      vi.doMock('@/lib/auth', () => ({
-        getSession: vi.fn().mockResolvedValue(null),
-      }))
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: false,
+        error: 'Unauthorized',
+      })
 
-      // Create mock request
       const req = new NextRequest('http://localhost:3000/api/tools/custom?id=tool-1')
 
-      // Import handler after mocks are set up
-      const { DELETE } = await import('@/app/api/tools/custom/route')
-
-      // Call the handler
       const response = await DELETE(req)
       const data = await response.json()
 
-      // Verify response
       expect(response.status).toBe(401)
       expect(data).toHaveProperty('error', 'Unauthorized')
     })

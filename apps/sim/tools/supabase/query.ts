@@ -1,4 +1,6 @@
+import { validateDatabaseIdentifier } from '@/lib/core/security/input-validation'
 import type { SupabaseQueryParams, SupabaseQueryResponse } from '@/tools/supabase/types'
+import { supabaseBaseUrl } from '@/tools/supabase/utils'
 import type { ToolConfig } from '@/tools/types'
 
 export const queryTool: ToolConfig<SupabaseQueryParams, SupabaseQueryResponse> = {
@@ -20,6 +22,19 @@ export const queryTool: ToolConfig<SupabaseQueryParams, SupabaseQueryResponse> =
       visibility: 'user-or-llm',
       description: 'The name of the Supabase table to query',
     },
+    schema: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Database schema to query from (default: public). Use this to access tables in other schemas.',
+    },
+    select: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Columns to return (comma-separated). Defaults to * (all columns)',
+    },
     filter: {
       type: 'string',
       required: false,
@@ -38,6 +53,12 @@ export const queryTool: ToolConfig<SupabaseQueryParams, SupabaseQueryResponse> =
       visibility: 'user-or-llm',
       description: 'Maximum number of rows to return',
     },
+    offset: {
+      type: 'number',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Number of rows to skip (for pagination)',
+    },
     apiKey: {
       type: 'string',
       required: true,
@@ -48,8 +69,10 @@ export const queryTool: ToolConfig<SupabaseQueryParams, SupabaseQueryResponse> =
 
   request: {
     url: (params) => {
-      // Construct the URL for the Supabase REST API
-      let url = `https://${params.projectId}.supabase.co/rest/v1/${params.table}?select=*`
+      const tableValidation = validateDatabaseIdentifier(params.table, 'table')
+      if (!tableValidation.isValid) throw new Error(tableValidation.error)
+      const selectColumns = params.select?.trim() || '*'
+      let url = `${supabaseBaseUrl(params.projectId)}/rest/v1/${encodeURIComponent(params.table)}?select=${encodeURIComponent(selectColumns)}`
 
       // Add filters if provided - using PostgREST syntax
       if (params.filter?.trim()) {
@@ -77,17 +100,28 @@ export const queryTool: ToolConfig<SupabaseQueryParams, SupabaseQueryResponse> =
       }
 
       // Add limit if provided
-      if (params.limit) {
-        url += `&limit=${params.limit}`
+      if (params.limit !== undefined && params.limit !== null) {
+        url += `&limit=${Number(params.limit)}`
+      }
+
+      // Add offset if provided
+      if (params.offset !== undefined && params.offset !== null) {
+        url += `&offset=${Number(params.offset)}`
       }
 
       return url
     },
     method: 'GET',
-    headers: (params) => ({
-      apikey: params.apiKey,
-      Authorization: `Bearer ${params.apiKey}`,
-    }),
+    headers: (params) => {
+      const headers: Record<string, string> = {
+        apikey: params.apiKey,
+        Authorization: `Bearer ${params.apiKey}`,
+      }
+      if (params.schema) {
+        headers['Accept-Profile'] = params.schema
+      }
+      return headers
+    },
   },
 
   transformResponse: async (response: Response) => {

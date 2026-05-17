@@ -13,13 +13,13 @@ export const readUrlTool: ToolConfig<ReadUrlParams, ReadUrlResponse> = {
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'The URL to read and convert to markdown',
+      description: 'The URL to read and convert to markdown (e.g., "https://example.com/page")',
     },
     useReaderLMv2: {
       type: 'boolean',
       required: false,
       visibility: 'user-only',
-      description: 'Whether to use ReaderLM-v2 for better quality',
+      description: 'Whether to use ReaderLM-v2 for better quality (3x token cost)',
     },
     gatherLinks: {
       type: 'boolean',
@@ -39,6 +39,69 @@ export const readUrlTool: ToolConfig<ReadUrlParams, ReadUrlResponse> = {
       visibility: 'user-only',
       description: 'Your Jina AI API key',
     },
+    // Content extraction params
+    withImagesummary: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Gather all images from the page with metadata',
+    },
+    retainImages: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Control image inclusion: "none" removes all, "all" keeps all',
+    },
+    returnFormat: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Output format: markdown, html, text, screenshot, or pageshot',
+    },
+    withIframe: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Include iframe content in extraction',
+    },
+    withShadowDom: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Extract Shadow DOM content',
+    },
+    // Performance & caching
+    noCache: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Bypass cached content for real-time retrieval',
+    },
+    // Advanced options
+    withGeneratedAlt: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Generate alt text for images using VLM',
+    },
+    robotsTxt: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Bot User-Agent for robots.txt checking',
+    },
+    dnt: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Do Not Track - prevents caching/tracking',
+    },
+    noGfm: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Disable GitHub Flavored Markdown',
+    },
   },
 
   request: {
@@ -53,7 +116,7 @@ export const readUrlTool: ToolConfig<ReadUrlParams, ReadUrlResponse> = {
         Authorization: `Bearer ${params.apiKey}`,
       }
 
-      // Add conditional headers based on boolean values
+      // Legacy params (backward compatible)
       if (params.useReaderLMv2 === true) {
         headers['X-Respond-With'] = 'readerlm-v2'
       }
@@ -61,17 +124,93 @@ export const readUrlTool: ToolConfig<ReadUrlParams, ReadUrlResponse> = {
         headers['X-With-Links-Summary'] = 'true'
       }
 
+      // Content extraction headers
+      if (params.withImagesummary === true) {
+        headers['X-With-Images-Summary'] = 'true'
+      }
+      if (params.retainImages) {
+        headers['X-Retain-Images'] = params.retainImages
+      }
+      if (params.returnFormat) {
+        headers['X-Return-Format'] = params.returnFormat
+      }
+      if (params.withIframe === true) {
+        headers['X-With-Iframe'] = 'true'
+      }
+      if (params.withShadowDom === true) {
+        headers['X-With-Shadow-Dom'] = 'true'
+      }
+
+      // Advanced options
+      if (params.withGeneratedAlt === true) {
+        headers['X-With-Generated-Alt'] = 'true'
+      }
+      if (params.robotsTxt) {
+        headers['X-Robots-Txt'] = params.robotsTxt
+      }
+      if (params.dnt === true) {
+        headers.DNT = '1'
+      }
+      if (params.noGfm === true) {
+        headers['X-No-Gfm'] = 'true'
+      }
+
       return headers
     },
   },
 
+  hosting: {
+    envKeyPrefix: 'JINA_API_KEY',
+    apiKeyParam: 'apiKey',
+    byokProviderId: 'jina',
+    pricing: {
+      type: 'custom',
+      getCost: (_params, output) => {
+        if (output.tokensUsed == null) {
+          throw new Error('Jina read_url response missing tokensUsed field')
+        }
+        // Jina bills per output token — $0.20 per 1M tokens
+        // Source: https://cloud.jina.ai/pricing (token-based billing)
+        const tokens = output.tokensUsed as number
+        const cost = tokens * 0.0000002
+        return { cost, metadata: { tokensUsed: tokens } }
+      },
+    },
+    rateLimit: {
+      mode: 'per_request',
+      requestsPerMinute: 200,
+    },
+  },
+
   transformResponse: async (response: Response) => {
+    let tokensUsed: number | undefined
+
+    const tokensHeader = response.headers.get('x-tokens')
+    if (tokensHeader) {
+      const parsed = Number.parseInt(tokensHeader, 10)
+      if (!Number.isNaN(parsed)) {
+        tokensUsed = parsed
+      }
+    }
+
+    const contentType = response.headers.get('content-type')
+
+    if (contentType?.includes('application/json')) {
+      const data = await response.json()
+      tokensUsed ??= data.data?.usage?.tokens ?? data.usage?.tokens
+      const content = data.data?.content || data.content || JSON.stringify(data)
+      tokensUsed ??= Math.ceil(content.length / 4)
+      return {
+        success: response.ok,
+        output: { content, tokensUsed },
+      }
+    }
+
     const content = await response.text()
+    tokensUsed ??= Math.ceil(content.length / 4)
     return {
       success: response.ok,
-      output: {
-        content,
-      },
+      output: { content, tokensUsed },
     }
   },
 
@@ -79,6 +218,11 @@ export const readUrlTool: ToolConfig<ReadUrlParams, ReadUrlResponse> = {
     content: {
       type: 'string',
       description: 'The extracted content from the URL, processed into clean, LLM-friendly text',
+    },
+    tokensUsed: {
+      type: 'number',
+      description: 'Number of Jina tokens consumed by this request',
+      optional: true,
     },
   },
 }

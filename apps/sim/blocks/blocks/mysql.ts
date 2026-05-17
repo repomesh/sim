@@ -1,5 +1,7 @@
+import { getErrorMessage } from '@sim/utils/errors'
 import { MySQLIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
+import { IntegrationType } from '@/blocks/types'
 import type { MySQLResponse } from '@/tools/mysql/types'
 
 export const MySQLBlock: BlockConfig<MySQLResponse> = {
@@ -10,6 +12,8 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
     'Integrate MySQL into the workflow. Can query, insert, update, delete, and execute raw SQL.',
   docsLink: 'https://docs.sim.ai/tools/mysql',
   category: 'tools',
+  integrationType: IntegrationType.Databases,
+  tags: ['data-warehouse', 'data-analytics'],
   bgColor: '#E0E0E0',
   icon: MySQLIcon,
   subBlocks: [
@@ -17,13 +21,13 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Query (SELECT)', id: 'query' },
         { label: 'Insert Data', id: 'insert' },
         { label: 'Update Data', id: 'update' },
         { label: 'Delete Data', id: 'delete' },
         { label: 'Execute Raw SQL', id: 'execute' },
+        { label: 'Introspect Schema', id: 'introspect' },
       ],
       value: () => 'query',
     },
@@ -31,7 +35,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'host',
       title: 'Host',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'localhost or your.database.host',
       required: true,
     },
@@ -39,7 +42,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'port',
       title: 'Port',
       type: 'short-input',
-      layout: 'full',
       placeholder: '3306',
       value: () => '3306',
       required: true,
@@ -48,7 +50,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'database',
       title: 'Database Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'your_database',
       required: true,
     },
@@ -56,7 +57,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'username',
       title: 'Username',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'root',
       required: true,
     },
@@ -64,7 +64,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'password',
       title: 'Password',
       type: 'short-input',
-      layout: 'full',
       password: true,
       placeholder: 'Your database password',
       required: true,
@@ -73,7 +72,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'ssl',
       title: 'SSL Mode',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Disabled', id: 'disabled' },
         { label: 'Required', id: 'required' },
@@ -86,7 +84,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'table',
       title: 'Table Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'users',
       condition: { field: 'operation', value: 'insert' },
       required: true,
@@ -95,7 +92,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'table',
       title: 'Table Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'users',
       condition: { field: 'operation', value: 'update' },
       required: true,
@@ -104,7 +100,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'table',
       title: 'Table Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'users',
       condition: { field: 'operation', value: 'delete' },
       required: true,
@@ -114,7 +109,6 @@ export const MySQLBlock: BlockConfig<MySQLResponse> = {
       id: 'query',
       title: 'SQL Query',
       type: 'code',
-      layout: 'full',
       placeholder: 'SELECT * FROM users WHERE active = true',
       condition: { field: 'operation', value: 'query' },
       required: true,
@@ -189,7 +183,6 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
       id: 'query',
       title: 'SQL Query',
       type: 'code',
-      layout: 'full',
       placeholder: 'SELECT * FROM table_name',
       condition: { field: 'operation', value: 'execute' },
       required: true,
@@ -265,7 +258,6 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
       id: 'data',
       title: 'Data (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{\n  "name": "John Doe",\n  "email": "john@example.com",\n  "active": true\n}',
       condition: { field: 'operation', value: 'insert' },
       required: true,
@@ -275,7 +267,6 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
       id: 'data',
       title: 'Update Data (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{\n  "name": "Jane Doe",\n  "email": "jane@example.com"\n}',
       condition: { field: 'operation', value: 'update' },
       required: true,
@@ -285,7 +276,6 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
       id: 'where',
       title: 'WHERE Condition',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'id = 1',
       condition: { field: 'operation', value: 'update' },
       required: true,
@@ -294,14 +284,20 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
       id: 'where',
       title: 'WHERE Condition',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'id = 1',
       condition: { field: 'operation', value: 'delete' },
       required: true,
     },
   ],
   tools: {
-    access: ['mysql_query', 'mysql_insert', 'mysql_update', 'mysql_delete', 'mysql_execute'],
+    access: [
+      'mysql_query',
+      'mysql_insert',
+      'mysql_update',
+      'mysql_delete',
+      'mysql_execute',
+      'mysql_introspect',
+    ],
     config: {
       tool: (params) => {
         switch (params.operation) {
@@ -315,6 +311,8 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
             return 'mysql_delete'
           case 'execute':
             return 'mysql_execute'
+          case 'introspect':
+            return 'mysql_introspect'
           default:
             throw new Error(`Invalid MySQL operation: ${params.operation}`)
         }
@@ -328,7 +326,7 @@ Return ONLY the SQL query - no explanations, no markdown, no extra text.`,
           try {
             parsedData = JSON.parse(data)
           } catch (parseError) {
-            const errorMsg = parseError instanceof Error ? parseError.message : 'Unknown JSON error'
+            const errorMsg = getErrorMessage(parseError, 'Unknown JSON error')
             throw new Error(`Invalid JSON data format: ${errorMsg}. Please check your JSON syntax.`)
           }
         } else if (data && typeof data === 'object') {

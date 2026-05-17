@@ -18,26 +18,116 @@ export const searchTool: ToolConfig<ExaSearchParams, ExaSearchResponse> = {
     numResults: {
       type: 'number',
       required: false,
-      visibility: 'user-only',
-      description: 'Number of results to return (default: 10, max: 25)',
+      visibility: 'user-or-llm',
+      description: 'Number of results to return (e.g., 5, 10, 25). Default: 10, max: 25',
     },
     useAutoprompt: {
       type: 'boolean',
       required: false,
-      visibility: 'user-only',
-      description: 'Whether to use autoprompt to improve the query (default: false)',
+      visibility: 'user-or-llm',
+      description: 'Whether to use autoprompt to improve the query (true or false). Default: false',
     },
     type: {
       type: 'string',
       required: false,
+      visibility: 'user-or-llm',
+      description: 'Search type: "neural", "keyword", "auto", or "fast". Default: "auto"',
+    },
+    includeDomains: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Comma-separated list of domains to include in results (e.g., "github.com, stackoverflow.com")',
+    },
+    excludeDomains: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Comma-separated list of domains to exclude from results (e.g., "reddit.com, pinterest.com")',
+    },
+    category: {
+      type: 'string',
+      required: false,
       visibility: 'user-only',
-      description: 'Search type: neural, keyword, auto or fast (default: auto)',
+      description:
+        'Filter by category: company, research paper, news, pdf, github, tweet, personal site, linkedin profile, financial report',
+    },
+    text: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Include full text content in results (default: false)',
+    },
+    highlights: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Include highlighted snippets in results (default: false)',
+    },
+    summary: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Include AI-generated summaries in results (default: false)',
+    },
+    livecrawl: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Live crawling mode: never (default), fallback, always, or preferred (always try livecrawl, fall back to cache if fails)',
+    },
+    startCrawlDate: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Only include results crawled on or after this ISO 8601 date (e.g., "2024-01-01" or "2024-01-01T00:00:00.000Z")',
+    },
+    endCrawlDate: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Only include results crawled on or before this ISO 8601 date',
+    },
+    startPublishedDate: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Only include results published on or after this ISO 8601 date',
+    },
+    endPublishedDate: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Only include results published on or before this ISO 8601 date',
     },
     apiKey: {
       type: 'string',
       required: true,
       visibility: 'user-only',
       description: 'Exa AI API Key',
+    },
+  },
+  hosting: {
+    envKeyPrefix: 'EXA_API_KEY',
+    apiKeyParam: 'apiKey',
+    byokProviderId: 'exa',
+    pricing: {
+      type: 'custom',
+      getCost: (_params, output) => {
+        const costDollars = output.__costDollars as { total?: number } | undefined
+        if (costDollars?.total == null) {
+          throw new Error('Exa search response missing costDollars field')
+        }
+        return { cost: costDollars.total, metadata: { costDollars } }
+      },
+    },
+    rateLimit: {
+      mode: 'per_request',
+      requestsPerMinute: 60,
     },
   },
 
@@ -54,9 +144,56 @@ export const searchTool: ToolConfig<ExaSearchParams, ExaSearchResponse> = {
       }
 
       // Add optional parameters if provided
-      if (params.numResults) body.numResults = params.numResults
+      if (params.numResults) body.numResults = Number(params.numResults)
       if (params.useAutoprompt !== undefined) body.useAutoprompt = params.useAutoprompt
       if (params.type) body.type = params.type
+
+      // Domain filtering
+      if (params.includeDomains) {
+        body.includeDomains = params.includeDomains
+          .split(',')
+          .map((d: string) => d.trim())
+          .filter((d: string) => d.length > 0)
+      }
+      if (params.excludeDomains) {
+        body.excludeDomains = params.excludeDomains
+          .split(',')
+          .map((d: string) => d.trim())
+          .filter((d: string) => d.length > 0)
+      }
+
+      // Category filtering
+      if (params.category) body.category = params.category
+
+      // Date filtering
+      if (params.startCrawlDate) body.startCrawlDate = params.startCrawlDate
+      if (params.endCrawlDate) body.endCrawlDate = params.endCrawlDate
+      if (params.startPublishedDate) body.startPublishedDate = params.startPublishedDate
+      if (params.endPublishedDate) body.endPublishedDate = params.endPublishedDate
+
+      // Build contents object for content options
+      const contents: Record<string, any> = {}
+
+      if (params.text !== undefined) {
+        contents.text = params.text
+      }
+
+      if (params.highlights !== undefined) {
+        contents.highlights = params.highlights
+      }
+
+      if (params.summary !== undefined) {
+        contents.summary = params.summary
+      }
+
+      if (params.livecrawl) {
+        contents.livecrawl = params.livecrawl
+      }
+
+      // Add contents to body if not empty
+      if (Object.keys(contents).length > 0) {
+        body.contents = contents
+      }
 
       return body
     },
@@ -77,8 +214,10 @@ export const searchTool: ToolConfig<ExaSearchParams, ExaSearchResponse> = {
           favicon: result.favicon,
           image: result.image,
           text: result.text,
+          highlights: result.highlights,
           score: result.score,
         })),
+        __costDollars: data.costDollars,
       },
     }
   },

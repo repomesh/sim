@@ -1,29 +1,22 @@
-import type { Chunk, StructuredDataOptions } from './types'
+import { createLogger } from '@sim/logger'
+import type { Chunk, StructuredDataOptions } from '@/lib/chunkers/types'
 
-// Configuration for structured data chunking (CSV, XLSX, etc.)
-const STRUCTURED_CHUNKING_CONFIG = {
-  // Target 2000-3000 tokens per chunk for better semantic meaning
-  TARGET_CHUNK_SIZE: 2500,
-  MIN_CHUNK_SIZE: 500,
-  MAX_CHUNK_SIZE: 4000,
-
-  // For spreadsheets, group rows together
-  ROWS_PER_CHUNK: 100, // Start with 100 rows per chunk
-  MIN_ROWS_PER_CHUNK: 20,
-  MAX_ROWS_PER_CHUNK: 500,
-
-  // For better embeddings quality
-  INCLUDE_HEADERS_IN_EACH_CHUNK: true,
-  MAX_HEADER_SIZE: 200, // tokens
+/** Structured data is denser in tokens (~3 chars/token vs ~4 for prose) */
+function estimateStructuredTokens(text: string): number {
+  if (!text?.trim()) return 0
+  return Math.ceil(text.length / 3)
 }
 
-/**
- * Smart chunker for structured data (CSV, XLSX) that preserves semantic meaning
- */
+const logger = createLogger('StructuredDataChunker')
+
+const DEFAULT_CONFIG = {
+  TARGET_CHUNK_SIZE: 1024,
+  MIN_ROWS_PER_CHUNK: 5,
+  MAX_ROWS_PER_CHUNK: 500,
+  INCLUDE_HEADERS_IN_EACH_CHUNK: true,
+} as const
+
 export class StructuredDataChunker {
-  /**
-   * Chunk structured data intelligently based on rows and semantic boundaries
-   */
   static async chunkStructuredData(
     content: string,
     options: StructuredDataOptions = {}
@@ -35,43 +28,43 @@ export class StructuredDataChunker {
       return chunks
     }
 
-    // Detect headers (first line or provided)
+    const targetChunkSize = options.chunkSize ?? DEFAULT_CONFIG.TARGET_CHUNK_SIZE
+
     const headerLine = options.headers?.join('\t') || lines[0]
     const dataStartIndex = options.headers ? 0 : 1
 
-    // Calculate optimal rows per chunk based on content
-    const estimatedTokensPerRow = StructuredDataChunker.estimateTokensPerRow(
+    const estimatedTokensPerRow = StructuredDataChunker.estimateStructuredTokensPerRow(
       lines.slice(dataStartIndex, Math.min(10, lines.length))
     )
-    const optimalRowsPerChunk =
-      StructuredDataChunker.calculateOptimalRowsPerChunk(estimatedTokensPerRow)
+    const optimalRowsPerChunk = StructuredDataChunker.calculateOptimalRowsPerChunk(
+      estimatedTokensPerRow,
+      targetChunkSize
+    )
 
-    console.log(
-      `Structured data chunking: ${lines.length} rows, ~${estimatedTokensPerRow} tokens/row, ${optimalRowsPerChunk} rows/chunk`
+    logger.info(
+      `Structured data chunking: ${lines.length} rows, ~${estimatedTokensPerRow} tokens/row, ${optimalRowsPerChunk} rows/chunk, target: ${targetChunkSize} tokens`
     )
 
     let currentChunkRows: string[] = []
     let currentTokenEstimate = 0
-    const headerTokens = StructuredDataChunker.estimateTokens(headerLine)
+    const headerTokens = estimateStructuredTokens(headerLine)
     let chunkStartRow = dataStartIndex
 
     for (let i = dataStartIndex; i < lines.length; i++) {
       const row = lines[i]
-      const rowTokens = StructuredDataChunker.estimateTokens(row)
+      const rowTokens = estimateStructuredTokens(row)
 
-      // Check if adding this row would exceed our target
       const projectedTokens =
         currentTokenEstimate +
         rowTokens +
-        (STRUCTURED_CHUNKING_CONFIG.INCLUDE_HEADERS_IN_EACH_CHUNK ? headerTokens : 0)
+        (DEFAULT_CONFIG.INCLUDE_HEADERS_IN_EACH_CHUNK ? headerTokens : 0)
 
       const shouldCreateChunk =
-        (projectedTokens > STRUCTURED_CHUNKING_CONFIG.TARGET_CHUNK_SIZE &&
-          currentChunkRows.length >= STRUCTURED_CHUNKING_CONFIG.MIN_ROWS_PER_CHUNK) ||
+        (projectedTokens > targetChunkSize &&
+          currentChunkRows.length >= DEFAULT_CONFIG.MIN_ROWS_PER_CHUNK) ||
         currentChunkRows.length >= optimalRowsPerChunk
 
       if (shouldCreateChunk && currentChunkRows.length > 0) {
-        // Create chunk with current rows
         const chunkContent = StructuredDataChunker.formatChunk(
           headerLine,
           currentChunkRows,
@@ -79,7 +72,6 @@ export class StructuredDataChunker {
         )
         chunks.push(StructuredDataChunker.createChunk(chunkContent, chunkStartRow, i - 1))
 
-        // Reset for next chunk
         currentChunkRows = []
         currentTokenEstimate = 0
         chunkStartRow = i
@@ -89,7 +81,6 @@ export class StructuredDataChunker {
       currentTokenEstimate += rowTokens
     }
 
-    // Add remaining rows as final chunk
     if (currentChunkRows.length > 0) {
       const chunkContent = StructuredDataChunker.formatChunk(
         headerLine,
@@ -99,46 +90,33 @@ export class StructuredDataChunker {
       chunks.push(StructuredDataChunker.createChunk(chunkContent, chunkStartRow, lines.length - 1))
     }
 
-    console.log(`Created ${chunks.length} chunks from ${lines.length} rows of structured data`)
+    logger.info(`Created ${chunks.length} chunks from ${lines.length} rows of structured data`)
 
     return chunks
   }
 
-  /**
-   * Format a chunk with headers and context
-   */
   private static formatChunk(headerLine: string, rows: string[], sheetName?: string): string {
     let content = ''
 
-    // Add sheet name context if available
     if (sheetName) {
       content += `=== ${sheetName} ===\n\n`
     }
 
-    // Add headers for context
-    if (STRUCTURED_CHUNKING_CONFIG.INCLUDE_HEADERS_IN_EACH_CHUNK) {
+    if (DEFAULT_CONFIG.INCLUDE_HEADERS_IN_EACH_CHUNK) {
       content += `Headers: ${headerLine}\n`
       content += `${'-'.repeat(Math.min(80, headerLine.length))}\n`
     }
 
-    // Add data rows
     content += rows.join('\n')
-
-    // Add row count for context
-    content += `\n\n[Rows ${rows.length} of data]`
+    content += `\n\n[${rows.length} rows of data]`
 
     return content
   }
 
-  /**
-   * Create a chunk object with actual row indices
-   */
   private static createChunk(content: string, startRow: number, endRow: number): Chunk {
-    const tokenCount = StructuredDataChunker.estimateTokens(content)
-
     return {
       text: content,
-      tokenCount,
+      tokenCount: estimateStructuredTokens(content),
       metadata: {
         startIndex: startRow,
         endIndex: endRow,
@@ -146,45 +124,26 @@ export class StructuredDataChunker {
     }
   }
 
-  /**
-   * Estimate tokens in text (rough approximation)
-   */
-  private static estimateTokens(text: string): number {
-    // Rough estimate: 1 token per 4 characters for English text
-    // For structured data with numbers, it's closer to 1 token per 3 characters
-    return Math.ceil(text.length / 3)
-  }
+  private static estimateStructuredTokensPerRow(sampleRows: string[]): number {
+    if (sampleRows.length === 0) return 50
 
-  /**
-   * Estimate average tokens per row from sample
-   */
-  private static estimateTokensPerRow(sampleRows: string[]): number {
-    if (sampleRows.length === 0) return 50 // default estimate
-
-    const totalTokens = sampleRows.reduce(
-      (sum, row) => sum + StructuredDataChunker.estimateTokens(row),
-      0
-    )
+    const totalTokens = sampleRows.reduce((sum, row) => sum + estimateStructuredTokens(row), 0)
     return Math.ceil(totalTokens / sampleRows.length)
   }
 
-  /**
-   * Calculate optimal rows per chunk based on token estimates
-   */
-  private static calculateOptimalRowsPerChunk(tokensPerRow: number): number {
-    const optimal = Math.floor(STRUCTURED_CHUNKING_CONFIG.TARGET_CHUNK_SIZE / tokensPerRow)
+  private static calculateOptimalRowsPerChunk(
+    tokensPerRow: number,
+    targetChunkSize: number
+  ): number {
+    const optimal = Math.floor(targetChunkSize / tokensPerRow)
 
     return Math.min(
-      Math.max(optimal, STRUCTURED_CHUNKING_CONFIG.MIN_ROWS_PER_CHUNK),
-      STRUCTURED_CHUNKING_CONFIG.MAX_ROWS_PER_CHUNK
+      Math.max(optimal, DEFAULT_CONFIG.MIN_ROWS_PER_CHUNK),
+      DEFAULT_CONFIG.MAX_ROWS_PER_CHUNK
     )
   }
 
-  /**
-   * Check if content appears to be structured data
-   */
   static isStructuredData(content: string, mimeType?: string): boolean {
-    // Check mime type first
     if (mimeType) {
       const structuredMimeTypes = [
         'text/csv',
@@ -197,20 +156,17 @@ export class StructuredDataChunker {
       }
     }
 
-    // Check content structure
-    const lines = content.split('\n').slice(0, 10) // Check first 10 lines
+    const lines = content.split('\n').slice(0, 10)
     if (lines.length < 2) return false
 
-    // Check for consistent delimiters (comma, tab, pipe)
     const delimiters = [',', '\t', '|']
     for (const delimiter of delimiters) {
-      const counts = lines.map(
-        (line) => (line.match(new RegExp(`\\${delimiter}`, 'g')) || []).length
-      )
+      const escaped = delimiter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const counts = lines.map((line) => (line.match(new RegExp(escaped, 'g')) || []).length)
       const avgCount = counts.reduce((a, b) => a + b, 0) / counts.length
 
-      // If most lines have similar delimiter counts, it's likely structured
-      if (avgCount > 2 && counts.every((c) => Math.abs(c - avgCount) <= 2)) {
+      const tolerance = Math.max(1, Math.ceil(avgCount * 0.2))
+      if (avgCount > 2 && counts.every((c) => Math.abs(c - avgCount) <= tolerance)) {
         return true
       }
     }

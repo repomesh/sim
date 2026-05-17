@@ -1,226 +1,393 @@
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { workflow } from '@sim/db/schema'
-import { and, eq, inArray } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { and, eq, inArray, isNull } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { deleteWorkspaceBodySchema, updateWorkspaceContract } from '@/lib/api/contracts'
+import { parseRequest, validationErrorResponse } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { captureServerEvent } from '@/lib/posthog/server'
+import { archiveWorkspace } from '@/lib/workspaces/lifecycle'
 
 const logger = createLogger('WorkspaceByIdAPI')
 
 import { db } from '@sim/db'
-import { knowledgeBase, permissions, templates, workspace } from '@sim/db/schema'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
+import { permissions, templates, workspace } from '@sim/db/schema'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params
-  const session = await getSession()
+export const GET = withRouteHandler(
+  async (request: NextRequest, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const session = await getSession()
 
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    if (!session?.user?.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const workspaceId = id
+    const url = new URL(request.url)
+    const checkTemplates = url.searchParams.get('check-templates') === 'true'
+
+    // Check if user has any access to this workspace
+    const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
+    if (!userPermission) {
+      return NextResponse.json({ error: 'Workspace not found or access denied' }, { status: 404 })
+    }
+
+    // If checking for published templates before deletion
+    if (checkTemplates) {
+      try {
+        // Get all workflows in this workspace
+        const workspaceWorkflows = await db
+          .select({ id: workflow.id })
+          .from(workflow)
+          .where(eq(workflow.workspaceId, workspaceId))
+
+        if (workspaceWorkflows.length === 0) {
+          return NextResponse.json({
+            hasPublishedTemplates: false,
+            publishedTemplates: [],
+            count: 0,
+          })
+        }
+
+        const workflowIds = workspaceWorkflows.map((w) => w.id)
+
+        // Check for published templates that reference these workflows
+        const publishedTemplates = await db
+          .select({
+            id: templates.id,
+            name: templates.name,
+            workflowId: templates.workflowId,
+          })
+          .from(templates)
+          .where(inArray(templates.workflowId, workflowIds))
+
+        return NextResponse.json({
+          hasPublishedTemplates: publishedTemplates.length > 0,
+          publishedTemplates,
+          count: publishedTemplates.length,
+        })
+      } catch (error) {
+        logger.error(`Error checking published templates for workspace ${workspaceId}:`, error)
+        return NextResponse.json({ error: 'Failed to check published templates' }, { status: 500 })
+      }
+    }
+
+    // Get workspace details
+    const workspaceDetails = await db
+      .select()
+      .from(workspace)
+      .where(and(eq(workspace.id, workspaceId), isNull(workspace.archivedAt)))
+      .then((rows) => rows[0])
+
+    if (!workspaceDetails) {
+      return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+    }
+
+    return NextResponse.json({
+      workspace: {
+        ...workspaceDetails,
+        permissions: userPermission,
+      },
+    })
   }
+)
 
-  const workspaceId = id
-  const url = new URL(request.url)
-  const checkTemplates = url.searchParams.get('check-templates') === 'true'
+export const PATCH = withRouteHandler(
+  async (request: NextRequest, context: { params: Promise<{ id: string }> }) => {
+    const session = await getSession()
 
-  // Check if user has any access to this workspace
-  const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
-  if (!userPermission) {
-    return NextResponse.json({ error: 'Workspace not found or access denied' }, { status: 404 })
-  }
+    if (!session?.user?.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
 
-  // If checking for published templates before deletion
-  if (checkTemplates) {
+    const parsed = await parseRequest(updateWorkspaceContract, request, context)
+    if (!parsed.success) return parsed.response
+
+    const workspaceId = parsed.data.params.id
+
+    // Check if user has admin permissions to update workspace
+    const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
+    if (userPermission !== 'admin') {
+      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
+    }
+
     try {
-      // Get all workflows in this workspace
+      const body = parsed.data.body
+      const { name, color, logoUrl, billedAccountUserId, allowPersonalApiKeys } = body
+
+      if (
+        name === undefined &&
+        color === undefined &&
+        logoUrl === undefined &&
+        billedAccountUserId === undefined &&
+        allowPersonalApiKeys === undefined
+      ) {
+        return NextResponse.json({ error: 'No updates provided' }, { status: 400 })
+      }
+
+      const existingWorkspace = await db
+        .select()
+        .from(workspace)
+        .where(and(eq(workspace.id, workspaceId), isNull(workspace.archivedAt)))
+        .then((rows) => rows[0])
+
+      if (!existingWorkspace) {
+        return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+      }
+
+      const updateData: Record<string, unknown> = {}
+
+      if (name !== undefined) {
+        updateData.name = name
+      }
+
+      if (color !== undefined) {
+        updateData.color = color
+      }
+
+      if (logoUrl !== undefined) {
+        updateData.logoUrl = logoUrl
+      }
+
+      if (allowPersonalApiKeys !== undefined) {
+        updateData.allowPersonalApiKeys = Boolean(allowPersonalApiKeys)
+      }
+
+      if (billedAccountUserId !== undefined) {
+        if (
+          existingWorkspace.organizationId &&
+          existingWorkspace.workspaceMode === 'organization'
+        ) {
+          return NextResponse.json(
+            {
+              error:
+                'Organization workspaces use organization billing and cannot change billed account.',
+            },
+            { status: 400 }
+          )
+        }
+
+        if (existingWorkspace.workspaceMode === 'personal') {
+          return NextResponse.json(
+            {
+              error:
+                'Personal workspaces are always billed to their owner and cannot change billed account.',
+            },
+            { status: 400 }
+          )
+        }
+
+        const candidateId = billedAccountUserId
+
+        const isOwner = candidateId === existingWorkspace.ownerId
+
+        let hasAdminAccess = isOwner
+
+        if (!hasAdminAccess) {
+          const adminPermission = await db
+            .select({ id: permissions.id })
+            .from(permissions)
+            .where(
+              and(
+                eq(permissions.entityType, 'workspace'),
+                eq(permissions.entityId, workspaceId),
+                eq(permissions.userId, candidateId),
+                eq(permissions.permissionType, 'admin')
+              )
+            )
+            .limit(1)
+
+          hasAdminAccess = adminPermission.length > 0
+        }
+
+        if (!hasAdminAccess) {
+          return NextResponse.json(
+            { error: 'Billed account must be a workspace admin' },
+            { status: 400 }
+          )
+        }
+
+        updateData.billedAccountUserId = candidateId
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return NextResponse.json({ error: 'No valid updates provided' }, { status: 400 })
+      }
+
+      updateData.updatedAt = new Date()
+
+      await db.update(workspace).set(updateData).where(eq(workspace.id, workspaceId))
+
+      const updatedWorkspace = await db
+        .select()
+        .from(workspace)
+        .where(eq(workspace.id, workspaceId))
+        .then((rows) => rows[0])
+
+      recordAudit({
+        workspaceId,
+        actorId: session.user.id,
+        actorName: session.user.name,
+        actorEmail: session.user.email,
+        action: AuditAction.WORKSPACE_UPDATED,
+        resourceType: AuditResourceType.WORKSPACE,
+        resourceId: workspaceId,
+        resourceName: updatedWorkspace?.name ?? existingWorkspace.name,
+        description: `Updated workspace "${updatedWorkspace?.name ?? existingWorkspace.name}"`,
+        metadata: {
+          changes: {
+            ...(name !== undefined && { name: { from: existingWorkspace.name, to: name } }),
+            ...(color !== undefined && { color: { from: existingWorkspace.color, to: color } }),
+            ...(logoUrl !== undefined && {
+              logoUrl: { from: existingWorkspace.logoUrl, to: logoUrl },
+            }),
+            ...(allowPersonalApiKeys !== undefined && {
+              allowPersonalApiKeys: {
+                from: existingWorkspace.allowPersonalApiKeys,
+                to: allowPersonalApiKeys,
+              },
+            }),
+            ...(billedAccountUserId !== undefined && {
+              billedAccountUserId: {
+                from: existingWorkspace.billedAccountUserId,
+                to: billedAccountUserId,
+              },
+            }),
+          },
+        },
+        request,
+      })
+
+      return NextResponse.json({
+        workspace: {
+          ...updatedWorkspace,
+          permissions: userPermission,
+        },
+      })
+    } catch (error) {
+      logger.error('Error updating workspace:', error)
+      return NextResponse.json({ error: 'Failed to update workspace' }, { status: 500 })
+    }
+  }
+)
+
+export const DELETE = withRouteHandler(
+  async (request: NextRequest, { params }: { params: Promise<{ id: string }> }) => {
+    const { id } = await params
+    const session = await getSession()
+
+    if (!session?.user?.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const workspaceId = id
+    const rawBody = await request.json().catch(() => ({}))
+    const bodyValidation = deleteWorkspaceBodySchema.safeParse(rawBody)
+    if (!bodyValidation.success) return validationErrorResponse(bodyValidation.error)
+    const { deleteTemplates } = bodyValidation.data // User's choice: false = keep templates (recommended), true = delete templates
+
+    // Check if user has admin permissions to delete workspace
+    const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
+    if (userPermission !== 'admin') {
+      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
+    }
+
+    try {
+      const [[workspaceRecord], totalWorkspaces] = await Promise.all([
+        db
+          .select({ name: workspace.name })
+          .from(workspace)
+          .where(and(eq(workspace.id, workspaceId), isNull(workspace.archivedAt)))
+          .limit(1),
+        db
+          .select({ id: permissions.entityId })
+          .from(permissions)
+          .innerJoin(workspace, eq(permissions.entityId, workspace.id))
+          .where(
+            and(
+              eq(permissions.userId, session.user.id),
+              eq(permissions.entityType, 'workspace'),
+              isNull(workspace.archivedAt)
+            )
+          ),
+      ])
+
+      /** Counts all workspace memberships (any role), not just admin — prevents the user from reaching a zero-workspace state. */
+      if (totalWorkspaces.length <= 1) {
+        return NextResponse.json({ error: 'Cannot delete the only workspace' }, { status: 400 })
+      }
+
+      logger.info(
+        `Deleting workspace ${workspaceId} for user ${session.user.id}, deleteTemplates: ${deleteTemplates}`
+      )
+
       const workspaceWorkflows = await db
         .select({ id: workflow.id })
         .from(workflow)
         .where(eq(workflow.workspaceId, workspaceId))
 
-      if (workspaceWorkflows.length === 0) {
-        return NextResponse.json({ hasPublishedTemplates: false, publishedTemplates: [] })
-      }
+      const workflowIds = workspaceWorkflows.map((entry) => entry.id)
 
-      const workflowIds = workspaceWorkflows.map((w) => w.id)
-
-      // Check for published templates that reference these workflows
-      const publishedTemplates = await db
-        .select({
-          id: templates.id,
-          name: templates.name,
-          workflowId: templates.workflowId,
-        })
-        .from(templates)
-        .where(inArray(templates.workflowId, workflowIds))
-
-      return NextResponse.json({
-        hasPublishedTemplates: publishedTemplates.length > 0,
-        publishedTemplates,
-        count: publishedTemplates.length,
-      })
-    } catch (error) {
-      logger.error(`Error checking published templates for workspace ${workspaceId}:`, error)
-      return NextResponse.json({ error: 'Failed to check published templates' }, { status: 500 })
-    }
-  }
-
-  // Get workspace details
-  const workspaceDetails = await db
-    .select()
-    .from(workspace)
-    .where(eq(workspace.id, workspaceId))
-    .then((rows) => rows[0])
-
-  if (!workspaceDetails) {
-    return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-  }
-
-  return NextResponse.json({
-    workspace: {
-      ...workspaceDetails,
-      permissions: userPermission,
-    },
-  })
-}
-
-export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params
-  const session = await getSession()
-
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const workspaceId = id
-
-  // Check if user has admin permissions to update workspace
-  const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
-  if (userPermission !== 'admin') {
-    return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
-  }
-
-  try {
-    const { name } = await request.json()
-
-    if (!name) {
-      return NextResponse.json({ error: 'Name is required' }, { status: 400 })
-    }
-
-    // Update workspace
-    await db
-      .update(workspace)
-      .set({
-        name,
-        updatedAt: new Date(),
-      })
-      .where(eq(workspace.id, workspaceId))
-
-    // Get updated workspace
-    const updatedWorkspace = await db
-      .select()
-      .from(workspace)
-      .where(eq(workspace.id, workspaceId))
-      .then((rows) => rows[0])
-
-    return NextResponse.json({
-      workspace: {
-        ...updatedWorkspace,
-        permissions: userPermission,
-      },
-    })
-  } catch (error) {
-    console.error('Error updating workspace:', error)
-    return NextResponse.json({ error: 'Failed to update workspace' }, { status: 500 })
-  }
-}
-
-export async function DELETE(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params
-  const session = await getSession()
-
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const workspaceId = id
-  const body = await request.json().catch(() => ({}))
-  const { deleteTemplates = false } = body // User's choice: false = keep templates (recommended), true = delete templates
-
-  // Check if user has admin permissions to delete workspace
-  const userPermission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
-  if (userPermission !== 'admin') {
-    return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
-  }
-
-  try {
-    logger.info(
-      `Deleting workspace ${workspaceId} for user ${session.user.id}, deleteTemplates: ${deleteTemplates}`
-    )
-
-    // Delete workspace and all related data in a transaction
-    await db.transaction(async (tx) => {
-      // Get all workflows in this workspace before deletion
-      const workspaceWorkflows = await tx
-        .select({ id: workflow.id })
-        .from(workflow)
-        .where(eq(workflow.workspaceId, workspaceId))
-
-      if (workspaceWorkflows.length > 0) {
-        const workflowIds = workspaceWorkflows.map((w) => w.id)
-
-        // Handle templates based on user choice
+      if (workflowIds.length > 0) {
         if (deleteTemplates) {
-          // Delete published templates that reference these workflows
-          await tx.delete(templates).where(inArray(templates.workflowId, workflowIds))
-          logger.info(`Deleted templates for workflows in workspace ${workspaceId}`)
+          await db.delete(templates).where(inArray(templates.workflowId, workflowIds))
         } else {
-          // Set workflowId to null for templates to create "orphaned" templates
-          // This allows templates to remain in marketplace but without source workflows
-          await tx
+          await db
             .update(templates)
             .set({ workflowId: null })
             .where(inArray(templates.workflowId, workflowIds))
-          logger.info(
-            `Updated templates to orphaned status for workflows in workspace ${workspaceId}`
-          )
         }
       }
 
-      // Delete all workflows in the workspace - database cascade will handle all workflow-related data
-      // The database cascade will handle deleting related workflow_blocks, workflow_edges, workflow_subflows,
-      // workflow_logs, workflow_execution_snapshots, workflow_execution_logs, workflow_execution_trace_spans,
-      // workflow_schedule, webhook, marketplace, chat, and memory records
-      await tx.delete(workflow).where(eq(workflow.workspaceId, workspaceId))
+      const archiveResult = await archiveWorkspace(workspaceId, {
+        requestId: `workspace-${workspaceId}`,
+      })
 
-      // Clear workspace ID from knowledge bases instead of deleting them
-      // This allows knowledge bases to become "unassigned" rather than being deleted
-      await tx
-        .update(knowledgeBase)
-        .set({ workspaceId: null, updatedAt: new Date() })
-        .where(eq(knowledgeBase.workspaceId, workspaceId))
+      if (!archiveResult.archived && !workspaceRecord) {
+        return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+      }
 
-      // Delete all permissions associated with this workspace
-      await tx
-        .delete(permissions)
-        .where(and(eq(permissions.entityType, 'workspace'), eq(permissions.entityId, workspaceId)))
+      recordAudit({
+        workspaceId,
+        actorId: session.user.id,
+        actorName: session.user.name,
+        actorEmail: session.user.email,
+        action: AuditAction.WORKSPACE_DELETED,
+        resourceType: AuditResourceType.WORKSPACE,
+        resourceId: workspaceId,
+        resourceName: workspaceRecord?.name,
+        description: `Archived workspace "${workspaceRecord?.name || workspaceId}"`,
+        metadata: {
+          affected: {
+            workflows: workflowIds.length,
+          },
+          archived: archiveResult.archived,
+          deleteTemplates,
+        },
+        request,
+      })
 
-      // Delete the workspace itself
-      await tx.delete(workspace).where(eq(workspace.id, workspaceId))
+      captureServerEvent(
+        session.user.id,
+        'workspace_deleted',
+        { workspace_id: workspaceId, workflow_count: workflowIds.length },
+        { groups: { workspace: workspaceId } }
+      )
 
-      logger.info(`Successfully deleted workspace ${workspaceId} and all related data`)
-    })
-
-    return NextResponse.json({ success: true })
-  } catch (error) {
-    logger.error(`Error deleting workspace ${workspaceId}:`, error)
-    return NextResponse.json({ error: 'Failed to delete workspace' }, { status: 500 })
+      return NextResponse.json({ success: true })
+    } catch (error) {
+      logger.error(`Error deleting workspace ${workspaceId}:`, error)
+      return NextResponse.json({ error: 'Failed to delete workspace' }, { status: 500 })
+    }
   }
-}
+)
 
-export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  // Reuse the PATCH handler implementation for PUT requests
-  return PATCH(request, { params })
-}
+export const PUT = withRouteHandler(
+  async (request: NextRequest, { params }: { params: Promise<{ id: string }> }) => {
+    // Reuse the PATCH handler implementation for PUT requests
+    return PATCH(request, { params })
+  }
+)

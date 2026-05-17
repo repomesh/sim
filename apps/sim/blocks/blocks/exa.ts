@@ -1,6 +1,6 @@
 import { ExaAIIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import { AuthMode } from '@/blocks/types'
+import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { ExaResponse } from '@/tools/exa/types'
 
 export const ExaBlock: BlockConfig<ExaResponse> = {
@@ -12,6 +12,8 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
     'Integrate Exa into the workflow. Can search, get contents, find similar links, answer a question, and perform research.',
   docsLink: 'https://docs.sim.ai/tools/exa',
   category: 'tools',
+  integrationType: IntegrationType.Search,
+  tags: ['web-scraping', 'enrichment'],
   bgColor: '#1F40ED',
   icon: ExaAIIcon,
   subBlocks: [
@@ -19,7 +21,6 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Search', id: 'exa_search' },
         { label: 'Get Contents', id: 'exa_get_contents' },
@@ -34,7 +35,6 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'query',
       title: 'Search Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter your search query...',
       condition: { field: 'operation', value: 'exa_search' },
       required: true,
@@ -43,7 +43,6 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'numResults',
       title: 'Number of Results',
       type: 'short-input',
-      layout: 'full',
       placeholder: '10',
       condition: { field: 'operation', value: 'exa_search' },
     },
@@ -51,14 +50,13 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'useAutoprompt',
       title: 'Use Autoprompt',
       type: 'switch',
-      layout: 'full',
       condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
     },
     {
       id: 'type',
       title: 'Search Type',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Auto', id: 'auto' },
         { label: 'Neural', id: 'neural' },
@@ -67,13 +65,114 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       ],
       value: () => 'auto',
       condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'includeDomains',
+      title: 'Include Domains',
+      type: 'long-input',
+      placeholder: 'example.com, another.com (comma-separated)',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'excludeDomains',
+      title: 'Exclude Domains',
+      type: 'long-input',
+      placeholder: 'exclude.com, another.com (comma-separated)',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'category',
+      title: 'Category Filter',
+      type: 'dropdown',
+      options: [
+        { label: 'None', id: '' },
+        { label: 'Company', id: 'company' },
+        { label: 'Research Paper', id: 'research_paper' },
+        { label: 'News Article', id: 'news_article' },
+        { label: 'PDF', id: 'pdf' },
+        { label: 'GitHub', id: 'github' },
+        { label: 'Tweet', id: 'tweet' },
+        { label: 'Movie', id: 'movie' },
+        { label: 'Song', id: 'song' },
+        { label: 'Personal Site', id: 'personal_site' },
+      ],
+      value: () => '',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'text',
+      title: 'Include Text',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_search' },
+    },
+    {
+      id: 'highlights',
+      title: 'Include Highlights',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'summary',
+      title: 'Include Summary',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'livecrawl',
+      title: 'Live Crawl Mode',
+      type: 'dropdown',
+      options: [
+        { label: 'Never (default)', id: 'never' },
+        { label: 'Fallback', id: 'fallback' },
+        { label: 'Always', id: 'always' },
+      ],
+      value: () => 'never',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'startPublishedDate',
+      title: 'Start Published Date',
+      type: 'short-input',
+      placeholder: '2024-01-01 or 2024-01-01T00:00:00.000Z',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'endPublishedDate',
+      title: 'End Published Date',
+      type: 'short-input',
+      placeholder: '2024-12-31 or 2024-12-31T23:59:59.999Z',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'startCrawlDate',
+      title: 'Start Crawl Date',
+      type: 'short-input',
+      placeholder: '2024-01-01 or 2024-01-01T00:00:00.000Z',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
+    },
+    {
+      id: 'endCrawlDate',
+      title: 'End Crawl Date',
+      type: 'short-input',
+      placeholder: '2024-12-31 or 2024-12-31T23:59:59.999Z',
+      condition: { field: 'operation', value: 'exa_search' },
+      mode: 'advanced',
     },
     // Get Contents operation inputs
     {
       id: 'urls',
       title: 'URLs',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter URLs to retrieve content from (comma-separated)...',
       condition: { field: 'operation', value: 'exa_get_contents' },
       required: true,
@@ -82,23 +181,44 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'text',
       title: 'Include Text',
       type: 'switch',
-      layout: 'full',
       condition: { field: 'operation', value: 'exa_get_contents' },
     },
     {
       id: 'summaryQuery',
       title: 'Summary Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter a query to guide the summary generation...',
       condition: { field: 'operation', value: 'exa_get_contents' },
+      mode: 'advanced',
+    },
+    {
+      id: 'subpages',
+      title: 'Number of Subpages',
+      type: 'short-input',
+      placeholder: '5',
+      condition: { field: 'operation', value: 'exa_get_contents' },
+      mode: 'advanced',
+    },
+    {
+      id: 'subpageTarget',
+      title: 'Subpage Target Keywords',
+      type: 'long-input',
+      placeholder: 'docs, tutorial, about (comma-separated)',
+      condition: { field: 'operation', value: 'exa_get_contents' },
+      mode: 'advanced',
+    },
+    {
+      id: 'highlights',
+      title: 'Include Highlights',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_get_contents' },
+      mode: 'advanced',
     },
     // Find Similar Links operation inputs
     {
       id: 'url',
       title: 'URL',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter URL to find similar links for...',
       condition: { field: 'operation', value: 'exa_find_similar_links' },
       required: true,
@@ -107,7 +227,6 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'numResults',
       title: 'Number of Results',
       type: 'short-input',
-      layout: 'full',
       placeholder: '10',
       condition: { field: 'operation', value: 'exa_find_similar_links' },
     },
@@ -115,15 +234,83 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'text',
       title: 'Include Text',
       type: 'switch',
-      layout: 'full',
       condition: { field: 'operation', value: 'exa_find_similar_links' },
+    },
+    {
+      id: 'includeDomains',
+      title: 'Include Domains',
+      type: 'long-input',
+      placeholder: 'example.com, another.com (comma-separated)',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'excludeDomains',
+      title: 'Exclude Domains',
+      type: 'long-input',
+      placeholder: 'exclude.com, another.com (comma-separated)',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'excludeSourceDomain',
+      title: 'Exclude Source Domain',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'category',
+      title: 'Category Filter',
+      type: 'dropdown',
+      options: [
+        { label: 'None', id: '' },
+        { label: 'Company', id: 'company' },
+        { label: 'Research Paper', id: 'research_paper' },
+        { label: 'News Article', id: 'news_article' },
+        { label: 'PDF', id: 'pdf' },
+        { label: 'GitHub', id: 'github' },
+        { label: 'Tweet', id: 'tweet' },
+        { label: 'Movie', id: 'movie' },
+        { label: 'Song', id: 'song' },
+        { label: 'Personal Site', id: 'personal_site' },
+      ],
+      value: () => '',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'highlights',
+      title: 'Include Highlights',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'summary',
+      title: 'Include Summary',
+      type: 'switch',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
+    },
+    {
+      id: 'livecrawl',
+      title: 'Live Crawl Mode',
+      type: 'dropdown',
+      options: [
+        { label: 'Never (default)', id: 'never' },
+        { label: 'Fallback', id: 'fallback' },
+        { label: 'Always', id: 'always' },
+      ],
+      value: () => 'never',
+      condition: { field: 'operation', value: 'exa_find_similar_links' },
+      mode: 'advanced',
     },
     // Answer operation inputs
     {
       id: 'query',
       title: 'Question',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter your question...',
       condition: { field: 'operation', value: 'exa_answer' },
       required: true,
@@ -132,35 +319,50 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
       id: 'text',
       title: 'Include Text',
       type: 'switch',
-      layout: 'full',
       condition: { field: 'operation', value: 'exa_answer' },
+      mode: 'advanced',
     },
     // Research operation inputs
     {
       id: 'query',
       title: 'Research Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter your research topic or question...',
       condition: { field: 'operation', value: 'exa_research' },
       required: true,
     },
     {
-      id: 'includeText',
-      title: 'Include Full Text',
-      type: 'switch',
-      layout: 'full',
+      id: 'model',
+      title: 'Research Model',
+      type: 'dropdown',
+      options: [
+        { label: 'Standard (default)', id: 'exa-research' },
+        { label: 'Fast', id: 'exa-research-fast' },
+        { label: 'Pro', id: 'exa-research-pro' },
+      ],
+      value: () => 'exa-research',
       condition: { field: 'operation', value: 'exa_research' },
     },
-    // API Key (common)
+    // API Key — hidden when hosted for operations with hosted key support
     {
       id: 'apiKey',
       title: 'API Key',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter your Exa API key',
       password: true,
       required: true,
+      hideWhenHosted: true,
+      condition: { field: 'operation', value: 'exa_research', not: true },
+    },
+    // API Key — always visible for research (no hosted key support)
+    {
+      id: 'apiKey',
+      title: 'API Key',
+      type: 'short-input',
+      placeholder: 'Enter your Exa API key',
+      password: true,
+      required: true,
+      condition: { field: 'operation', value: 'exa_research' },
     },
   ],
   tools: {
@@ -173,11 +375,6 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
     ],
     config: {
       tool: (params) => {
-        // Convert numResults to a number for operations that use it
-        if (params.numResults) {
-          params.numResults = Number(params.numResults)
-        }
-
         switch (params.operation) {
           case 'exa_search':
             return 'exa_search'
@@ -193,6 +390,16 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
             return 'exa_search'
         }
       },
+      params: (params) => {
+        const result: Record<string, unknown> = {}
+        if (params.numResults) {
+          result.numResults = Number(params.numResults)
+        }
+        if (params.subpages) {
+          result.subpages = Number(params.subpages)
+        }
+        return result
+      },
     },
   },
   inputs: {
@@ -203,12 +410,27 @@ export const ExaBlock: BlockConfig<ExaResponse> = {
     numResults: { type: 'number', description: 'Number of results' },
     useAutoprompt: { type: 'boolean', description: 'Use autoprompt feature' },
     type: { type: 'string', description: 'Search type' },
+    includeDomains: { type: 'string', description: 'Include domains filter' },
+    excludeDomains: { type: 'string', description: 'Exclude domains filter' },
+    category: { type: 'string', description: 'Category filter' },
+    text: { type: 'boolean', description: 'Include text content' },
+    highlights: { type: 'boolean', description: 'Include highlights' },
+    summary: { type: 'boolean', description: 'Include summary' },
+    livecrawl: { type: 'string', description: 'Live crawl mode' },
+    startCrawlDate: { type: 'string', description: 'Earliest crawl date (ISO 8601)' },
+    endCrawlDate: { type: 'string', description: 'Latest crawl date (ISO 8601)' },
+    startPublishedDate: { type: 'string', description: 'Earliest published date (ISO 8601)' },
+    endPublishedDate: { type: 'string', description: 'Latest published date (ISO 8601)' },
     // Get Contents operation
     urls: { type: 'string', description: 'URLs to retrieve' },
-    text: { type: 'boolean', description: 'Include text content' },
     summaryQuery: { type: 'string', description: 'Summary query guidance' },
+    subpages: { type: 'number', description: 'Number of subpages to crawl' },
+    subpageTarget: { type: 'string', description: 'Subpage target keywords' },
     // Find Similar Links operation
     url: { type: 'string', description: 'Source URL' },
+    excludeSourceDomain: { type: 'boolean', description: 'Exclude source domain' },
+    // Research operation
+    model: { type: 'string', description: 'Research model selection' },
   },
   outputs: {
     // Search output

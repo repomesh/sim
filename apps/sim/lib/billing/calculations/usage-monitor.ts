@@ -1,10 +1,21 @@
 import { db } from '@sim/db'
-import { member, organization, userStats } from '@sim/db/schema'
-import { eq, inArray } from 'drizzle-orm'
-import { getOrganizationSubscription, getPlanPricing } from '@/lib/billing/core/billing'
-import { getUserUsageLimit } from '@/lib/billing/core/usage'
-import { isBillingEnabled } from '@/lib/environment'
-import { createLogger } from '@/lib/logs/console/logger'
+import { member, userStats } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
+import { and, eq } from 'drizzle-orm'
+import {
+  getHighestPrioritySubscription,
+  type HighestPrioritySubscription,
+} from '@/lib/billing/core/plan'
+import { getPooledOrgCurrentPeriodCost, getUserUsageLimit } from '@/lib/billing/core/usage'
+import {
+  computeDailyRefreshConsumed,
+  getOrgMemberRefreshBounds,
+} from '@/lib/billing/credits/daily-refresh'
+import { getPlanTierDollars, isPaid } from '@/lib/billing/plan-helpers'
+import { isOrgScopedSubscription } from '@/lib/billing/subscriptions/utils'
+import { toDecimal, toNumber } from '@/lib/billing/utils/decimal'
+import { isBillingEnabled } from '@/lib/core/config/feature-flags'
 
 const logger = createLogger('UsageMonitor')
 
@@ -16,22 +27,67 @@ interface UsageData {
   isExceeded: boolean
   currentUsage: number
   limit: number
+  /**
+   * Whether the returned values are this user's individual slice or the
+   * organization's pooled total/cap. When an org pool is the blocker,
+   * the pooled values are surfaced here so error messages reflect it.
+   */
+  scope: 'user' | 'organization'
+  /** Present only when `scope === 'organization'`. */
+  organizationId: string | null
+}
+
+/**
+ * Sum `currentPeriodCost` across all members of an org, then subtract
+ * daily-refresh credits (with per-user window bounds for mid-cycle
+ * joiners).
+ */
+async function computePooledOrgUsage(
+  organizationId: string,
+  sub: {
+    plan: string | null
+    seats: number | null
+    periodStart: Date | null
+    periodEnd: Date | null
+  }
+): Promise<number> {
+  const { memberIds, currentPeriodCost } = await getPooledOrgCurrentPeriodCost(organizationId)
+  if (memberIds.length === 0) return 0
+
+  let pooled = currentPeriodCost
+
+  if (isPaid(sub.plan) && sub.periodStart) {
+    const planDollars = getPlanTierDollars(sub.plan)
+    if (planDollars > 0) {
+      const userBounds = await getOrgMemberRefreshBounds(organizationId, sub.periodStart)
+      const refresh = await computeDailyRefreshConsumed({
+        userIds: memberIds,
+        periodStart: sub.periodStart,
+        periodEnd: sub.periodEnd ?? null,
+        planDollars,
+        seats: sub.seats || 1,
+        userBounds: Object.keys(userBounds).length > 0 ? userBounds : undefined,
+      })
+      pooled = Math.max(0, pooled - refresh)
+    }
+  }
+
+  return pooled
 }
 
 /**
  * Checks a user's cost usage against their subscription plan limit
  * and returns usage information including whether they're approaching the limit
  */
-export async function checkUsageStatus(userId: string): Promise<UsageData> {
+export async function checkUsageStatus(
+  userId: string,
+  preloadedSubscription?: HighestPrioritySubscription
+): Promise<UsageData> {
   try {
-    // If billing is disabled, always return permissive limits
     if (!isBillingEnabled) {
-      // Get actual usage from the database for display purposes
       const statsRecords = await db.select().from(userStats).where(eq(userStats.userId, userId))
       const currentUsage =
-        statsRecords.length > 0
-          ? Number.parseFloat(statsRecords[0].currentPeriodCost?.toString())
-          : 0
+        statsRecords.length > 0 ? toNumber(toDecimal(statsRecords[0].currentPeriodCost)) : 0
 
       return {
         percentUsed: Math.min((currentUsage / 1000) * 100, 100),
@@ -39,100 +95,67 @@ export async function checkUsageStatus(userId: string): Promise<UsageData> {
         isExceeded: false,
         currentUsage,
         limit: 1000,
+        scope: 'user',
+        organizationId: null,
       }
     }
 
-    // Get usage limit from user_stats (per-user cap)
-    const limit = await getUserUsageLimit(userId)
+    const sub =
+      preloadedSubscription !== undefined
+        ? preloadedSubscription
+        : await getHighestPrioritySubscription(userId)
+
+    const limit = await getUserUsageLimit(userId, sub)
     logger.info('Using stored usage limit', { userId, limit })
 
-    // Get actual usage from the database
-    const statsRecords = await db.select().from(userStats).where(eq(userStats.userId, userId))
+    const subIsOrgScoped = isOrgScopedSubscription(sub, userId)
+    const scope: 'user' | 'organization' = subIsOrgScoped ? 'organization' : 'user'
+    const organizationId: string | null = subIsOrgScoped && sub ? sub.referenceId : null
 
-    // If no stats record exists, create a default one
-    if (statsRecords.length === 0) {
-      logger.info('No usage stats found for user', { userId, limit })
+    let currentUsage = 0
 
-      return {
-        percentUsed: 0,
-        isWarning: false,
-        isExceeded: false,
-        currentUsage: 0,
-        limit,
-      }
-    }
+    if (subIsOrgScoped && sub) {
+      currentUsage = await computePooledOrgUsage(sub.referenceId, sub)
+    } else {
+      const statsRecords = await db
+        .select()
+        .from(userStats)
+        .where(eq(userStats.userId, userId))
+        .limit(1)
 
-    // Get the current period cost from the user stats (use currentPeriodCost if available, fallback to totalCost)
-    const currentUsage = Number.parseFloat(
-      statsRecords[0].currentPeriodCost?.toString() || statsRecords[0].totalCost.toString()
-    )
-
-    // Calculate percentage used
-    const percentUsed = Math.min((currentUsage / limit) * 100, 100)
-
-    // Check org-level cap for team/enterprise pooled usage
-    let isExceeded = currentUsage >= limit
-    let isWarning = percentUsed >= WARNING_THRESHOLD && percentUsed < 100
-    try {
-      const memberships = await db
-        .select({ organizationId: member.organizationId })
-        .from(member)
-        .where(eq(member.userId, userId))
-      if (memberships.length > 0) {
-        for (const m of memberships) {
-          const orgRows = await db
-            .select({ id: organization.id, orgUsageLimit: organization.orgUsageLimit })
-            .from(organization)
-            .where(eq(organization.id, m.organizationId))
-            .limit(1)
-          if (orgRows.length) {
-            const org = orgRows[0]
-            // Sum pooled usage
-            const teamMembers = await db
-              .select({ userId: member.userId })
-              .from(member)
-              .where(eq(member.organizationId, org.id))
-
-            // Get all team member usage in a single query to avoid N+1
-            let pooledUsage = 0
-            if (teamMembers.length > 0) {
-              const memberIds = teamMembers.map((tm) => tm.userId)
-              const allMemberStats = await db
-                .select({ current: userStats.currentPeriodCost, total: userStats.totalCost })
-                .from(userStats)
-                .where(inArray(userStats.userId, memberIds))
-
-              for (const stats of allMemberStats) {
-                pooledUsage += Number.parseFloat(
-                  stats.current?.toString() || stats.total.toString()
-                )
-              }
-            }
-            // Determine org cap
-            let orgCap = org.orgUsageLimit ? Number.parseFloat(String(org.orgUsageLimit)) : 0
-            if (!orgCap || Number.isNaN(orgCap)) {
-              // Fall back to minimum billing amount from Stripe subscription
-              const orgSub = await getOrganizationSubscription(org.id)
-              if (orgSub?.seats) {
-                const { basePrice } = getPlanPricing(orgSub.plan)
-                orgCap = (orgSub.seats || 1) * basePrice
-              } else {
-                // If no subscription, use team default
-                const { basePrice } = getPlanPricing('team')
-                orgCap = basePrice // Default to 1 seat minimum
-              }
-            }
-            if (pooledUsage >= orgCap) {
-              isExceeded = true
-              isWarning = false
-              break
-            }
-          }
+      if (statsRecords.length === 0) {
+        logger.info('No usage stats found for user', { userId, limit })
+        return {
+          percentUsed: 0,
+          isWarning: false,
+          isExceeded: false,
+          currentUsage: 0,
+          limit,
+          scope: 'user',
+          organizationId: null,
         }
       }
-    } catch (error) {
-      logger.warn('Error checking organization usage limits', { error, userId })
+
+      const rawUsage = toNumber(toDecimal(statsRecords[0].currentPeriodCost))
+
+      let refresh = 0
+      if (sub && isPaid(sub.plan) && sub.periodStart) {
+        const planDollars = getPlanTierDollars(sub.plan)
+        if (planDollars > 0) {
+          refresh = await computeDailyRefreshConsumed({
+            userIds: [userId],
+            periodStart: sub.periodStart,
+            periodEnd: sub.periodEnd ?? null,
+            planDollars,
+          })
+        }
+      }
+      currentUsage = Math.max(0, rawUsage - refresh)
     }
+
+    const percentUsed = limit > 0 ? Math.min((currentUsage / limit) * 100, 100) : 100
+    const isExceeded = currentUsage >= limit
+    const isWarning = !isExceeded && percentUsed >= WARNING_THRESHOLD
 
     logger.info('Final usage statistics', {
       userId,
@@ -141,6 +164,8 @@ export async function checkUsageStatus(userId: string): Promise<UsageData> {
       percentUsed,
       isWarning,
       isExceeded,
+      scope,
+      organizationId,
     })
 
     return {
@@ -149,6 +174,8 @@ export async function checkUsageStatus(userId: string): Promise<UsageData> {
       isExceeded,
       currentUsage,
       limit,
+      scope,
+      organizationId,
     }
   } catch (error) {
     logger.error('Error checking usage status', {
@@ -159,15 +186,17 @@ export async function checkUsageStatus(userId: string): Promise<UsageData> {
     // Block execution if we can't determine usage status
     logger.error('Cannot determine usage status - blocking execution', {
       userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toError(error).message,
     })
 
     return {
       percentUsed: 100,
       isWarning: false,
-      isExceeded: true, // Block execution when we can't determine status
+      isExceeded: true,
       currentUsage: 0,
-      limit: 0, // Zero limit forces blocking
+      limit: 0,
+      scope: 'user',
+      organizationId: null,
     }
   }
 }
@@ -176,9 +205,8 @@ export async function checkUsageStatus(userId: string): Promise<UsageData> {
  * Displays a notification to the user when they're approaching their usage limit
  * Can be called on app startup or before executing actions that might incur costs
  */
-export async function checkAndNotifyUsage(userId: string): Promise<void> {
+async function checkAndNotifyUsage(userId: string): Promise<void> {
   try {
-    // Skip usage notifications if billing is disabled
     if (!isBillingEnabled) {
       return
     }
@@ -186,14 +214,12 @@ export async function checkAndNotifyUsage(userId: string): Promise<void> {
     const usageData = await checkUsageStatus(userId)
 
     if (usageData.isExceeded) {
-      // User has exceeded their limit
       logger.warn('User has exceeded usage limits', {
         userId,
         usage: usageData.currentUsage,
         limit: usageData.limit,
       })
 
-      // Dispatch event to show a UI notification
       if (typeof window !== 'undefined') {
         window.dispatchEvent(
           new CustomEvent('usage-exceeded', {
@@ -202,7 +228,6 @@ export async function checkAndNotifyUsage(userId: string): Promise<void> {
         )
       }
     } else if (usageData.isWarning) {
-      // User is approaching their limit
       logger.info('User approaching usage limits', {
         userId,
         usage: usageData.currentUsage,
@@ -210,18 +235,10 @@ export async function checkAndNotifyUsage(userId: string): Promise<void> {
         percent: usageData.percentUsed,
       })
 
-      // Dispatch event to show a UI notification
       if (typeof window !== 'undefined') {
         window.dispatchEvent(
           new CustomEvent('usage-warning', {
             detail: { usageData },
-          })
-        )
-
-        // Optionally open the subscription tab in settings
-        window.dispatchEvent(
-          new CustomEvent('open-settings', {
-            detail: { tab: 'subscription' },
           })
         )
       }
@@ -238,7 +255,10 @@ export async function checkAndNotifyUsage(userId: string): Promise<void> {
  * @param userId The ID of the user to check
  * @returns An object containing the exceeded status and usage details
  */
-export async function checkServerSideUsageLimits(userId: string): Promise<{
+export async function checkServerSideUsageLimits(
+  userId: string,
+  preloadedSubscription?: HighestPrioritySubscription
+): Promise<{
   isExceeded: boolean
   currentUsage: number
   limit: number
@@ -258,33 +278,79 @@ export async function checkServerSideUsageLimits(userId: string): Promise<{
     const stats = await db
       .select({
         blocked: userStats.billingBlocked,
+        blockedReason: userStats.billingBlockedReason,
         current: userStats.currentPeriodCost,
-        total: userStats.totalCost,
       })
       .from(userStats)
       .where(eq(userStats.userId, userId))
       .limit(1)
+
+    const currentUsage = stats.length > 0 ? toNumber(toDecimal(stats[0].current)) : 0
+
     if (stats.length > 0 && stats[0].blocked) {
-      const currentUsage = Number.parseFloat(
-        stats[0].current?.toString() || stats[0].total.toString()
-      )
+      const message =
+        stats[0].blockedReason === 'dispute'
+          ? 'Account frozen. Please contact support to resolve this issue.'
+          : 'Billing issue detected. Please update your payment method to continue.'
       return {
         isExceeded: true,
         currentUsage,
         limit: 0,
-        message: 'Billing issue detected. Please update your payment method to continue.',
+        message,
       }
     }
 
-    const usageData = await checkUsageStatus(userId)
+    const memberships = await db
+      .select({ organizationId: member.organizationId })
+      .from(member)
+      .where(eq(member.userId, userId))
+
+    for (const m of memberships) {
+      const owners = await db
+        .select({ userId: member.userId })
+        .from(member)
+        .where(and(eq(member.organizationId, m.organizationId), eq(member.role, 'owner')))
+        .limit(1)
+
+      if (owners.length > 0) {
+        const ownerStats = await db
+          .select({
+            blocked: userStats.billingBlocked,
+            blockedReason: userStats.billingBlockedReason,
+          })
+          .from(userStats)
+          .where(eq(userStats.userId, owners[0].userId))
+          .limit(1)
+
+        if (ownerStats.length > 0 && ownerStats[0].blocked) {
+          const message =
+            ownerStats[0].blockedReason === 'dispute'
+              ? 'Organization account frozen. Please contact support to resolve this issue.'
+              : 'Organization billing issue. Please contact your organization owner.'
+          return {
+            isExceeded: true,
+            currentUsage,
+            limit: 0,
+            message,
+          }
+        }
+      }
+    }
+
+    const usageData = await checkUsageStatus(userId, preloadedSubscription)
+
+    const formattedUsage = (usageData.currentUsage ?? 0).toFixed(2)
+    const formattedLimit = (usageData.limit ?? 0).toFixed(2)
+    const exceededMessage =
+      usageData.scope === 'organization'
+        ? `Organization usage limit exceeded: $${formattedUsage} pooled of $${formattedLimit} organization limit. Ask a team admin to raise the organization usage limit to continue.`
+        : `Usage limit exceeded: $${formattedUsage} used of $${formattedLimit} limit. Please upgrade your plan or raise your usage limit to continue.`
 
     return {
       isExceeded: usageData.isExceeded,
       currentUsage: usageData.currentUsage,
       limit: usageData.limit,
-      message: usageData.isExceeded
-        ? `Usage limit exceeded: ${usageData.currentUsage?.toFixed(2) || 0}$ used of ${usageData.limit?.toFixed(2) || 0}$ limit. Please upgrade your plan to continue.`
-        : undefined,
+      message: usageData.isExceeded ? exceededMessage : undefined,
     }
   } catch (error) {
     logger.error('Error in server-side usage limit check', {
@@ -294,13 +360,13 @@ export async function checkServerSideUsageLimits(userId: string): Promise<{
 
     logger.error('Cannot determine usage limits - blocking execution', {
       userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: toError(error).message,
     })
 
     return {
-      isExceeded: true, // Block execution when we can't determine limits
+      isExceeded: true,
       currentUsage: 0,
-      limit: 0, // Zero limit forces blocking
+      limit: 0,
       message:
         error instanceof Error && error.message.includes('No user stats record found')
           ? 'User account not properly initialized. Please contact support.'

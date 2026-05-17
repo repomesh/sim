@@ -1,19 +1,35 @@
+import { createLogger } from '@sim/logger'
+import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { type NextRequest, NextResponse } from 'next/server'
+import { guardrailsValidateContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { validateHallucination } from '@/lib/guardrails/validate_hallucination'
 import { validateJson } from '@/lib/guardrails/validate_json'
 import { validatePII } from '@/lib/guardrails/validate_pii'
 import { validateRegex } from '@/lib/guardrails/validate_regex'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import {
+  assertPermissionsAllowed,
+  ProviderNotAllowedError,
+} from '@/ee/access-control/utils/permission-check'
 
 const logger = createLogger('GuardrailsValidateAPI')
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
   logger.info(`[${requestId}] Guardrails validation request received`)
 
   try {
-    const body = await request.json()
+    const auth = await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseRequest(guardrailsValidateContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { body } = parsed.data
     const {
       validationType,
       input,
@@ -23,6 +39,14 @@ export async function POST(request: NextRequest) {
       topK,
       model,
       apiKey,
+      azureEndpoint,
+      azureApiVersion,
+      vertexProject,
+      vertexLocation,
+      vertexCredential,
+      bedrockAccessKeyId,
+      bedrockSecretKey,
+      bedrockRegion,
       workflowId,
       piiEntityTypes,
       piiMode,
@@ -94,12 +118,74 @@ export async function POST(request: NextRequest) {
       })
     }
 
+    let resolvedWorkspaceId: string | undefined
+
+    if (validationType === 'hallucination' && model) {
+      if (!workflowId || typeof workflowId !== 'string') {
+        return NextResponse.json({
+          success: true,
+          output: {
+            passed: false,
+            validationType,
+            input: input || '',
+            error:
+              'Workflow context is required for hallucination validation. Call this endpoint via a workflow execution, not directly.',
+          },
+        })
+      }
+
+      const authorization = await authorizeWorkflowByWorkspacePermission({
+        workflowId,
+        userId: auth.userId,
+        action: 'read',
+      })
+
+      if (!authorization.allowed || !authorization.workflow?.workspaceId) {
+        return NextResponse.json({
+          success: true,
+          output: {
+            passed: false,
+            validationType,
+            input: input || '',
+            error: authorization.message || 'Workflow not found or access denied.',
+          },
+        })
+      }
+
+      resolvedWorkspaceId = authorization.workflow.workspaceId
+
+      try {
+        await assertPermissionsAllowed({
+          userId: auth.userId,
+          workspaceId: resolvedWorkspaceId,
+          model,
+        })
+      } catch (err) {
+        if (err instanceof ProviderNotAllowedError) {
+          return NextResponse.json({
+            success: true,
+            output: {
+              passed: false,
+              validationType,
+              input: input || '',
+              error: err.message,
+            },
+          })
+        }
+        throw err
+      }
+    }
+
     const inputStr = convertInputToString(input)
 
     logger.info(`[${requestId}] Executing validation locally`, {
       validationType,
       inputType: typeof input,
     })
+    const authHeaders = {
+      cookie: request.headers.get('cookie') || undefined,
+      authorization: request.headers.get('authorization') || undefined,
+    }
 
     const validationResult = await executeValidation(
       validationType,
@@ -110,10 +196,22 @@ export async function POST(request: NextRequest) {
       topK,
       model,
       apiKey,
+      {
+        azureEndpoint,
+        azureApiVersion,
+        vertexProject,
+        vertexLocation,
+        vertexCredential,
+        bedrockAccessKeyId,
+        bedrockSecretKey,
+        bedrockRegion,
+      },
       workflowId,
+      resolvedWorkspaceId,
       piiEntityTypes,
       piiMode,
       piiLanguage,
+      authHeaders,
       requestId
     )
 
@@ -148,7 +246,7 @@ export async function POST(request: NextRequest) {
       },
     })
   }
-}
+})
 
 /**
  * Convert input to string for validation
@@ -176,12 +274,24 @@ async function executeValidation(
   knowledgeBaseId: string | undefined,
   threshold: string | undefined,
   topK: string | undefined,
-  model: string,
+  model: string | undefined,
   apiKey: string | undefined,
+  providerCredentials: {
+    azureEndpoint?: string
+    azureApiVersion?: string
+    vertexProject?: string
+    vertexLocation?: string
+    vertexCredential?: string
+    bedrockAccessKeyId?: string
+    bedrockSecretKey?: string
+    bedrockRegion?: string
+  },
   workflowId: string | undefined,
+  workspaceId: string | undefined,
   piiEntityTypes: string[] | undefined,
   piiMode: string | undefined,
   piiLanguage: string | undefined,
+  authHeaders: { cookie?: string; authorization?: string } | undefined,
   requestId: string
 ): Promise<{
   passed: boolean
@@ -211,6 +321,12 @@ async function executeValidation(
         error: 'Knowledge base ID is required for hallucination check',
       }
     }
+    if (!model) {
+      return {
+        passed: false,
+        error: 'Model is required for hallucination validation',
+      }
+    }
 
     return await validateHallucination({
       userInput: inputStr,
@@ -219,7 +335,10 @@ async function executeValidation(
       topK: topK ? Number.parseInt(topK) : 10, // Default topK is 10
       model: model,
       apiKey,
+      providerCredentials,
       workflowId,
+      workspaceId,
+      authHeaders,
       requestId,
     })
   }

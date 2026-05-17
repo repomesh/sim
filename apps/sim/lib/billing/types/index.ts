@@ -2,18 +2,47 @@
  * Billing System Types
  * Centralized type definitions for the billing system
  */
+import { z } from 'zod'
 
-export interface EnterpriseSubscriptionMetadata {
-  plan: 'enterprise'
+export const enterpriseSubscriptionMetadataSchema = z.object({
+  plan: z
+    .string()
+    .transform((v) => v.toLowerCase())
+    .pipe(z.literal('enterprise')),
   // The referenceId must be provided in Stripe metadata to link to the organization
   // This gets stored in the subscription.referenceId column
-  referenceId: string
+  referenceId: z.string().min(1),
   // The fixed monthly price for this enterprise customer (as string from Stripe metadata)
   // This will be used to set the organization's usage limit
-  monthlyPrice: string
-  // Number of seats for invitation limits (not for billing) (as string from Stripe metadata)
-  // We set Stripe quantity to 1 and use this for actual seat count
-  seats: string
+  monthlyPrice: z.coerce.number().positive(),
+  // Number of seats for invitation limits (not for billing)
+  seats: z.coerce.number().int().positive(),
+  // Optional custom workspace concurrency limit for enterprise workspaces
+  workspaceConcurrencyLimit: z.coerce.number().int().positive().optional(),
+})
+
+export type EnterpriseSubscriptionMetadata = z.infer<typeof enterpriseSubscriptionMetadataSchema>
+
+const enterpriseWorkspaceConcurrencyMetadataSchema = z.object({
+  workspaceConcurrencyLimit: z.coerce.number().int().positive().optional(),
+})
+
+export type EnterpriseWorkspaceConcurrencyMetadata = z.infer<
+  typeof enterpriseWorkspaceConcurrencyMetadataSchema
+>
+
+export function parseEnterpriseSubscriptionMetadata(
+  value: unknown
+): EnterpriseSubscriptionMetadata | null {
+  const result = enterpriseSubscriptionMetadataSchema.safeParse(value)
+  return result.success ? result.data : null
+}
+
+export function parseEnterpriseWorkspaceConcurrencyMetadata(
+  value: unknown
+): EnterpriseWorkspaceConcurrencyMetadata | null {
+  const result = enterpriseWorkspaceConcurrencyMetadataSchema.safeParse(value)
+  return result.success ? result.data : null
 }
 
 export interface UsageData {
@@ -33,6 +62,15 @@ export interface UsageLimitInfo {
   minimumLimit: number
   plan: string
   updatedAt: Date | null
+  /**
+   * Whether the limit is stored on the user (`'user'`) or the organization
+   * (`'organization'`). Callers should route edits to the matching API
+   * context. Org-scoped includes any subscription whose `referenceId` is
+   * an organization id, regardless of plan name.
+   */
+  scope: 'user' | 'organization'
+  /** Present only when `scope === 'organization'`. */
+  organizationId: string | null
 }
 
 export interface BillingData {
@@ -44,17 +82,7 @@ export interface BillingData {
   daysRemaining: number
 }
 
-export interface UserSubscriptionState {
-  isPro: boolean
-  isTeam: boolean
-  isEnterprise: boolean
-  isFree: boolean
-  highestPrioritySubscription: any | null
-  hasExceededLimit: boolean
-  planName: string
-}
-
-export interface SubscriptionPlan {
+interface SubscriptionPlan {
   name: string
   priceId: string
   limits: {
@@ -62,7 +90,7 @@ export interface SubscriptionPlan {
   }
 }
 
-export interface BillingEntity {
+interface BillingEntity {
   id: string
   type: 'user' | 'organization'
   referenceId: string
@@ -71,7 +99,7 @@ export interface BillingEntity {
   updatedAt: Date
 }
 
-export interface BillingConfig {
+interface BillingConfig {
   id: string
   entityType: 'user' | 'organization'
   entityId: string
@@ -84,7 +112,7 @@ export interface BillingConfig {
   updatedAt: Date
 }
 
-export interface UsagePeriod {
+interface UsagePeriod {
   id: string
   entityType: 'user' | 'organization'
   entityId: string
@@ -98,12 +126,12 @@ export interface UsagePeriod {
   finalizedAt?: Date
 }
 
-export interface BillingStatus {
+interface BillingStatus {
   status: 'ok' | 'warning' | 'exceeded'
   usageData: UsageData
 }
 
-export interface TeamUsageLimit {
+interface TeamUsageLimit {
   userId: string
   userName: string
   userEmail: string
@@ -115,7 +143,7 @@ export interface TeamUsageLimit {
   limitUpdatedAt: Date | null
 }
 
-export interface BillingSummary {
+interface BillingSummary {
   userId: string
   email: string
   name: string
@@ -130,7 +158,7 @@ export interface BillingSummary {
   billingStatus: 'ok' | 'warning' | 'exceeded'
 }
 
-export interface SubscriptionAPIResponse {
+interface SubscriptionAPIResponse {
   isPaid: boolean
   isPro: boolean
   isTeam: boolean
@@ -142,7 +170,7 @@ export interface SubscriptionAPIResponse {
   usage: UsageData
 }
 
-export interface UsageLimitAPIResponse {
+interface UsageLimitAPIResponse {
   currentLimit: number
   canEdit: boolean
   minimumLimit: number
@@ -167,19 +195,19 @@ export type UsagePeriodStatus = 'active' | 'finalized' | 'billed'
 export type BillingStatusType = 'ok' | 'warning' | 'exceeded'
 
 // Error Types
-export interface BillingError {
+interface BillingError {
   code: string
   message: string
   details?: any
 }
 
-export interface UpdateUsageLimitResult {
+interface UpdateUsageLimitResult {
   success: boolean
   error?: string
 }
 
 // Hook Types for React
-export interface UseSubscriptionStateReturn {
+interface UseSubscriptionStateReturn {
   subscription: {
     isPaid: boolean
     isPro: boolean
@@ -203,7 +231,7 @@ export interface UseSubscriptionStateReturn {
   getDaysRemainingInPeriod: () => number | null
 }
 
-export interface UseUsageLimitReturn {
+interface UseUsageLimitReturn {
   currentLimit: number
   canEdit: boolean
   minimumLimit: number

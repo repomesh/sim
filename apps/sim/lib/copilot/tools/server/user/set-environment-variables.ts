@@ -1,21 +1,43 @@
-import { db } from '@sim/db'
-import { environment } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { z } from 'zod'
-import { createPermissionError, verifyWorkflowAccess } from '@/lib/copilot/auth/permissions'
-import type { BaseServerTool } from '@/lib/copilot/tools/server/base-tool'
-import { createLogger } from '@/lib/logs/console/logger'
-import { decryptSecret, encryptSecret } from '@/lib/utils'
+import { SetEnvironmentVariables } from '@/lib/copilot/generated/tool-catalog-v1'
+import {
+  ensureWorkflowAccess,
+  ensureWorkspaceAccess,
+  getDefaultWorkspaceId,
+} from '@/lib/copilot/tools/handlers/access'
+import type { BaseServerTool, ServerToolContext } from '@/lib/copilot/tools/server/base-tool'
+import { upsertPersonalEnvVars, upsertWorkspaceEnvVars } from '@/lib/environment/utils'
 
-interface SetEnvironmentVariablesParams {
-  variables: Record<string, any> | Array<{ name: string; value: string }>
-  workflowId?: string
+type EnvironmentVariableInputValue = string | number | boolean | null | undefined
+
+interface EnvironmentVariableInput {
+  name: string
+  value: EnvironmentVariableInputValue
 }
 
-const EnvVarSchema = z.object({ variables: z.record(z.string()) })
+interface SetEnvironmentVariablesParams {
+  variables: Record<string, EnvironmentVariableInputValue> | EnvironmentVariableInput[]
+  scope?: 'personal' | 'workspace'
+  workflowId?: string
+  workspaceId?: string
+}
+
+interface SetEnvironmentVariablesResult {
+  message: string
+  scope: 'personal' | 'workspace'
+  workspaceId?: string
+  variableCount: number
+  variableNames: string[]
+  addedVariables: string[]
+  updatedVariables: string[]
+  workspaceUpdatedVariables: string[]
+}
+
+const EnvVarSchema = z.object({ variables: z.record(z.string(), z.string()) })
 
 function normalizeVariables(
-  input: Record<string, any> | Array<{ name: string; value: string }>
+  input: Record<string, EnvironmentVariableInputValue> | EnvironmentVariableInput[]
 ): Record<string, string> {
   if (Array.isArray(input)) {
     return input.reduce(
@@ -33,102 +55,97 @@ function normalizeVariables(
   ) as Record<string, string>
 }
 
-export const setEnvironmentVariablesServerTool: BaseServerTool<SetEnvironmentVariablesParams, any> =
-  {
-    name: 'set_environment_variables',
-    async execute(
-      params: SetEnvironmentVariablesParams,
-      context?: { userId: string }
-    ): Promise<any> {
-      const logger = createLogger('SetEnvironmentVariablesServerTool')
-
-      if (!context?.userId) {
-        logger.error(
-          'Unauthorized attempt to set environment variables - no authenticated user context'
-        )
-        throw new Error('Authentication required')
-      }
-
-      const authenticatedUserId = context.userId
-      const { variables, workflowId } = params || ({} as SetEnvironmentVariablesParams)
-
-      if (workflowId) {
-        const { hasAccess } = await verifyWorkflowAccess(authenticatedUserId, workflowId)
-
-        if (!hasAccess) {
-          const errorMessage = createPermissionError('modify environment variables in')
-          logger.error('Unauthorized attempt to set environment variables', {
-            workflowId,
-            authenticatedUserId,
-          })
-          throw new Error(errorMessage)
-        }
-      }
-
-      const userId = authenticatedUserId
-
-      const normalized = normalizeVariables(variables || {})
-      const { variables: validatedVariables } = EnvVarSchema.parse({ variables: normalized })
-
-      const existingData = await db
-        .select()
-        .from(environment)
-        .where(eq(environment.userId, userId))
-        .limit(1)
-      const existingEncrypted = (existingData[0]?.variables as Record<string, string>) || {}
-
-      const toEncrypt: Record<string, string> = {}
-      const added: string[] = []
-      const updated: string[] = []
-      for (const [key, newVal] of Object.entries(validatedVariables)) {
-        if (!(key in existingEncrypted)) {
-          toEncrypt[key] = newVal
-          added.push(key)
-        } else {
-          try {
-            const { decrypted } = await decryptSecret(existingEncrypted[key])
-            if (decrypted !== newVal) {
-              toEncrypt[key] = newVal
-              updated.push(key)
-            }
-          } catch {
-            toEncrypt[key] = newVal
-            updated.push(key)
-          }
-        }
-      }
-
-      const newlyEncrypted = await Object.entries(toEncrypt).reduce(
-        async (accP, [key, val]) => {
-          const acc = await accP
-          const { encrypted } = await encryptSecret(val)
-          return { ...acc, [key]: encrypted }
-        },
-        Promise.resolve({} as Record<string, string>)
-      )
-
-      const finalEncrypted = { ...existingEncrypted, ...newlyEncrypted }
-
-      await db
-        .insert(environment)
-        .values({
-          id: crypto.randomUUID(),
-          userId,
-          variables: finalEncrypted,
-          updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [environment.userId],
-          set: { variables: finalEncrypted, updatedAt: new Date() },
-        })
-
-      return {
-        message: `Successfully processed ${Object.keys(validatedVariables).length} environment variable(s): ${added.length} added, ${updated.length} updated`,
-        variableCount: Object.keys(validatedVariables).length,
-        variableNames: Object.keys(validatedVariables),
-        totalVariableCount: Object.keys(finalEncrypted).length,
-        addedVariables: added,
-        updatedVariables: updated,
-      }
-    },
+async function resolveWorkspaceId(
+  params: SetEnvironmentVariablesParams,
+  context: ServerToolContext | undefined,
+  userId: string
+): Promise<string> {
+  if (params.workflowId) {
+    const { workflow } = await ensureWorkflowAccess(params.workflowId, userId, 'write')
+    if (!workflow.workspaceId) {
+      throw new Error(`Workflow ${params.workflowId} is not associated with a workspace`)
+    }
+    return workflow.workspaceId
   }
+
+  const workspaceId = params.workspaceId ?? context?.workspaceId
+  if (workspaceId) {
+    await ensureWorkspaceAccess(workspaceId, userId, 'write')
+    return workspaceId
+  }
+
+  return getDefaultWorkspaceId(userId)
+}
+
+export const setEnvironmentVariablesServerTool: BaseServerTool<
+  SetEnvironmentVariablesParams,
+  SetEnvironmentVariablesResult
+> = {
+  name: SetEnvironmentVariables.id,
+  async execute(
+    params: SetEnvironmentVariablesParams,
+    context?: ServerToolContext
+  ): Promise<SetEnvironmentVariablesResult> {
+    const logger = createLogger('SetEnvironmentVariablesServerTool')
+
+    if (!context?.userId) {
+      logger.error(
+        'Unauthorized attempt to set environment variables - no authenticated user context'
+      )
+      throw new Error('Authentication required')
+    }
+
+    const authenticatedUserId = context.userId
+    const { variables } = params || ({} as SetEnvironmentVariablesParams)
+    const scope = params.scope === 'personal' ? 'personal' : 'workspace'
+
+    const normalized = normalizeVariables(variables || {})
+    const { variables: validatedVariables } = EnvVarSchema.parse({ variables: normalized })
+    const variableNames = Object.keys(validatedVariables)
+    const added: string[] = []
+    const updated: string[] = []
+    let workspaceUpdated: string[] = []
+
+    let resolvedWorkspaceId: string | undefined
+    if (scope === 'workspace') {
+      resolvedWorkspaceId = await resolveWorkspaceId(params, context, authenticatedUserId)
+      workspaceUpdated = await upsertWorkspaceEnvVars(
+        resolvedWorkspaceId,
+        validatedVariables,
+        authenticatedUserId
+      )
+    } else {
+      const result = await upsertPersonalEnvVars(authenticatedUserId, validatedVariables)
+      added.push(...result.added)
+      updated.push(...result.updated)
+    }
+
+    const totalProcessed = added.length + updated.length + workspaceUpdated.length
+
+    logger.info('Saved environment variables', {
+      userId: authenticatedUserId,
+      scope,
+      addedCount: added.length,
+      updatedCount: updated.length,
+      workspaceUpdatedCount: workspaceUpdated.length,
+      workspaceId: resolvedWorkspaceId,
+    })
+
+    const parts: string[] = []
+    if (added.length > 0) parts.push(`${added.length} personal secret(s) added`)
+    if (updated.length > 0) parts.push(`${updated.length} personal secret(s) updated`)
+    if (workspaceUpdated.length > 0)
+      parts.push(`${workspaceUpdated.length} workspace secret(s) updated`)
+
+    return {
+      message: `Successfully processed ${totalProcessed} secret(s): ${parts.join(', ')}`,
+      scope,
+      workspaceId: resolvedWorkspaceId,
+      variableCount: variableNames.length,
+      variableNames,
+      addedVariables: added,
+      updatedVariables: updated,
+      workspaceUpdatedVariables: workspaceUpdated,
+    }
+  },
+}

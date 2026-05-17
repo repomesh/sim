@@ -9,12 +9,13 @@ export const ChatTriggerBlock: BlockConfig = {
   type: 'chat_trigger',
   triggerAllowed: true,
   name: 'Chat',
-  description: 'Start workflow from a chat deployment',
+  description: 'Legacy chat start block. Prefer the unified Start block.',
   longDescription: 'Chat trigger to run the workflow via deployed chat interfaces.',
   bestPractices: `
   - Can run the workflow manually to test implementation when this is the trigger point by passing in a message.
   `,
   category: 'triggers',
+  hideFromToolbar: true,
   bgColor: '#6F3DFA',
   icon: ChatTriggerIcon,
   subBlocks: [],
@@ -25,7 +26,7 @@ export const ChatTriggerBlock: BlockConfig = {
   outputs: {
     input: { type: 'string', description: 'User message' },
     conversationId: { type: 'string', description: 'Conversation ID' },
-    files: { type: 'files', description: 'Uploaded files' },
+    files: { type: 'file[]', description: 'Uploaded files' },
   },
   triggers: {
     enabled: true,

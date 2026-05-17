@@ -1,19 +1,30 @@
-import { NextResponse } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
-import { validateAlphanumericId, validateJiraCloudId } from '@/lib/security/input-validation'
-import { getJiraCloudId } from '@/tools/jira/utils'
+import { createLogger } from '@sim/logger'
+import { type NextRequest, NextResponse } from 'next/server'
+import {
+  jiraProjectSelectorContract,
+  jiraProjectsSelectorContract,
+} from '@/lib/api/contracts/selectors/jira'
+import { parseRequest } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { validateAlphanumericId, validateJiraCloudId } from '@/lib/core/security/input-validation'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { getJiraCloudId, parseAtlassianErrorMessage } from '@/tools/jira/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('JiraProjectsAPI')
 
-export async function GET(request: Request) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   try {
-    const url = new URL(request.url)
-    const domain = url.searchParams.get('domain')?.trim()
-    const accessToken = url.searchParams.get('accessToken')
-    const providedCloudId = url.searchParams.get('cloudId')
-    const query = url.searchParams.get('query') || ''
+    const auth = await checkSessionOrInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseRequest(jiraProjectsSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+
+    const { domain, accessToken, cloudId: providedCloudId, query = '' } = parsed.data.query
 
     if (!domain) {
       return NextResponse.json({ error: 'Domain is required' }, { status: 400 })
@@ -54,16 +65,12 @@ export async function GET(request: Request) {
     logger.info(`Response status: ${response.status} ${response.statusText}`)
 
     if (!response.ok) {
-      logger.error(`Jira API error: ${response.status} ${response.statusText}`)
-      let errorMessage
-      try {
-        const errorData = await response.json()
-        logger.error('Error details:', errorData)
-        errorMessage = errorData.message || `Failed to fetch projects (${response.status})`
-      } catch (_e) {
-        errorMessage = `Failed to fetch projects: ${response.status} ${response.statusText}`
-      }
-      return NextResponse.json({ error: errorMessage }, { status: response.status })
+      const errorText = await response.text()
+      logger.error('Jira API error:', { status: response.status, error: errorText })
+      return NextResponse.json(
+        { error: parseAtlassianErrorMessage(response.status, response.statusText, errorText) },
+        { status: response.status }
+      )
     }
 
     const data = await response.json()
@@ -96,11 +103,19 @@ export async function GET(request: Request) {
       { status: 500 }
     )
   }
-}
+})
 
-export async function POST(request: Request) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
-    const { domain, accessToken, projectId, cloudId: providedCloudId } = await request.json()
+    const auth = await checkSessionOrInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseRequest(jiraProjectSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+
+    const { domain, accessToken, projectId, cloudId: providedCloudId } = parsed.data.body
 
     if (!domain) {
       return NextResponse.json({ error: 'Domain is required' }, { status: 400 })
@@ -137,10 +152,10 @@ export async function POST(request: Request) {
     })
 
     if (!response.ok) {
-      const errorData = await response.json()
-      logger.error('Error details:', errorData)
+      const errorText = await response.text()
+      logger.error('Jira API error:', { status: response.status, error: errorText })
       return NextResponse.json(
-        { error: errorData.message || `Failed to fetch project (${response.status})` },
+        { error: parseAtlassianErrorMessage(response.status, response.statusText, errorText) },
         { status: response.status }
       )
     }
@@ -169,4 +184,4 @@ export async function POST(request: Request) {
       { status: 500 }
     )
   }
-}
+})

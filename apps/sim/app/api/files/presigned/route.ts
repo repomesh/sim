@@ -1,38 +1,33 @@
-import { PutObjectCommand } from '@aws-sdk/client-s3'
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { v4 as uuidv4 } from 'uuid'
+import { presignedUploadBodyContract, uploadTypeSchema } from '@/lib/api/contracts/storage-transfer'
+import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getStorageProvider, isUsingCloudStorage } from '@/lib/uploads'
-import { isImageFileType } from '@/lib/uploads/file-utils'
-// Dynamic imports for storage clients to avoid client-side bundling
-import {
-  BLOB_CHAT_CONFIG,
-  BLOB_CONFIG,
-  BLOB_COPILOT_CONFIG,
-  BLOB_KB_CONFIG,
-  BLOB_PROFILE_PICTURES_CONFIG,
-  S3_CHAT_CONFIG,
-  S3_CONFIG,
-  S3_COPILOT_CONFIG,
-  S3_KB_CONFIG,
-  S3_PROFILE_PICTURES_CONFIG,
-} from '@/lib/uploads/setup'
-import { validateFileType } from '@/lib/uploads/validation'
-import { createErrorResponse, createOptionsResponse } from '@/app/api/files/utils'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { CopilotFiles } from '@/lib/uploads'
+import type { StorageContext } from '@/lib/uploads/config'
+import { USE_BLOB_STORAGE } from '@/lib/uploads/config'
+import { generateExecutionFileKey } from '@/lib/uploads/contexts/execution/utils'
+import { generateWorkspaceFileKey } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
+import { generatePresignedUploadUrl, hasCloudStorage } from '@/lib/uploads/core/storage-service'
+import { insertFileMetadata } from '@/lib/uploads/server/metadata'
+import { isImageFileType } from '@/lib/uploads/utils/file-utils'
+import { validateAttachmentFileType, validateFileType } from '@/lib/uploads/utils/validation'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
+import { createErrorResponse } from '@/app/api/files/utils'
 
 const logger = createLogger('PresignedUploadAPI')
 
-interface PresignedUrlRequest {
-  fileName: string
-  contentType: string
-  fileSize: number
-  userId?: string
-  chatId?: string
-}
-
-type UploadType = 'general' | 'knowledge-base' | 'chat' | 'copilot' | 'profile-pictures'
+const VALID_UPLOAD_TYPES = [
+  'knowledge-base',
+  'chat',
+  'copilot',
+  'profile-pictures',
+  'mothership',
+  'workspace-logos',
+  'execution',
+] as const
 
 class PresignedUrlError extends Error {
   constructor(
@@ -45,62 +40,49 @@ class PresignedUrlError extends Error {
   }
 }
 
-class StorageConfigError extends PresignedUrlError {
-  constructor(message: string) {
-    super(message, 'STORAGE_CONFIG_ERROR', 500)
-  }
-}
-
 class ValidationError extends PresignedUrlError {
   constructor(message: string) {
     super(message, 'VALIDATION_ERROR', 400)
   }
 }
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    let data: PresignedUrlRequest
-    try {
-      data = await request.json()
-    } catch {
-      throw new ValidationError('Invalid JSON in request body')
+    const parsed = await parseRequest(
+      presignedUploadBodyContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          throw new ValidationError(getValidationErrorMessage(error, 'Invalid request data'))
+        },
+        invalidJsonResponse: () => {
+          throw new ValidationError('Invalid JSON in request body')
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
+
+    const { fileName, contentType, fileSize } = parsed.data.body
+
+    const uploadTypeParam = request.nextUrl.searchParams.get('type')
+    if (!uploadTypeParam) {
+      throw new ValidationError('type query parameter is required')
     }
 
-    const { fileName, contentType, fileSize } = data
-
-    if (!fileName?.trim()) {
-      throw new ValidationError('fileName is required and cannot be empty')
-    }
-    if (!contentType?.trim()) {
-      throw new ValidationError('contentType is required and cannot be empty')
-    }
-    if (!fileSize || fileSize <= 0) {
-      throw new ValidationError('fileSize must be a positive number')
-    }
-
-    const MAX_FILE_SIZE = 100 * 1024 * 1024
-    if (fileSize > MAX_FILE_SIZE) {
+    const uploadTypeResult = uploadTypeSchema.safeParse(uploadTypeParam)
+    if (!uploadTypeResult.success) {
       throw new ValidationError(
-        `File size (${fileSize} bytes) exceeds maximum allowed size (${MAX_FILE_SIZE} bytes)`
+        `Invalid type parameter. Must be one of: ${VALID_UPLOAD_TYPES.join(', ')}`
       )
     }
 
-    const uploadTypeParam = request.nextUrl.searchParams.get('type')
-    const uploadType: UploadType =
-      uploadTypeParam === 'knowledge-base'
-        ? 'knowledge-base'
-        : uploadTypeParam === 'chat'
-          ? 'chat'
-          : uploadTypeParam === 'copilot'
-            ? 'copilot'
-            : uploadTypeParam === 'profile-pictures'
-              ? 'profile-pictures'
-              : 'general'
+    const uploadType = uploadTypeResult.data as StorageContext
 
     if (uploadType === 'knowledge-base') {
       const fileValidationError = validateFileType(fileName, contentType)
@@ -109,66 +91,206 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Evaluate user id from session for copilot uploads
     const sessionUserId = session.user.id
 
-    // Validate copilot-specific requirements (use session user)
-    if (uploadType === 'copilot') {
-      if (!sessionUserId?.trim()) {
-        throw new ValidationError('Authenticated user session is required for copilot uploads')
-      }
-      // Only allow image uploads for copilot
-      if (!isImageFileType(contentType)) {
-        throw new ValidationError(
-          'Only image files (JPEG, PNG, GIF, WebP, SVG) are allowed for copilot uploads'
-        )
-      }
-    }
-
-    // Validate profile picture requirements
-    if (uploadType === 'profile-pictures') {
-      if (!sessionUserId?.trim()) {
-        throw new ValidationError(
-          'Authenticated user session is required for profile picture uploads'
-        )
-      }
-      // Only allow image uploads for profile pictures
-      if (!isImageFileType(contentType)) {
-        throw new ValidationError(
-          'Only image files (JPEG, PNG, GIF, WebP, SVG) are allowed for profile picture uploads'
-        )
-      }
-    }
-
-    if (!isUsingCloudStorage()) {
-      throw new StorageConfigError(
-        'Direct uploads are only available when cloud storage is enabled'
+    if (!hasCloudStorage()) {
+      logger.info(
+        `Local storage detected - presigned URL not available for ${fileName}, client will use API fallback`
       )
+      return NextResponse.json({
+        fileName,
+        presignedUrl: '', // Empty URL signals fallback to API upload
+        fileInfo: {
+          path: '',
+          key: '',
+          name: fileName,
+          size: fileSize,
+          type: contentType,
+        },
+        directUploadSupported: false,
+      })
     }
 
-    const storageProvider = getStorageProvider()
-    logger.info(`Generating ${uploadType} presigned URL for ${fileName} using ${storageProvider}`)
+    logger.info(`Generating ${uploadType} presigned URL for ${fileName}`)
 
-    switch (storageProvider) {
-      case 's3':
-        return await handleS3PresignedUrl(
+    let presignedUrlResponse
+
+    if (uploadType === 'copilot') {
+      try {
+        presignedUrlResponse = await CopilotFiles.generateCopilotUploadUrl({
           fileName,
           contentType,
           fileSize,
-          uploadType,
-          sessionUserId
+          userId: sessionUserId,
+          expirationSeconds: 3600,
+        })
+      } catch (error) {
+        throw new ValidationError(getErrorMessage(error, 'Copilot validation failed'))
+      }
+    } else if (uploadType === 'mothership') {
+      const workspaceId = request.nextUrl.searchParams.get('workspaceId')
+      if (!workspaceId?.trim()) {
+        throw new ValidationError('workspaceId query parameter is required for mothership uploads')
+      }
+
+      const permission = await getUserEntityPermissions(sessionUserId, 'workspace', workspaceId)
+      if (permission !== 'write' && permission !== 'admin') {
+        return NextResponse.json(
+          { error: 'Write or Admin access required for mothership uploads' },
+          { status: 403 }
         )
-      case 'blob':
-        return await handleBlobPresignedUrl(
-          fileName,
-          contentType,
-          fileSize,
-          uploadType,
-          sessionUserId
+      }
+
+      const fileValidationError = validateAttachmentFileType(fileName)
+      if (fileValidationError) {
+        throw new ValidationError(fileValidationError.message)
+      }
+
+      const customKey = generateWorkspaceFileKey(workspaceId, fileName)
+      presignedUrlResponse = await generatePresignedUploadUrl({
+        fileName,
+        contentType,
+        fileSize,
+        context: 'mothership',
+        userId: sessionUserId,
+        customKey,
+        expirationSeconds: 3600,
+        metadata: { workspaceId },
+      })
+
+      await insertFileMetadata({
+        key: presignedUrlResponse.key,
+        userId: sessionUserId,
+        workspaceId,
+        context: 'mothership',
+        originalName: fileName,
+        contentType,
+        size: fileSize,
+      })
+    } else if (uploadType === 'execution') {
+      const workflowId = request.nextUrl.searchParams.get('workflowId')
+      const executionId = request.nextUrl.searchParams.get('executionId')
+      const workspaceId = request.nextUrl.searchParams.get('workspaceId')
+      if (!workflowId?.trim() || !executionId?.trim() || !workspaceId?.trim()) {
+        throw new ValidationError(
+          'workflowId, executionId, and workspaceId query parameters are required for execution uploads'
         )
-      default:
-        throw new StorageConfigError(`Unknown storage provider: ${storageProvider}`)
+      }
+
+      const permission = await getUserEntityPermissions(sessionUserId, 'workspace', workspaceId)
+      if (permission !== 'write' && permission !== 'admin') {
+        return NextResponse.json(
+          { error: 'Write or Admin access required for execution uploads' },
+          { status: 403 }
+        )
+      }
+
+      const fileValidationError = validateAttachmentFileType(fileName)
+      if (fileValidationError) {
+        throw new ValidationError(fileValidationError.message)
+      }
+
+      const customKey = generateExecutionFileKey({ workspaceId, workflowId, executionId }, fileName)
+      presignedUrlResponse = await generatePresignedUploadUrl({
+        fileName,
+        contentType,
+        fileSize,
+        context: 'execution',
+        userId: sessionUserId,
+        customKey,
+        expirationSeconds: 3600,
+        metadata: { workspaceId, workflowId, executionId },
+      })
+
+      await insertFileMetadata({
+        key: presignedUrlResponse.key,
+        userId: sessionUserId,
+        workspaceId,
+        context: 'execution',
+        originalName: fileName,
+        contentType,
+        size: fileSize,
+      })
+    } else if (uploadType === 'workspace-logos') {
+      const workspaceId = request.nextUrl.searchParams.get('workspaceId')
+      if (!workspaceId?.trim()) {
+        throw new ValidationError(
+          'workspaceId query parameter is required for workspace-logos uploads'
+        )
+      }
+
+      const permission = await getUserEntityPermissions(sessionUserId, 'workspace', workspaceId)
+      if (permission !== 'admin') {
+        return NextResponse.json(
+          { error: 'Admin access required for workspace logo uploads' },
+          { status: 403 }
+        )
+      }
+
+      if (!isImageFileType(contentType)) {
+        throw new ValidationError(
+          'Only image files (JPEG, PNG, GIF, WebP, SVG) are allowed for workspace logo uploads'
+        )
+      }
+
+      presignedUrlResponse = await generatePresignedUploadUrl({
+        fileName,
+        contentType,
+        fileSize,
+        context: 'workspace-logos',
+        userId: sessionUserId,
+        expirationSeconds: 3600,
+        metadata: { workspaceId },
+      })
+
+      await insertFileMetadata({
+        key: presignedUrlResponse.key,
+        userId: sessionUserId,
+        workspaceId,
+        context: 'workspace-logos',
+        originalName: fileName,
+        contentType,
+        size: fileSize,
+      })
+    } else {
+      if (uploadType === 'profile-pictures') {
+        if (!sessionUserId?.trim()) {
+          throw new ValidationError(
+            'Authenticated user session is required for profile picture uploads'
+          )
+        }
+        if (!isImageFileType(contentType)) {
+          throw new ValidationError(
+            'Only image files (JPEG, PNG, GIF, WebP, SVG) are allowed for profile picture uploads'
+          )
+        }
+      }
+
+      presignedUrlResponse = await generatePresignedUploadUrl({
+        fileName,
+        contentType,
+        fileSize,
+        context: uploadType,
+        userId: sessionUserId,
+        expirationSeconds: 3600, // 1 hour
+      })
     }
+
+    const finalPath = `/api/files/serve/${USE_BLOB_STORAGE ? 'blob' : 's3'}/${encodeURIComponent(presignedUrlResponse.key)}?context=${uploadType}`
+
+    return NextResponse.json({
+      fileName,
+      presignedUrl: presignedUrlResponse.url,
+      fileInfo: {
+        path: finalPath,
+        key: presignedUrlResponse.key,
+        name: fileName,
+        size: fileSize,
+        type: contentType,
+      },
+      uploadHeaders: presignedUrlResponse.uploadHeaders,
+      directUploadSupported: true,
+    })
   } catch (error) {
     logger.error('Error generating presigned URL:', error)
 
@@ -187,236 +309,18 @@ export async function POST(request: NextRequest) {
       error instanceof Error ? error : new Error('Failed to generate presigned URL')
     )
   }
-}
+})
 
-async function handleS3PresignedUrl(
-  fileName: string,
-  contentType: string,
-  fileSize: number,
-  uploadType: UploadType,
-  userId?: string
-) {
-  try {
-    const config =
-      uploadType === 'knowledge-base'
-        ? S3_KB_CONFIG
-        : uploadType === 'chat'
-          ? S3_CHAT_CONFIG
-          : uploadType === 'copilot'
-            ? S3_COPILOT_CONFIG
-            : uploadType === 'profile-pictures'
-              ? S3_PROFILE_PICTURES_CONFIG
-              : S3_CONFIG
-
-    if (!config.bucket || !config.region) {
-      throw new StorageConfigError(`S3 configuration missing for ${uploadType} uploads`)
-    }
-
-    const safeFileName = fileName.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9.-]/g, '_')
-
-    let prefix = ''
-    if (uploadType === 'knowledge-base') {
-      prefix = 'kb/'
-    } else if (uploadType === 'chat') {
-      prefix = 'chat/'
-    } else if (uploadType === 'copilot') {
-      prefix = `${userId}/`
-    } else if (uploadType === 'profile-pictures') {
-      prefix = `${userId}/`
-    }
-
-    const uniqueKey = `${prefix}${uuidv4()}-${safeFileName}`
-
-    const { sanitizeFilenameForMetadata } = await import('@/lib/uploads/s3/s3-client')
-    const sanitizedOriginalName = sanitizeFilenameForMetadata(fileName)
-
-    const metadata: Record<string, string> = {
-      originalName: sanitizedOriginalName,
-      uploadedAt: new Date().toISOString(),
-    }
-
-    if (uploadType === 'knowledge-base') {
-      metadata.purpose = 'knowledge-base'
-    } else if (uploadType === 'chat') {
-      metadata.purpose = 'chat'
-    } else if (uploadType === 'copilot') {
-      metadata.purpose = 'copilot'
-      metadata.userId = userId || ''
-    } else if (uploadType === 'profile-pictures') {
-      metadata.purpose = 'profile-pictures'
-      metadata.userId = userId || ''
-    }
-
-    const command = new PutObjectCommand({
-      Bucket: config.bucket,
-      Key: uniqueKey,
-      ContentType: contentType,
-      Metadata: metadata,
-    })
-
-    let presignedUrl: string
-    try {
-      const { getS3Client } = await import('@/lib/uploads/s3/s3-client')
-      presignedUrl = await getSignedUrl(getS3Client(), command, { expiresIn: 3600 })
-    } catch (s3Error) {
-      logger.error('Failed to generate S3 presigned URL:', s3Error)
-      throw new StorageConfigError(
-        'Failed to generate S3 presigned URL - check AWS credentials and permissions'
-      )
-    }
-
-    const finalPath =
-      uploadType === 'chat' || uploadType === 'profile-pictures'
-        ? `https://${config.bucket}.s3.${config.region}.amazonaws.com/${uniqueKey}`
-        : `/api/files/serve/s3/${encodeURIComponent(uniqueKey)}`
-
-    logger.info(`Generated ${uploadType} S3 presigned URL for ${fileName} (${uniqueKey})`)
-    logger.info(`Presigned URL: ${presignedUrl}`)
-    logger.info(`Final path: ${finalPath}`)
-
-    return NextResponse.json({
-      presignedUrl,
-      uploadUrl: presignedUrl, // Make sure we're returning the uploadUrl field
-      fileInfo: {
-        path: finalPath,
-        key: uniqueKey,
-        name: fileName,
-        size: fileSize,
-        type: contentType,
+export const OPTIONS = withRouteHandler(async () => {
+  return NextResponse.json(
+    {},
+    {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       },
-      directUploadSupported: true,
-    })
-  } catch (error) {
-    if (error instanceof PresignedUrlError) {
-      throw error
     }
-    logger.error('Error in S3 presigned URL generation:', error)
-    throw new StorageConfigError('Failed to generate S3 presigned URL')
-  }
-}
-
-async function handleBlobPresignedUrl(
-  fileName: string,
-  contentType: string,
-  fileSize: number,
-  uploadType: UploadType,
-  userId?: string
-) {
-  try {
-    const config =
-      uploadType === 'knowledge-base'
-        ? BLOB_KB_CONFIG
-        : uploadType === 'chat'
-          ? BLOB_CHAT_CONFIG
-          : uploadType === 'copilot'
-            ? BLOB_COPILOT_CONFIG
-            : uploadType === 'profile-pictures'
-              ? BLOB_PROFILE_PICTURES_CONFIG
-              : BLOB_CONFIG
-
-    if (
-      !config.accountName ||
-      !config.containerName ||
-      (!config.accountKey && !config.connectionString)
-    ) {
-      throw new StorageConfigError(`Azure Blob configuration missing for ${uploadType} uploads`)
-    }
-
-    const safeFileName = fileName.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9.-]/g, '_')
-
-    let prefix = ''
-    if (uploadType === 'knowledge-base') {
-      prefix = 'kb/'
-    } else if (uploadType === 'chat') {
-      prefix = 'chat/'
-    } else if (uploadType === 'copilot') {
-      prefix = `${userId}/`
-    } else if (uploadType === 'profile-pictures') {
-      prefix = `${userId}/`
-    }
-
-    const uniqueKey = `${prefix}${uuidv4()}-${safeFileName}`
-
-    const { getBlobServiceClient } = await import('@/lib/uploads/blob/blob-client')
-    const blobServiceClient = getBlobServiceClient()
-    const containerClient = blobServiceClient.getContainerClient(config.containerName)
-    const blockBlobClient = containerClient.getBlockBlobClient(uniqueKey)
-
-    const { BlobSASPermissions, generateBlobSASQueryParameters, StorageSharedKeyCredential } =
-      await import('@azure/storage-blob')
-
-    const sasOptions = {
-      containerName: config.containerName,
-      blobName: uniqueKey,
-      permissions: BlobSASPermissions.parse('w'), // Write permission for upload
-      startsOn: new Date(),
-      expiresOn: new Date(Date.now() + 3600 * 1000), // 1 hour expiration
-    }
-
-    let sasToken: string
-    try {
-      sasToken = generateBlobSASQueryParameters(
-        sasOptions,
-        new StorageSharedKeyCredential(config.accountName, config.accountKey || '')
-      ).toString()
-    } catch (blobError) {
-      logger.error('Failed to generate Azure Blob SAS token:', blobError)
-      throw new StorageConfigError(
-        'Failed to generate Azure Blob SAS token - check Azure credentials and permissions'
-      )
-    }
-
-    const presignedUrl = `${blockBlobClient.url}?${sasToken}`
-
-    // For chat images and profile pictures, use direct Blob URLs since they need to be permanently accessible
-    // For other files, use serve path for access control
-    const finalPath =
-      uploadType === 'chat' || uploadType === 'profile-pictures'
-        ? blockBlobClient.url
-        : `/api/files/serve/blob/${encodeURIComponent(uniqueKey)}`
-
-    logger.info(`Generated ${uploadType} Azure Blob presigned URL for ${fileName} (${uniqueKey})`)
-
-    const uploadHeaders: Record<string, string> = {
-      'x-ms-blob-type': 'BlockBlob',
-      'x-ms-blob-content-type': contentType,
-      'x-ms-meta-originalname': encodeURIComponent(fileName),
-      'x-ms-meta-uploadedat': new Date().toISOString(),
-    }
-
-    if (uploadType === 'knowledge-base') {
-      uploadHeaders['x-ms-meta-purpose'] = 'knowledge-base'
-    } else if (uploadType === 'chat') {
-      uploadHeaders['x-ms-meta-purpose'] = 'chat'
-    } else if (uploadType === 'copilot') {
-      uploadHeaders['x-ms-meta-purpose'] = 'copilot'
-      uploadHeaders['x-ms-meta-userid'] = encodeURIComponent(userId || '')
-    } else if (uploadType === 'profile-pictures') {
-      uploadHeaders['x-ms-meta-purpose'] = 'profile-pictures'
-      uploadHeaders['x-ms-meta-userid'] = encodeURIComponent(userId || '')
-    }
-
-    return NextResponse.json({
-      presignedUrl,
-      fileInfo: {
-        path: finalPath,
-        key: uniqueKey,
-        name: fileName,
-        size: fileSize,
-        type: contentType,
-      },
-      directUploadSupported: true,
-      uploadHeaders,
-    })
-  } catch (error) {
-    if (error instanceof PresignedUrlError) {
-      throw error
-    }
-    logger.error('Error in Azure Blob presigned URL generation:', error)
-    throw new StorageConfigError('Failed to generate Azure Blob presigned URL')
-  }
-}
-
-export async function OPTIONS() {
-  return createOptionsResponse()
-}
+  )
+})

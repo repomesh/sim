@@ -1,33 +1,15 @@
 import { db } from '@sim/db'
 import { organization, subscription, user } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
 import { eq } from 'drizzle-orm'
 import type Stripe from 'stripe'
-import {
-  getEmailSubject,
-  renderEnterpriseSubscriptionEmail,
-} from '@/components/emails/render-email'
-import { sendEmail } from '@/lib/email/mailer'
-import { getFromEmailAddress } from '@/lib/email/utils'
-import { createLogger } from '@/lib/logs/console/logger'
-import type { EnterpriseSubscriptionMetadata } from '../types'
+import { getEmailSubject, renderEnterpriseSubscriptionEmail } from '@/components/emails'
+import { sendEmail } from '@/lib/messaging/email/mailer'
+import { getFromEmailAddress } from '@/lib/messaging/email/utils'
+import { parseEnterpriseSubscriptionMetadata } from '../types'
 
 const logger = createLogger('BillingEnterprise')
-
-function isEnterpriseMetadata(value: unknown): value is EnterpriseSubscriptionMetadata {
-  return (
-    !!value &&
-    typeof value === 'object' &&
-    'plan' in value &&
-    'referenceId' in value &&
-    'monthlyPrice' in value &&
-    'seats' in value &&
-    typeof value.plan === 'string' &&
-    value.plan.toLowerCase() === 'enterprise' &&
-    typeof value.referenceId === 'string' &&
-    typeof value.monthlyPrice === 'string' &&
-    typeof value.seats === 'string'
-  )
-}
 
 export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
   const stripeSubscription = event.data.object as Stripe.Subscription
@@ -66,43 +48,22 @@ export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
     throw new Error('Unable to resolve referenceId for subscription')
   }
 
-  if (!isEnterpriseMetadata(metadata)) {
+  const enterpriseMetadata = parseEnterpriseSubscriptionMetadata(metadata)
+  if (!enterpriseMetadata) {
     logger.error('[subscription.created] Invalid enterprise metadata shape', {
       subscriptionId: stripeSubscription.id,
       metadata,
     })
     throw new Error('Invalid enterprise metadata for subscription')
   }
-  const enterpriseMetadata = metadata
-  const metadataJson: Record<string, unknown> = { ...enterpriseMetadata }
 
-  // Extract and parse seats and monthly price from metadata (they come as strings from Stripe)
-  const seats = Number.parseInt(enterpriseMetadata.seats, 10)
-  const monthlyPrice = Number.parseFloat(enterpriseMetadata.monthlyPrice)
-
-  if (!seats || seats <= 0 || Number.isNaN(seats)) {
-    logger.error('[subscription.created] Invalid or missing seats in enterprise metadata', {
-      subscriptionId: stripeSubscription.id,
-      seatsRaw: enterpriseMetadata.seats,
-      seatsParsed: seats,
-    })
-    throw new Error('Enterprise subscription must include valid seats in metadata')
-  }
-
-  if (!monthlyPrice || monthlyPrice <= 0 || Number.isNaN(monthlyPrice)) {
-    logger.error('[subscription.created] Invalid or missing monthlyPrice in enterprise metadata', {
-      subscriptionId: stripeSubscription.id,
-      monthlyPriceRaw: enterpriseMetadata.monthlyPrice,
-      monthlyPriceParsed: monthlyPrice,
-    })
-    throw new Error('Enterprise subscription must include valid monthlyPrice in metadata')
-  }
+  const { seats, monthlyPrice } = enterpriseMetadata
 
   // Get the first subscription item which contains the period information
   const referenceItem = stripeSubscription.items?.data?.[0]
 
   const subscriptionRow = {
-    id: crypto.randomUUID(),
+    id: generateId(),
     plan: 'enterprise',
     referenceId,
     stripeCustomerId,
@@ -115,12 +76,12 @@ export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
       ? new Date(referenceItem.current_period_end * 1000)
       : null,
     cancelAtPeriodEnd: stripeSubscription.cancel_at_period_end ?? null,
-    seats,
+    seats: 1, // Enterprise uses metadata.seats for actual seat count, column is always 1
     trialStart: stripeSubscription.trial_start
       ? new Date(stripeSubscription.trial_start * 1000)
       : null,
     trialEnd: stripeSubscription.trial_end ? new Date(stripeSubscription.trial_end * 1000) : null,
-    metadata: metadataJson,
+    metadata: metadata as Record<string, unknown>,
   }
 
   const existing = await db
@@ -140,7 +101,7 @@ export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
         periodStart: subscriptionRow.periodStart,
         periodEnd: subscriptionRow.periodEnd,
         cancelAtPeriodEnd: subscriptionRow.cancelAtPeriodEnd,
-        seats: subscriptionRow.seats,
+        seats: 1, // Enterprise uses metadata.seats for actual seat count, column is always 1
         trialStart: subscriptionRow.trialStart,
         trialEnd: subscriptionRow.trialEnd,
         metadata: subscriptionRow.metadata,
@@ -208,7 +169,7 @@ export async function handleManualEnterpriseSubscription(event: Stripe.Event) {
       const user = userDetails[0]
       const org = orgDetails[0]
 
-      const html = await renderEnterpriseSubscriptionEmail(user.name || user.email, user.email)
+      const html = await renderEnterpriseSubscriptionEmail(user.name || user.email)
 
       const emailResult = await sendEmail({
         to: user.email,

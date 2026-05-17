@@ -1,49 +1,45 @@
 import { WorkflowIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 
-// Helper: list workflows excluding self
-const getAvailableWorkflows = (): Array<{ label: string; id: string }> => {
-  try {
-    const { workflows, activeWorkflowId } = useWorkflowRegistry.getState()
-    return Object.entries(workflows)
-      .filter(([id]) => id !== activeWorkflowId)
-      .map(([id, w]) => ({ label: w.name || `Workflow ${id.slice(0, 8)}`, id }))
-      .sort((a, b) => a.label.localeCompare(b.label))
-  } catch {
-    return []
-  }
-}
-
-// New workflow block variant that visualizes child Input Trigger schema for mapping
 export const WorkflowInputBlock: BlockConfig = {
   type: 'workflow_input',
   name: 'Workflow',
-  description: 'Execute another workflow and map variables to its Input Form Trigger schema.',
-  longDescription: `Execute another child workflow and map variables to its Input Form Trigger schema. Helps with modularizing workflows.`,
+  description: 'Execute another workflow and map variables to its Start trigger schema.',
+  longDescription: `Execute another child workflow and map variables to its Start trigger schema. Helps with modularizing workflows.`,
   bestPractices: `
   - Usually clarify/check if the user has tagged a workflow to use as the child workflow. Understand the child workflow to determine the logical position of this block in the workflow.
-  - Remember, that the start point of the child workflow is the Input Form Trigger block.
+  - Remember, that the start point of the child workflow is the Start block.
   `,
   category: 'blocks',
-  bgColor: '#6366F1', // Indigo - modern and professional
+  docsLink: 'https://docs.sim.ai/blocks/workflow',
+  bgColor: '#6366F1',
   icon: WorkflowIcon,
   subBlocks: [
     {
       id: 'workflowId',
       title: 'Select Workflow',
-      type: 'dropdown',
-      options: getAvailableWorkflows,
+      type: 'workflow-selector',
+      canonicalParamId: 'workflowId',
+      selectorKey: 'sim.workflows',
+      placeholder: 'Search workflows...',
       required: true,
+      mode: 'basic',
     },
-    // Renders dynamic mapping UI based on selected child workflow's Input Trigger inputFormat
+    {
+      id: 'manualWorkflowId',
+      title: 'Workflow ID',
+      type: 'short-input',
+      canonicalParamId: 'workflowId',
+      placeholder: 'Enter workflow ID',
+      required: true,
+      mode: 'advanced',
+    },
     {
       id: 'inputMapping',
-      title: 'Input Mapping',
+      title: 'Inputs',
       type: 'input-mapping',
-      layout: 'full',
       description:
-        "Map fields defined in the child workflow's Input Trigger to variables/values in this workflow.",
+        "Map fields defined in the child workflow's Start block to variables/values in this workflow.",
       dependsOn: ['workflowId'],
     },
   ],
@@ -57,7 +53,13 @@ export const WorkflowInputBlock: BlockConfig = {
   outputs: {
     success: { type: 'boolean', description: 'Execution success status' },
     childWorkflowName: { type: 'string', description: 'Child workflow name' },
+    childWorkflowId: { type: 'string', description: 'Child workflow ID' },
     result: { type: 'json', description: 'Workflow execution result' },
     error: { type: 'string', description: 'Error message' },
+    childTraceSpans: {
+      type: 'json',
+      description: 'Child workflow trace spans',
+      hiddenFromDisplay: true,
+    },
   },
 }

@@ -1,17 +1,24 @@
+import { toError } from '@sim/utils/errors'
 import { NotionIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import { AuthMode } from '@/blocks/types'
+import { AuthMode, IntegrationType } from '@/blocks/types'
+import { createVersionedToolSelector } from '@/blocks/utils'
 import type { NotionResponse } from '@/tools/notion/types'
+import { getTrigger } from '@/triggers'
 
+// Legacy block - hidden from toolbar
 export const NotionBlock: BlockConfig<NotionResponse> = {
   type: 'notion',
-  name: 'Notion',
+  name: 'Notion (Legacy)',
+  hideFromToolbar: true,
   description: 'Manage Notion pages',
   authMode: AuthMode.OAuth,
   longDescription:
     'Integrate with Notion into the workflow. Can read page, read database, create page, create database, append content, query database, and search workspace.',
   docsLink: 'https://docs.sim.ai/tools/notion',
   category: 'tools',
+  integrationType: IntegrationType.Documents,
+  tags: ['note-taking', 'knowledge-base', 'content-management'],
   bgColor: '#181C1E',
   icon: NotionIcon,
   subBlocks: [
@@ -19,12 +26,12 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Read Page', id: 'notion_read' },
         { label: 'Read Database', id: 'notion_read_database' },
         { label: 'Create Page', id: 'notion_create_page' },
         { label: 'Create Database', id: 'notion_create_database' },
+        { label: 'Add Database Row', id: 'notion_add_database_row' },
         { label: 'Append Content', id: 'notion_write' },
         { label: 'Query Database', id: 'notion_query_database' },
         { label: 'Search Workspace', id: 'notion_search' },
@@ -35,23 +42,64 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       id: 'credential',
       title: 'Notion Account',
       type: 'oauth-input',
-      layout: 'full',
-      provider: 'notion',
+      canonicalParamId: 'oauthCredential',
+      mode: 'basic',
       serviceId: 'notion',
-      requiredScopes: ['workspace.content', 'workspace.name', 'page.read', 'page.write'],
       placeholder: 'Select Notion account',
       required: true,
     },
-    // Read/Write operation - Page ID
+    {
+      id: 'manualCredential',
+      title: 'Notion Account',
+      type: 'short-input',
+      canonicalParamId: 'oauthCredential',
+      mode: 'advanced',
+      placeholder: 'Enter credential ID',
+      required: true,
+    },
+    {
+      id: 'pageSelector',
+      title: 'Page',
+      type: 'file-selector',
+      canonicalParamId: 'pageId',
+      serviceId: 'notion',
+      selectorKey: 'notion.pages',
+      placeholder: 'Select Notion page',
+      dependsOn: ['credential'],
+      mode: 'basic',
+      condition: {
+        field: 'operation',
+        value: ['notion_read', 'notion_write'],
+      },
+      required: true,
+    },
     {
       id: 'pageId',
       title: 'Page ID',
       type: 'short-input',
-      layout: 'full',
+      canonicalParamId: 'pageId',
       placeholder: 'Enter Notion page ID',
+      dependsOn: ['credential'],
+      mode: 'advanced',
       condition: {
         field: 'operation',
-        value: 'notion_read',
+        value: ['notion_read', 'notion_write'],
+      },
+      required: true,
+    },
+    {
+      id: 'databaseSelector',
+      title: 'Database',
+      type: 'project-selector',
+      canonicalParamId: 'databaseId',
+      serviceId: 'notion',
+      selectorKey: 'notion.databases',
+      placeholder: 'Select Notion database',
+      dependsOn: ['credential'],
+      mode: 'basic',
+      condition: {
+        field: 'operation',
+        value: ['notion_read_database', 'notion_query_database', 'notion_add_database_row'],
       },
       required: true,
     },
@@ -59,45 +107,54 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       id: 'databaseId',
       title: 'Database ID',
       type: 'short-input',
-      layout: 'full',
+      canonicalParamId: 'databaseId',
       placeholder: 'Enter Notion database ID',
+      dependsOn: ['credential'],
+      mode: 'advanced',
       condition: {
         field: 'operation',
-        value: 'notion_read_database',
+        value: ['notion_read_database', 'notion_query_database', 'notion_add_database_row'],
       },
       required: true,
     },
     {
-      id: 'pageId',
-      title: 'Page ID',
-      type: 'short-input',
-      layout: 'full',
-      placeholder: 'Enter Notion page ID',
-      condition: {
-        field: 'operation',
-        value: 'notion_write',
-      },
+      id: 'parentSelector',
+      title: 'Parent Page',
+      type: 'file-selector',
+      canonicalParamId: 'parentId',
+      serviceId: 'notion',
+      selectorKey: 'notion.pages',
+      placeholder: 'Select parent page',
+      dependsOn: ['credential'],
+      mode: 'basic',
+      condition: { field: 'operation', value: ['notion_create_page', 'notion_create_database'] },
       required: true,
     },
-    // Create operation fields
     {
       id: 'parentId',
       title: 'Parent Page ID',
       type: 'short-input',
-      layout: 'full',
+      canonicalParamId: 'parentId',
       placeholder: 'ID of parent page',
-      condition: { field: 'operation', value: 'notion_create_page' },
+      dependsOn: ['credential'],
+      mode: 'advanced',
+      condition: { field: 'operation', value: ['notion_create_page', 'notion_create_database'] },
       required: true,
     },
     {
       id: 'title',
       title: 'Page Title',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Title for the new page',
       condition: {
         field: 'operation',
         value: 'notion_create_page',
+      },
+      wandConfig: {
+        enabled: true,
+        prompt:
+          "Generate a concise, descriptive title for a Notion page based on the user's description. The title should be clear and professional. Return ONLY the title text - no explanations, no quotes.",
+        placeholder: 'Describe what the page is about...',
       },
     },
     // Content input for write/create operations
@@ -105,58 +162,70 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       id: 'content',
       title: 'Content',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter content to add to the page',
       condition: {
         field: 'operation',
         value: 'notion_write',
       },
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt:
+          "Generate content to append to a Notion page based on the user's description. The content can include paragraphs, lists, headings, and other text elements. Format it appropriately for Notion. Return ONLY the content - no explanations.",
+        placeholder: 'Describe the content you want to add...',
+      },
     },
     {
       id: 'content',
       title: 'Content',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter content to add to the page',
       condition: {
         field: 'operation',
         value: 'notion_create_page',
       },
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt:
+          "Generate content for a new Notion page based on the user's description. The content can include paragraphs, lists, headings, and other text elements. Format it appropriately for Notion. Return ONLY the content - no explanations.",
+        placeholder: 'Describe the content you want to create...',
+      },
     },
     // Query Database Fields
     {
-      id: 'databaseId',
-      title: 'Database ID',
-      type: 'short-input',
-      layout: 'full',
-      placeholder: 'Enter Notion database ID',
-      condition: { field: 'operation', value: 'notion_query_database' },
-      required: true,
-    },
-    {
       id: 'filter',
-      title: 'Filter (JSON)',
-      type: 'long-input',
-      layout: 'full',
+      title: 'Filter',
+      type: 'code',
       placeholder: 'Enter filter conditions as JSON (optional)',
       condition: { field: 'operation', value: 'notion_query_database' },
-      required: true,
+      wandConfig: {
+        enabled: true,
+        prompt:
+          'Generate a Notion database filter object in JSON format based on the user\'s description. Notion filters use properties like "property", "equals", "contains", "checkbox", "date", etc. Example: {"property": "Status", "select": {"equals": "Done"}}. For compound filters use "and" or "or" arrays. Return ONLY valid JSON - no explanations.',
+        placeholder:
+          'Describe what you want to filter (e.g., "status is done", "created after last week")...',
+        generationType: 'json-object',
+      },
     },
     {
       id: 'sorts',
-      title: 'Sort Criteria (JSON)',
-      type: 'long-input',
-      layout: 'full',
+      title: 'Sort Criteria',
+      type: 'code',
       placeholder: 'Enter sort criteria as JSON array (optional)',
       condition: { field: 'operation', value: 'notion_query_database' },
+      wandConfig: {
+        enabled: true,
+        prompt:
+          'Generate a Notion database sort criteria array in JSON format based on the user\'s description. Each sort object has "property" (property name) or "timestamp" ("created_time" or "last_edited_time") and "direction" ("ascending" or "descending"). Example: [{"property": "Name", "direction": "ascending"}]. Return ONLY a valid JSON array - no explanations.',
+        placeholder: 'Describe how to sort (e.g., "by name ascending", "newest first")...',
+        generationType: 'json-object',
+      },
     },
     {
       id: 'pageSize',
       title: 'Page Size',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Number of results (default: 100, max: 100)',
       condition: { field: 'operation', value: 'notion_query_database' },
     },
@@ -165,15 +234,19 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       id: 'query',
       title: 'Search Query',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter search terms (leave empty for all pages)',
       condition: { field: 'operation', value: 'notion_search' },
+      wandConfig: {
+        enabled: true,
+        prompt:
+          "Generate a search query string for searching a Notion workspace based on the user's description. The query should be concise and use relevant keywords. Return ONLY the search query text - no explanations, no quotes.",
+        placeholder: 'Describe what you want to search for...',
+      },
     },
     {
       id: 'filterType',
       title: 'Filter Type',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'All', id: 'all' },
         { label: 'Pages Only', id: 'page' },
@@ -183,30 +256,50 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
     },
     // Create Database Fields
     {
-      id: 'parentId',
-      title: 'Parent Page ID',
-      type: 'short-input',
-      layout: 'full',
-      placeholder: 'ID of parent page where database will be created',
-      condition: { field: 'operation', value: 'notion_create_database' },
-      required: true,
-    },
-    {
       id: 'title',
       title: 'Database Title',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Title for the new database',
       condition: { field: 'operation', value: 'notion_create_database' },
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt:
+          "Generate a concise, descriptive title for a Notion database based on the user's description. The title should clearly indicate what data the database will contain. Return ONLY the title text - no explanations, no quotes.",
+        placeholder: 'Describe what the database will track...',
+      },
     },
     {
       id: 'properties',
-      title: 'Database Properties (JSON)',
-      type: 'long-input',
-      layout: 'full',
+      title: 'Database Properties',
+      type: 'code',
       placeholder: 'Enter database properties as JSON object',
       condition: { field: 'operation', value: 'notion_create_database' },
+      wandConfig: {
+        enabled: true,
+        prompt:
+          'Generate Notion database properties in JSON format based on the user\'s description. Only provide the json, no escaping required. Properties define the schema of the database. Common types: "title" (required), "rich_text", "number", "select" (with options), "multi_select", "date", "checkbox", "url", "email", "phone_number". Example: {"Name": {"title": {}}, "Status": {"select": {"options": [{"name": "To Do"}, {"name": "Done"}]}}, "Priority": {"number": {}}}. Return ONLY valid JSON - no explanations.',
+        placeholder:
+          'Describe the columns/properties you want (e.g., "name, status dropdown, due date, priority number")...',
+        generationType: 'json-object',
+      },
+    },
+    // Add Database Row Fields
+    {
+      id: 'properties',
+      title: 'Row Properties',
+      type: 'code',
+      placeholder: 'Enter row properties as JSON object',
+      condition: { field: 'operation', value: 'notion_add_database_row' },
+      required: true,
+      wandConfig: {
+        enabled: true,
+        prompt:
+          'Generate Notion page/row properties in JSON format based on the user\'s description. Properties must match the database schema. Common formats: Title: {"Name": {"title": [{"text": {"content": "Value"}}]}}, Text: {"Description": {"rich_text": [{"text": {"content": "Value"}}]}}, Number: {"Price": {"number": 10}}, Select: {"Status": {"select": {"name": "Done"}}}, Multi-select: {"Tags": {"multi_select": [{"name": "Tag1"}, {"name": "Tag2"}]}}, Date: {"Due": {"date": {"start": "2024-01-01"}}}, Checkbox: {"Done": {"checkbox": true}}, URL: {"Link": {"url": "https://..."}}, Email: {"Contact": {"email": "test@example.com"}}. Return ONLY valid JSON - no explanations.',
+        placeholder:
+          'Describe the row data (e.g., "name is Task 1, status is Done, priority is High")...',
+        generationType: 'json-object',
+      },
     },
   ],
   tools: {
@@ -241,20 +334,24 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
         }
       },
       params: (params) => {
-        const { credential, operation, properties, filter, sorts, ...rest } = params
+        const { oauthCredential, operation, properties, filter, sorts, ...rest } = params
 
-        // Parse properties from JSON string for create operations
+        // Parse properties from JSON string for create/add operations
         let parsedProperties
         if (
-          (operation === 'notion_create_page' || operation === 'notion_create_database') &&
+          (operation === 'notion_create_page' ||
+            operation === 'notion_create_database' ||
+            operation === 'notion_add_database_row') &&
           properties
         ) {
-          try {
-            parsedProperties = JSON.parse(properties)
-          } catch (error) {
-            throw new Error(
-              `Invalid JSON for properties: ${error instanceof Error ? error.message : String(error)}`
-            )
+          if (typeof properties === 'string') {
+            try {
+              parsedProperties = JSON.parse(properties)
+            } catch (error) {
+              throw new Error(`Invalid JSON for properties: ${toError(error).message}`)
+            }
+          } else {
+            parsedProperties = properties
           }
         }
 
@@ -264,9 +361,7 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
           try {
             parsedFilter = JSON.parse(filter)
           } catch (error) {
-            throw new Error(
-              `Invalid JSON for filter: ${error instanceof Error ? error.message : String(error)}`
-            )
+            throw new Error(`Invalid JSON for filter: ${toError(error).message}`)
           }
         }
 
@@ -276,15 +371,13 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
           try {
             parsedSorts = JSON.parse(sorts)
           } catch (error) {
-            throw new Error(
-              `Invalid JSON for sorts: ${error instanceof Error ? error.message : String(error)}`
-            )
+            throw new Error(`Invalid JSON for sorts: ${toError(error).message}`)
           }
         }
 
         return {
           ...rest,
-          credential,
+          oauthCredential,
           ...(parsedProperties ? { properties: parsedProperties } : {}),
           ...(parsedFilter ? { filter: JSON.stringify(parsedFilter) } : {}),
           ...(parsedSorts ? { sorts: JSON.stringify(parsedSorts) } : {}),
@@ -294,7 +387,7 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
   },
   inputs: {
     operation: { type: 'string', description: 'Operation to perform' },
-    credential: { type: 'string', description: 'Notion access token' },
+    oauthCredential: { type: 'string', description: 'Notion access token' },
     pageId: { type: 'string', description: 'Page identifier' },
     content: { type: 'string', description: 'Page content' },
     // Create page inputs
@@ -321,6 +414,145 @@ export const NotionBlock: BlockConfig<NotionResponse> = {
       type: 'json',
       description:
         'Metadata containing operation-specific details including page/database info, results, and pagination data',
+    },
+  },
+}
+
+// V2 Block with API-aligned outputs
+
+export const NotionV2Block: BlockConfig<any> = {
+  type: 'notion_v2',
+  name: 'Notion',
+  description: 'Manage Notion pages',
+  authMode: AuthMode.OAuth,
+  longDescription:
+    'Integrate with Notion into the workflow. Can read page, read database, create page, create database, append content, query database, and search workspace.',
+  docsLink: 'https://docs.sim.ai/tools/notion',
+  category: 'tools',
+  integrationType: IntegrationType.Documents,
+  tags: ['note-taking', 'knowledge-base', 'content-management'],
+  bgColor: '#181C1E',
+  icon: NotionIcon,
+  hideFromToolbar: false,
+  subBlocks: [
+    ...NotionBlock.subBlocks,
+
+    // Trigger subBlocks
+    ...getTrigger('notion_page_created').subBlocks,
+    ...getTrigger('notion_page_properties_updated').subBlocks,
+    ...getTrigger('notion_page_content_updated').subBlocks,
+    ...getTrigger('notion_page_deleted').subBlocks,
+    ...getTrigger('notion_database_created').subBlocks,
+    ...getTrigger('notion_database_schema_updated').subBlocks,
+    ...getTrigger('notion_database_deleted').subBlocks,
+    ...getTrigger('notion_comment_created').subBlocks,
+    ...getTrigger('notion_webhook').subBlocks,
+  ],
+  triggers: {
+    enabled: true,
+    available: [
+      'notion_page_created',
+      'notion_page_properties_updated',
+      'notion_page_content_updated',
+      'notion_page_deleted',
+      'notion_database_created',
+      'notion_database_schema_updated',
+      'notion_database_deleted',
+      'notion_comment_created',
+      'notion_webhook',
+    ],
+  },
+  tools: {
+    access: [
+      'notion_read_v2',
+      'notion_read_database_v2',
+      'notion_write_v2',
+      'notion_create_page_v2',
+      'notion_update_page_v2',
+      'notion_query_database_v2',
+      'notion_search_v2',
+      'notion_create_database_v2',
+      'notion_add_database_row_v2',
+    ],
+    config: {
+      tool: createVersionedToolSelector({
+        baseToolSelector: (params) => params.operation || 'notion_read',
+        suffix: '_v2',
+        fallbackToolId: 'notion_read_v2',
+      }),
+      params: NotionBlock.tools?.config?.params,
+    },
+  },
+  inputs: NotionBlock.inputs,
+  outputs: {
+    // Read page outputs
+    content: {
+      type: 'string',
+      description: 'Page content in markdown format',
+      condition: { field: 'operation', value: 'notion_read' },
+    },
+    title: {
+      type: 'string',
+      description: 'Page or database title',
+    },
+    url: {
+      type: 'string',
+      description: 'Notion URL',
+    },
+    id: {
+      type: 'string',
+      description: 'Page or database ID',
+      condition: {
+        field: 'operation',
+        value: [
+          'notion_create_page',
+          'notion_create_database',
+          'notion_add_database_row',
+          'notion_read_database',
+          'notion_update_page',
+        ],
+      },
+    },
+    created_time: {
+      type: 'string',
+      description: 'Creation timestamp',
+    },
+    last_edited_time: {
+      type: 'string',
+      description: 'Last edit timestamp',
+    },
+    // Database query/search outputs
+    results: {
+      type: 'array',
+      description: 'Array of results from query or search',
+      condition: { field: 'operation', value: ['notion_query_database', 'notion_search'] },
+    },
+    has_more: {
+      type: 'boolean',
+      description: 'Whether more results are available',
+      condition: { field: 'operation', value: ['notion_query_database', 'notion_search'] },
+    },
+    next_cursor: {
+      type: 'string',
+      description: 'Cursor for pagination',
+      condition: { field: 'operation', value: ['notion_query_database', 'notion_search'] },
+    },
+    total_results: {
+      type: 'number',
+      description: 'Number of results returned',
+      condition: { field: 'operation', value: ['notion_query_database', 'notion_search'] },
+    },
+    // Database schema
+    properties: {
+      type: 'json',
+      description: 'Database properties schema',
+      condition: { field: 'operation', value: ['notion_read_database', 'notion_create_database'] },
+    },
+    // Write output
+    appended: {
+      type: 'boolean',
+      description: 'Whether content was successfully appended',
+      condition: { field: 'operation', value: 'notion_write' },
     },
   },
 }

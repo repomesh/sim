@@ -1,19 +1,8 @@
-export type TriggerFieldType = 'string' | 'boolean' | 'select' | 'number' | 'multiselect'
-
-export interface TriggerConfigField {
-  type: TriggerFieldType
-  label: string
-  placeholder?: string
-  options?: string[]
-  defaultValue?: string | boolean | number | string[]
-  description?: string
-  required?: boolean
-  isSecret?: boolean
-}
+import type { SubBlockConfig } from '@/blocks/types'
 
 export interface TriggerOutput {
   type?: string
-  description?: string
+  description?: string | TriggerOutput
   [key: string]: TriggerOutput | string | undefined
 }
 
@@ -24,20 +13,12 @@ export interface TriggerConfig {
   description: string
   version: string
 
-  // Optional icon component for UI display
   icon?: React.ComponentType<{ className?: string }>
 
-  // Configuration fields that users need to fill
-  configFields: Record<string, TriggerConfigField>
+  subBlocks: SubBlockConfig[]
 
   // Define the structure of data this trigger outputs to workflows
   outputs: Record<string, TriggerOutput>
-
-  // Setup instructions for users
-  instructions: string[]
-
-  // Example payload for documentation
-  samplePayload: any
 
   // Webhook configuration (for most triggers)
   webhook?: {
@@ -45,16 +26,15 @@ export interface TriggerConfig {
     headers?: Record<string, string>
   }
 
-  // For triggers that require OAuth credentials (like Gmail)
-  requiresCredentials?: boolean
-  credentialProvider?: string // 'google-email', 'microsoft', etc.
+  /** When true, this trigger is poll-based (cron-driven) rather than push-based. */
+  polling?: boolean
 }
 
 export interface TriggerRegistry {
   [triggerId: string]: TriggerConfig
 }
 
-export interface TriggerInstance {
+interface TriggerInstance {
   id: string
   triggerId: string
   blockId: string

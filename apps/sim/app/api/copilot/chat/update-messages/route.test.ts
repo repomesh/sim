@@ -3,66 +3,65 @@
  *
  * @vitest-environment node
  */
+import { authMockFns } from '@sim/testing'
 import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  createMockRequest,
-  mockAuth,
-  mockCryptoUuid,
-  setupCommonApiMocks,
-} from '@/app/api/__test-utils__/utils'
+
+const { mockSelect, mockFrom, mockWhere, mockLimit, mockUpdate, mockSet, mockUpdateWhere } =
+  vi.hoisted(() => ({
+    mockSelect: vi.fn(),
+    mockFrom: vi.fn(),
+    mockWhere: vi.fn(),
+    mockLimit: vi.fn(),
+    mockUpdate: vi.fn(),
+    mockSet: vi.fn(),
+    mockUpdateWhere: vi.fn(),
+  }))
+
+vi.mock('@sim/db', () => ({
+  db: {
+    select: mockSelect,
+    update: mockUpdate,
+  },
+}))
+
+vi.mock('drizzle-orm', () => ({
+  and: vi.fn((...conditions: unknown[]) => ({ conditions, type: 'and' })),
+  eq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
+}))
+
+import { POST } from '@/app/api/copilot/chat/update-messages/route'
+
+function createMockRequest(method: string, body: Record<string, unknown>): NextRequest {
+  return new NextRequest('http://localhost:3000/api/copilot/chat/update-messages', {
+    method,
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
 
 describe('Copilot Chat Update Messages API Route', () => {
-  const mockSelect = vi.fn()
-  const mockFrom = vi.fn()
-  const mockWhere = vi.fn()
-  const mockLimit = vi.fn()
-  const mockUpdate = vi.fn()
-  const mockSet = vi.fn()
-
   beforeEach(() => {
-    vi.resetModules()
-    setupCommonApiMocks()
-    mockCryptoUuid()
+    vi.clearAllMocks()
+
+    authMockFns.mockGetSession.mockResolvedValue(null)
 
     mockSelect.mockReturnValue({ from: mockFrom })
     mockFrom.mockReturnValue({ where: mockWhere })
     mockWhere.mockReturnValue({ limit: mockLimit })
-    mockLimit.mockResolvedValue([]) // Default: no chat found
+    mockLimit.mockResolvedValue([])
     mockUpdate.mockReturnValue({ set: mockSet })
-    mockSet.mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }) // Different where for update
-
-    vi.doMock('@sim/db', () => ({
-      db: {
-        select: mockSelect,
-        update: mockUpdate,
-      },
-    }))
-
-    vi.doMock('@sim/db/schema', () => ({
-      copilotChats: {
-        id: 'id',
-        userId: 'userId',
-        messages: 'messages',
-        updatedAt: 'updatedAt',
-      },
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      and: vi.fn((...conditions) => ({ conditions, type: 'and' })),
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-    }))
+    mockUpdateWhere.mockResolvedValue(undefined)
+    mockSet.mockReturnValue({ where: mockUpdateWhere })
   })
 
   afterEach(() => {
-    vi.clearAllMocks()
     vi.restoreAllMocks()
   })
 
   describe('POST', () => {
     it('should return 401 when user is not authenticated', async () => {
-      const authMocks = mockAuth()
-      authMocks.setUnauthenticated()
+      authMockFns.mockGetSession.mockResolvedValue(null)
 
       const req = createMockRequest('POST', {
         chatId: 'chat-123',
@@ -76,7 +75,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(401)
@@ -85,8 +83,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should return 400 for invalid request body - missing chatId', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const req = createMockRequest('POST', {
         messages: [
@@ -97,59 +94,50 @@ describe('Copilot Chat Update Messages API Route', () => {
             timestamp: '2024-01-01T00:00:00.000Z',
           },
         ],
-        // Missing chatId
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to update chat messages')
+      expect(responseData.error).toBe('Validation error')
     })
 
     it('should return 400 for invalid request body - missing messages', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const req = createMockRequest('POST', {
         chatId: 'chat-123',
-        // Missing messages
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to update chat messages')
+      expect(responseData.error).toBe('Validation error')
     })
 
     it('should return 400 for invalid message structure - missing required fields', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const req = createMockRequest('POST', {
         chatId: 'chat-123',
         messages: [
           {
             id: 'msg-1',
-            // Missing role, content, timestamp
           },
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to update chat messages')
+      expect(responseData.error).toBe('Validation error')
     })
 
     it('should return 400 for invalid message role', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const req = createMockRequest('POST', {
         chatId: 'chat-123',
@@ -163,19 +151,16 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to update chat messages')
+      expect(responseData.error).toBe('Validation error')
     })
 
     it('should return 404 when chat is not found', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
-      // Mock chat not found
       mockLimit.mockResolvedValueOnce([])
 
       const req = createMockRequest('POST', {
@@ -190,7 +175,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(404)
@@ -199,10 +183,8 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should return 404 when chat belongs to different user', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
-      // Mock chat not found (due to user mismatch)
       mockLimit.mockResolvedValueOnce([])
 
       const req = createMockRequest('POST', {
@@ -217,7 +199,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(404)
@@ -226,8 +207,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should successfully update chat messages', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-123',
@@ -256,7 +236,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         messages,
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -275,8 +254,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should successfully update chat messages with optional fields', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-456',
@@ -318,7 +296,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         messages,
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -329,14 +306,41 @@ describe('Copilot Chat Update Messages API Route', () => {
       })
 
       expect(mockSet).toHaveBeenCalledWith({
-        messages,
+        messages: [
+          {
+            id: 'msg-1',
+            role: 'user',
+            content: 'Hello',
+            timestamp: '2024-01-01T10:00:00.000Z',
+          },
+          {
+            id: 'msg-2',
+            role: 'assistant',
+            content: 'Hi there!',
+            timestamp: '2024-01-01T10:01:00.000Z',
+            contentBlocks: [
+              {
+                type: 'text',
+                content: 'Here is the weather information',
+              },
+              {
+                type: 'tool',
+                phase: 'call',
+                toolCall: {
+                  id: 'tool-1',
+                  name: 'get_weather',
+                  state: 'pending',
+                },
+              },
+            ],
+          },
+        ],
         updatedAt: expect.any(Date),
       })
     })
 
     it('should handle empty messages array', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-789',
@@ -350,7 +354,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         messages: [],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -367,8 +370,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should handle database errors during chat lookup', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       mockLimit.mockRejectedValueOnce(new Error('Database connection failed'))
 
@@ -384,7 +386,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -393,8 +394,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should handle database errors during update operation', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-123',
@@ -419,7 +419,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         ],
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -428,8 +427,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should handle JSON parsing errors in request body', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const req = new NextRequest('http://localhost:3000/api/copilot/chat/update-messages', {
         method: 'POST',
@@ -439,7 +437,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         },
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -448,8 +445,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should handle large message arrays', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-large',
@@ -470,7 +466,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         messages,
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -487,8 +482,7 @@ describe('Copilot Chat Update Messages API Route', () => {
     })
 
     it('should handle messages with both user and assistant roles', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
 
       const existingChat = {
         id: 'chat-mixed',
@@ -536,7 +530,6 @@ describe('Copilot Chat Update Messages API Route', () => {
         messages,
       })
 
-      const { POST } = await import('@/app/api/copilot/chat/update-messages/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)

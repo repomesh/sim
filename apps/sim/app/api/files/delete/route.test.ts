@@ -1,27 +1,128 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest, setupFileApiMocks } from '@/app/api/__test-utils__/utils'
+/**
+ * @vitest-environment node
+ */
+import {
+  authMockFns,
+  hybridAuthMockFns,
+  storageServiceMock,
+  storageServiceMockFns,
+} from '@sim/testing'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => {
+  const mockVerifyFileAccess = vi.fn()
+  const mockVerifyWorkspaceFileAccess = vi.fn()
+  const mockGetStorageProvider = vi.fn()
+  const mockIsUsingCloudStorage = vi.fn()
+
+  return {
+    mockVerifyFileAccess,
+    mockVerifyWorkspaceFileAccess,
+    mockGetStorageProvider,
+    mockIsUsingCloudStorage,
+  }
+})
+
+vi.mock('drizzle-orm', () => ({
+  and: vi.fn((...conditions: unknown[]) => ({ conditions, type: 'and' })),
+  eq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
+  or: vi.fn((...conditions: unknown[]) => ({ type: 'or', conditions })),
+  gte: vi.fn((field: unknown, value: unknown) => ({ type: 'gte', field, value })),
+  lte: vi.fn((field: unknown, value: unknown) => ({ type: 'lte', field, value })),
+  gt: vi.fn((field: unknown, value: unknown) => ({ type: 'gt', field, value })),
+  lt: vi.fn((field: unknown, value: unknown) => ({ type: 'lt', field, value })),
+  ne: vi.fn((field: unknown, value: unknown) => ({ type: 'ne', field, value })),
+  asc: vi.fn((field: unknown) => ({ field, type: 'asc' })),
+  desc: vi.fn((field: unknown) => ({ field, type: 'desc' })),
+  isNull: vi.fn((field: unknown) => ({ field, type: 'isNull' })),
+  isNotNull: vi.fn((field: unknown) => ({ field, type: 'isNotNull' })),
+  inArray: vi.fn((field: unknown, values: unknown) => ({ field, values, type: 'inArray' })),
+  notInArray: vi.fn((field: unknown, values: unknown) => ({ field, values, type: 'notInArray' })),
+  like: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'like' })),
+  ilike: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'ilike' })),
+  count: vi.fn((field: unknown) => ({ field, type: 'count' })),
+  sum: vi.fn((field: unknown) => ({ field, type: 'sum' })),
+  avg: vi.fn((field: unknown) => ({ field, type: 'avg' })),
+  min: vi.fn((field: unknown) => ({ field, type: 'min' })),
+  max: vi.fn((field: unknown) => ({ field, type: 'max' })),
+  sql: vi.fn((strings: unknown, ...values: unknown[]) => ({ type: 'sql', sql: strings, values })),
+}))
+
+vi.mock('@sim/utils/id', () => ({
+  generateId: vi.fn(() => 'test-uuid'),
+  generateShortId: vi.fn(() => 'mock-short-id'),
+  isValidUuid: vi.fn((v: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+  ),
+}))
+
+vi.mock('@/app/api/files/authorization', () => ({
+  verifyFileAccess: mocks.mockVerifyFileAccess,
+  verifyWorkspaceFileAccess: mocks.mockVerifyWorkspaceFileAccess,
+}))
+
+vi.mock('@/lib/uploads', () => ({
+  getStorageProvider: mocks.mockGetStorageProvider,
+  isUsingCloudStorage: mocks.mockIsUsingCloudStorage,
+  StorageService: {
+    uploadFile: storageServiceMockFns.mockUploadFile,
+    downloadFile: storageServiceMockFns.mockDownloadFile,
+    deleteFile: storageServiceMockFns.mockDeleteFile,
+    hasCloudStorage: storageServiceMockFns.mockHasCloudStorage,
+  },
+  uploadFile: storageServiceMockFns.mockUploadFile,
+  downloadFile: storageServiceMockFns.mockDownloadFile,
+  deleteFile: storageServiceMockFns.mockDeleteFile,
+  hasCloudStorage: storageServiceMockFns.mockHasCloudStorage,
+}))
+
+vi.mock('@/lib/uploads/core/storage-service', () => storageServiceMock)
+
+vi.mock('@/lib/uploads/server/metadata', () => ({
+  deleteFileMetadata: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/uploads/setup.server', () => ({}))
+
+vi.mock('fs/promises', () => ({
+  unlink: vi.fn().mockResolvedValue(undefined),
+  access: vi.fn().mockResolvedValue(undefined),
+  stat: vi.fn().mockResolvedValue({ isFile: () => true }),
+}))
+
+import { createMockRequest } from '@sim/testing'
+import { OPTIONS, POST } from '@/app/api/files/delete/route'
 
 describe('File Delete API Route', () => {
   beforeEach(() => {
-    vi.resetModules()
-    vi.doMock('@/lib/uploads/setup.server', () => ({}))
-  })
-
-  afterEach(() => {
     vi.clearAllMocks()
+
+    vi.stubGlobal('crypto', {
+      randomUUID: vi.fn().mockReturnValue('mock-uuid-1234-5678'),
+    })
+
+    authMockFns.mockGetSession.mockResolvedValue({ user: { id: 'test-user-id' } })
+    hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
+      success: true,
+      userId: 'test-user-id',
+      error: undefined,
+    })
+    mocks.mockVerifyFileAccess.mockResolvedValue(true)
+    mocks.mockVerifyWorkspaceFileAccess.mockResolvedValue(true)
+    storageServiceMockFns.mockDeleteFile.mockResolvedValue(undefined)
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(true)
+    mocks.mockGetStorageProvider.mockReturnValue('s3')
+    mocks.mockIsUsingCloudStorage.mockReturnValue(true)
   })
 
   it('should handle local file deletion successfully', async () => {
-    setupFileApiMocks({
-      cloudEnabled: false,
-      storageProvider: 'local',
-    })
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(false)
+    mocks.mockGetStorageProvider.mockReturnValue('local')
+    mocks.mockIsUsingCloudStorage.mockReturnValue(false)
 
     const req = createMockRequest('POST', {
-      filePath: '/api/files/serve/test-file.txt',
+      filePath: '/api/files/serve/workspace/test-workspace-id/test-file.txt',
     })
-
-    const { POST } = await import('@/app/api/files/delete/route')
 
     const response = await POST(req)
     const data = await response.json()
@@ -33,16 +134,13 @@ describe('File Delete API Route', () => {
   })
 
   it('should handle file not found gracefully', async () => {
-    setupFileApiMocks({
-      cloudEnabled: false,
-      storageProvider: 'local',
-    })
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(false)
+    mocks.mockGetStorageProvider.mockReturnValue('local')
+    mocks.mockIsUsingCloudStorage.mockReturnValue(false)
 
     const req = createMockRequest('POST', {
-      filePath: '/api/files/serve/nonexistent.txt',
+      filePath: '/api/files/serve/workspace/test-workspace-id/nonexistent.txt',
     })
-
-    const { POST } = await import('@/app/api/files/delete/route')
 
     const response = await POST(req)
     const data = await response.json()
@@ -53,81 +151,45 @@ describe('File Delete API Route', () => {
   })
 
   it('should handle S3 file deletion successfully', async () => {
-    setupFileApiMocks({
-      cloudEnabled: true,
-      storageProvider: 's3',
-    })
-
-    vi.doMock('@/lib/uploads', () => ({
-      deleteFile: vi.fn().mockResolvedValue(undefined),
-      isUsingCloudStorage: vi.fn().mockReturnValue(true),
-      uploadFile: vi.fn().mockResolvedValue({
-        path: '/api/files/serve/test-key',
-        key: 'test-key',
-        name: 'test.txt',
-        size: 100,
-        type: 'text/plain',
-      }),
-    }))
-
     const req = createMockRequest('POST', {
-      filePath: '/api/files/serve/s3/1234567890-test-file.txt',
+      filePath: '/api/files/serve/workspace/test-workspace-id/1234567890-test-file.txt',
     })
-
-    const { POST } = await import('@/app/api/files/delete/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(200)
     expect(data).toHaveProperty('success', true)
-    expect(data).toHaveProperty('message', 'File deleted successfully from cloud storage')
+    expect(data).toHaveProperty('message', 'File deleted successfully')
 
-    const uploads = await import('@/lib/uploads')
-    expect(uploads.deleteFile).toHaveBeenCalledWith('1234567890-test-file.txt')
+    expect(storageServiceMockFns.mockDeleteFile).toHaveBeenCalledWith({
+      key: 'workspace/test-workspace-id/1234567890-test-file.txt',
+      context: 'workspace',
+    })
   })
 
   it('should handle Azure Blob file deletion successfully', async () => {
-    setupFileApiMocks({
-      cloudEnabled: true,
-      storageProvider: 'blob',
-    })
-
-    vi.doMock('@/lib/uploads', () => ({
-      deleteFile: vi.fn().mockResolvedValue(undefined),
-      isUsingCloudStorage: vi.fn().mockReturnValue(true),
-      uploadFile: vi.fn().mockResolvedValue({
-        path: '/api/files/serve/test-key',
-        key: 'test-key',
-        name: 'test.txt',
-        size: 100,
-        type: 'text/plain',
-      }),
-    }))
+    mocks.mockGetStorageProvider.mockReturnValue('blob')
 
     const req = createMockRequest('POST', {
-      filePath: '/api/files/serve/blob/1234567890-test-document.pdf',
+      filePath: '/api/files/serve/workspace/test-workspace-id/1234567890-test-document.pdf',
     })
-
-    const { POST } = await import('@/app/api/files/delete/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(200)
     expect(data).toHaveProperty('success', true)
-    expect(data).toHaveProperty('message', 'File deleted successfully from cloud storage')
+    expect(data).toHaveProperty('message', 'File deleted successfully')
 
-    const uploads = await import('@/lib/uploads')
-    expect(uploads.deleteFile).toHaveBeenCalledWith('1234567890-test-document.pdf')
+    expect(storageServiceMockFns.mockDeleteFile).toHaveBeenCalledWith({
+      key: 'workspace/test-workspace-id/1234567890-test-document.pdf',
+      context: 'workspace',
+    })
   })
 
   it('should handle missing file path', async () => {
-    setupFileApiMocks()
-
     const req = createMockRequest('POST', {})
-
-    const { POST } = await import('@/app/api/files/delete/route')
 
     const response = await POST(req)
     const data = await response.json()
@@ -138,8 +200,6 @@ describe('File Delete API Route', () => {
   })
 
   it('should handle CORS preflight requests', async () => {
-    const { OPTIONS } = await import('@/app/api/files/delete/route')
-
     const response = await OPTIONS()
 
     expect(response.status).toBe(204)

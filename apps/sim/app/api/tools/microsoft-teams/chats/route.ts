@@ -1,27 +1,46 @@
-import { NextResponse } from 'next/server'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
+import { type NextRequest, NextResponse } from 'next/server'
+import { microsoftChatsSelectorContract } from '@/lib/api/contracts/selectors/microsoft'
+import { parseRequest } from '@/lib/api/server'
 import { authorizeCredentialUse } from '@/lib/auth/credential-access'
-import { createLogger } from '@/lib/logs/console/logger'
+import { validateMicrosoftGraphId } from '@/lib/core/security/input-validation'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('TeamsChatsAPI')
 
-// Helper function to get chat members and create a meaningful name
+/**
+ * Helper function to get chat members and create a meaningful name
+ *
+ * @param chatId - Microsoft Teams chat ID to get display name for
+ * @param accessToken - Access token for Microsoft Graph API
+ * @param chatTopic - Optional existing chat topic
+ * @returns A meaningful display name for the chat
+ */
 const getChatDisplayName = async (
   chatId: string,
   accessToken: string,
   chatTopic?: string
 ): Promise<string> => {
   try {
-    // If the chat already has a topic, use it
+    const chatIdValidation = validateMicrosoftGraphId(chatId, 'chatId')
+    if (!chatIdValidation.isValid) {
+      logger.warn('Invalid chat ID in getChatDisplayName', {
+        error: chatIdValidation.error,
+        chatId: chatId.substring(0, 50),
+      })
+      return `Chat ${chatId.substring(0, 8)}...`
+    }
+
     if (chatTopic?.trim() && chatTopic !== 'null') {
       return chatTopic
     }
 
-    // Fetch chat members to create a meaningful name
     const membersResponse = await fetch(
-      `https://graph.microsoft.com/v1.0/chats/${chatId}/members`,
+      `https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/members`,
       {
         method: 'GET',
         headers: {
@@ -35,27 +54,25 @@ const getChatDisplayName = async (
       const membersData = await membersResponse.json()
       const members = membersData.value || []
 
-      // Filter out the current user and get display names
       const memberNames = members
         .filter((member: any) => member.displayName && member.displayName !== 'Unknown')
         .map((member: any) => member.displayName)
-        .slice(0, 3) // Limit to first 3 names to avoid very long names
+        .slice(0, 3)
 
       if (memberNames.length > 0) {
         if (memberNames.length === 1) {
-          return memberNames[0] // 1:1 chat
+          return memberNames[0]
         }
         if (memberNames.length === 2) {
-          return memberNames.join(' & ') // 2-person group
+          return memberNames.join(' & ')
         }
-        return `${memberNames.slice(0, 2).join(', ')} & ${memberNames.length - 2} more` // Larger group
+        return `${memberNames.slice(0, 2).join(', ')} & ${memberNames.length - 2} more`
       }
     }
 
-    // Fallback: try to get a better name from recent messages
     try {
       const messagesResponse = await fetch(
-        `https://graph.microsoft.com/v1.0/chats/${chatId}/messages?$top=10&$orderby=createdDateTime desc`,
+        `https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/messages?$top=10&$orderby=createdDateTime desc`,
         {
           method: 'GET',
           headers: {
@@ -69,14 +86,12 @@ const getChatDisplayName = async (
         const messagesData = await messagesResponse.json()
         const messages = messagesData.value || []
 
-        // Look for chat rename events
         for (const message of messages) {
           if (message.eventDetail?.chatDisplayName) {
             return message.eventDetail.chatDisplayName
           }
         }
 
-        // Get unique sender names from recent messages as last resort
         const senderNames = [
           ...new Set(
             messages
@@ -99,33 +114,25 @@ const getChatDisplayName = async (
       }
     } catch (error) {
       logger.warn(
-        `Failed to get better name from messages for chat ${chatId}: ${error instanceof Error ? error.message : String(error)}`
+        `Failed to get better name from messages for chat ${chatId}: ${toError(error).message}`
       )
     }
 
-    // Final fallback
     return `Chat ${chatId.split(':')[0] || chatId.substring(0, 8)}...`
   } catch (error) {
-    logger.warn(
-      `Failed to get display name for chat ${chatId}: ${error instanceof Error ? error.message : String(error)}`
-    )
+    logger.warn(`Failed to get display name for chat ${chatId}: ${toError(error).message}`)
     return `Chat ${chatId.split(':')[0] || chatId.substring(0, 8)}...`
   }
 }
 
-export async function POST(request: Request) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
-    const body = await request.json()
-
-    const { credential, workflowId } = body
-
-    if (!credential) {
-      logger.error('Missing credential in request')
-      return NextResponse.json({ error: 'Credential is required' }, { status: 400 })
-    }
+    const parsed = await parseRequest(microsoftChatsSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credential, workflowId } = parsed.data.body
 
     try {
-      const authz = await authorizeCredentialUse(request as any, {
+      const authz = await authorizeCredentialUse(request, {
         credentialId: credential,
         workflowId,
       })
@@ -146,7 +153,6 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: 'Could not retrieve access token' }, { status: 401 })
       }
 
-      // Now try to fetch the chats
       const response = await fetch('https://graph.microsoft.com/v1.0/me/chats', {
         method: 'GET',
         headers: {
@@ -163,7 +169,6 @@ export async function POST(request: Request) {
           endpoint: 'https://graph.microsoft.com/v1.0/me/chats',
         })
 
-        // Check for auth errors specifically
         if (response.status === 401) {
           return NextResponse.json(
             {
@@ -179,7 +184,6 @@ export async function POST(request: Request) {
 
       const data = await response.json()
 
-      // Process chats with enhanced display names
       const chats = await Promise.all(
         data.value.map(async (chat: any) => ({
           id: chat.id,
@@ -193,8 +197,7 @@ export async function POST(request: Request) {
     } catch (innerError) {
       logger.error('Error during API requests:', innerError)
 
-      // Check if it's an authentication error
-      const errorMessage = innerError instanceof Error ? innerError.message : String(innerError)
+      const errorMessage = toError(innerError).message
       if (
         errorMessage.includes('auth') ||
         errorMessage.includes('token') ||
@@ -223,4 +226,4 @@ export async function POST(request: Request) {
       { status: 500 }
     )
   }
-}
+})

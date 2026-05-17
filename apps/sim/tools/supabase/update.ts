@@ -1,4 +1,6 @@
+import { validateDatabaseIdentifier } from '@/lib/core/security/input-validation'
 import type { SupabaseUpdateParams, SupabaseUpdateResponse } from '@/tools/supabase/types'
+import { supabaseBaseUrl } from '@/tools/supabase/utils'
 import type { ToolConfig } from '@/tools/types'
 
 export const updateTool: ToolConfig<SupabaseUpdateParams, SupabaseUpdateResponse> = {
@@ -19,6 +21,13 @@ export const updateTool: ToolConfig<SupabaseUpdateParams, SupabaseUpdateResponse
       required: true,
       visibility: 'user-or-llm',
       description: 'The name of the Supabase table to update',
+    },
+    schema: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Database schema to update in (default: public). Use this to access tables in other schemas.',
     },
     filter: {
       type: 'string',
@@ -42,23 +51,34 @@ export const updateTool: ToolConfig<SupabaseUpdateParams, SupabaseUpdateResponse
 
   request: {
     url: (params) => {
-      // Construct the URL for the Supabase REST API with select to return updated data
-      let url = `https://${params.projectId}.supabase.co/rest/v1/${params.table}?select=*`
+      const tableValidation = validateDatabaseIdentifier(params.table, 'table')
+      if (!tableValidation.isValid) throw new Error(tableValidation.error)
 
-      // Add filters (required for update) - using PostgREST syntax
+      let url = `${supabaseBaseUrl(params.projectId)}/rest/v1/${encodeURIComponent(params.table)}?select=*`
+
       if (params.filter?.trim()) {
         url += `&${params.filter.trim()}`
+      } else {
+        throw new Error(
+          'Filter is required for update operations to prevent accidental update of all rows'
+        )
       }
 
       return url
     },
     method: 'PATCH',
-    headers: (params) => ({
-      apikey: params.apiKey,
-      Authorization: `Bearer ${params.apiKey}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-    }),
+    headers: (params) => {
+      const headers: Record<string, string> = {
+        apikey: params.apiKey,
+        Authorization: `Bearer ${params.apiKey}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      }
+      if (params.schema) {
+        headers['Content-Profile'] = params.schema
+      }
+      return headers
+    },
     body: (params) => params.data,
   },
 

@@ -1,40 +1,25 @@
-import { randomUUID } from 'crypto'
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { validateMicrosoftGraphId } from '@/lib/security/input-validation'
+import { microsoftPlannerTasksSelectorContract } from '@/lib/api/contracts/selectors/microsoft'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validateMicrosoftGraphId } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 import type { PlannerTask } from '@/tools/microsoft_planner/types'
 
 const logger = createLogger('MicrosoftPlannerTasksAPI')
 
-export async function GET(request: NextRequest) {
-  const requestId = randomUUID().slice(0, 8)
+export const dynamic = 'force-dynamic'
+
+export const POST = withRouteHandler(async (request: NextRequest) => {
+  const requestId = generateRequestId()
 
   try {
-    const session = await getSession()
-
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthenticated request rejected`)
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
-    }
-
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const planId = searchParams.get('planId')
-
-    if (!credentialId) {
-      logger.error(`[${requestId}] Missing credentialId parameter`)
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
-    }
-
-    if (!planId) {
-      logger.error(`[${requestId}] Missing planId parameter`)
-      return NextResponse.json({ error: 'Plan ID is required' }, { status: 400 })
-    }
+    const parsed = await parseRequest(microsoftPlannerTasksSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credential, workflowId, planId } = parsed.data.body
 
     const planIdValidation = validateMicrosoftGraphId(planId, 'planId')
     if (!planIdValidation.isValid) {
@@ -42,35 +27,35 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: planIdValidation.error }, { status: 400 })
     }
 
-    const credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-
-    if (!credentials.length) {
-      logger.warn(`[${requestId}] Credential not found`, { credentialId })
-      return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
+    const authz = await authorizeCredentialUse(request, {
+      credentialId: credential,
+      workflowId,
+    })
+    if (!authz.ok || !authz.credentialOwnerUserId) {
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    const credential = credentials[0]
-
-    if (credential.userId !== session.user.id) {
-      logger.warn(`[${requestId}] Unauthorized credential access attempt`, {
-        credentialUserId: credential.userId,
-        requestUserId: session.user.id,
-      })
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, session.user.id, requestId)
-
+    const accessToken = await refreshAccessTokenIfNeeded(
+      credential,
+      authz.credentialOwnerUserId,
+      requestId
+    )
     if (!accessToken) {
       logger.error(`[${requestId}] Failed to obtain valid access token`)
-      return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
+      return NextResponse.json(
+        { error: 'Failed to obtain valid access token', authRequired: true },
+        { status: 401 }
+      )
     }
 
-    const response = await fetch(`https://graph.microsoft.com/v1.0/planner/plans/${planId}/tasks`, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    })
+    const response = await fetch(
+      `https://graph.microsoft.com/v1.0/planner/plans/${planIdValidation.sanitized}/tasks`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    )
 
     if (!response.ok) {
       const errorText = await response.text()
@@ -109,4 +94,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Error fetching Microsoft Planner tasks:`, error)
     return NextResponse.json({ error: 'Failed to fetch tasks' }, { status: 500 })
   }
-}
+})

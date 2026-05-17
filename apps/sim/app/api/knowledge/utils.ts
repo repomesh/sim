@@ -1,9 +1,9 @@
 import { db } from '@sim/db'
 import { document, embedding, knowledgeBase } from '@sim/db/schema'
 import { and, eq, isNull } from 'drizzle-orm'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
-export interface KnowledgeBaseData {
+interface KnowledgeBaseData {
   id: string
   userId: string
   workspaceId?: string | null
@@ -18,7 +18,7 @@ export interface KnowledgeBaseData {
   updatedAt: Date
 }
 
-export interface DocumentData {
+interface DocumentData {
   id: string
   knowledgeBaseId: string
   filename: string
@@ -35,7 +35,7 @@ export interface DocumentData {
   enabled: boolean
   deletedAt?: Date | null
   uploadedAt: Date
-  // Document tags
+  // Text tags
   tag1?: string | null
   tag2?: string | null
   tag3?: string | null
@@ -43,9 +43,26 @@ export interface DocumentData {
   tag5?: string | null
   tag6?: string | null
   tag7?: string | null
+  // Number tags (5 slots)
+  number1?: number | null
+  number2?: number | null
+  number3?: number | null
+  number4?: number | null
+  number5?: number | null
+  // Date tags (2 slots)
+  date1?: Date | null
+  date2?: Date | null
+  // Boolean tags (3 slots)
+  boolean1?: boolean | null
+  boolean2?: boolean | null
+  boolean3?: boolean | null
+  // Connector fields
+  connectorId?: string | null
+  sourceUrl?: string | null
+  externalId?: string | null
 }
 
-export interface EmbeddingData {
+interface EmbeddingData {
   id: string
   knowledgeBaseId: string
   documentId: string
@@ -58,7 +75,7 @@ export interface EmbeddingData {
   embeddingModel: string
   startOffset: number
   endOffset: number
-  // Tag fields for filtering
+  // Text tags
   tag1?: string | null
   tag2?: string | null
   tag3?: string | null
@@ -66,6 +83,19 @@ export interface EmbeddingData {
   tag5?: string | null
   tag6?: string | null
   tag7?: string | null
+  // Number tags (5 slots)
+  number1?: number | null
+  number2?: number | null
+  number3?: number | null
+  number4?: number | null
+  number5?: number | null
+  // Date tags (2 slots)
+  date1?: Date | null
+  date2?: Date | null
+  // Boolean tags (3 slots)
+  boolean1?: boolean | null
+  boolean2?: boolean | null
+  boolean3?: boolean | null
   enabled: boolean
   createdAt: Date
   updatedAt: Date
@@ -73,10 +103,13 @@ export interface EmbeddingData {
 
 export interface KnowledgeBaseAccessResult {
   hasAccess: true
-  knowledgeBase: Pick<KnowledgeBaseData, 'id' | 'userId'>
+  knowledgeBase: Pick<
+    KnowledgeBaseData,
+    'id' | 'userId' | 'workspaceId' | 'name' | 'embeddingModel'
+  >
 }
 
-export interface KnowledgeBaseAccessDenied {
+interface KnowledgeBaseAccessDenied {
   hasAccess: false
   notFound?: boolean
   reason?: string
@@ -84,13 +117,16 @@ export interface KnowledgeBaseAccessDenied {
 
 export type KnowledgeBaseAccessCheck = KnowledgeBaseAccessResult | KnowledgeBaseAccessDenied
 
-export interface DocumentAccessResult {
+interface DocumentAccessResult {
   hasAccess: true
   document: DocumentData
-  knowledgeBase: Pick<KnowledgeBaseData, 'id' | 'userId'>
+  knowledgeBase: Pick<
+    KnowledgeBaseData,
+    'id' | 'userId' | 'workspaceId' | 'name' | 'embeddingModel'
+  >
 }
 
-export interface DocumentAccessDenied {
+interface DocumentAccessDenied {
   hasAccess: false
   notFound?: boolean
   reason: string
@@ -98,14 +134,17 @@ export interface DocumentAccessDenied {
 
 export type DocumentAccessCheck = DocumentAccessResult | DocumentAccessDenied
 
-export interface ChunkAccessResult {
+interface ChunkAccessResult {
   hasAccess: true
   chunk: EmbeddingData
   document: DocumentData
-  knowledgeBase: Pick<KnowledgeBaseData, 'id' | 'userId'>
+  knowledgeBase: Pick<
+    KnowledgeBaseData,
+    'id' | 'userId' | 'workspaceId' | 'name' | 'embeddingModel'
+  >
 }
 
-export interface ChunkAccessDenied {
+interface ChunkAccessDenied {
   hasAccess: false
   notFound?: boolean
   reason: string
@@ -125,6 +164,8 @@ export async function checkKnowledgeBaseAccess(
       id: knowledgeBase.id,
       userId: knowledgeBase.userId,
       workspaceId: knowledgeBase.workspaceId,
+      name: knowledgeBase.name,
+      embeddingModel: knowledgeBase.embeddingModel,
     })
     .from(knowledgeBase)
     .where(and(eq(knowledgeBase.id, knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
@@ -136,17 +177,18 @@ export async function checkKnowledgeBaseAccess(
 
   const kbData = kb[0]
 
-  // Case 1: User owns the knowledge base directly
-  if (kbData.userId === userId) {
-    return { hasAccess: true, knowledgeBase: kbData }
-  }
-
-  // Case 2: Knowledge base belongs to a workspace the user has permissions for
   if (kbData.workspaceId) {
+    // Workspace KB: use workspace permissions only
     const userPermission = await getUserEntityPermissions(userId, 'workspace', kbData.workspaceId)
     if (userPermission !== null) {
       return { hasAccess: true, knowledgeBase: kbData }
     }
+    return { hasAccess: false }
+  }
+
+  // Legacy non-workspace KB: allow owner access
+  if (kbData.userId === userId) {
+    return { hasAccess: true, knowledgeBase: kbData }
   }
 
   return { hasAccess: false }
@@ -155,8 +197,8 @@ export async function checkKnowledgeBaseAccess(
 /**
  * Check if a user has write access to a knowledge base
  * Write access is granted if:
- * 1. User owns the knowledge base directly, OR
- * 2. User has write or admin permissions on the knowledge base's workspace
+ * 1. KB has a workspace: user has write or admin permissions on that workspace
+ * 2. KB has no workspace (legacy): user owns the KB directly
  */
 export async function checkKnowledgeBaseWriteAccess(
   knowledgeBaseId: string,
@@ -167,6 +209,8 @@ export async function checkKnowledgeBaseWriteAccess(
       id: knowledgeBase.id,
       userId: knowledgeBase.userId,
       workspaceId: knowledgeBase.workspaceId,
+      name: knowledgeBase.name,
+      embeddingModel: knowledgeBase.embeddingModel,
     })
     .from(knowledgeBase)
     .where(and(eq(knowledgeBase.id, knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
@@ -178,17 +222,18 @@ export async function checkKnowledgeBaseWriteAccess(
 
   const kbData = kb[0]
 
-  // Case 1: User owns the knowledge base directly
-  if (kbData.userId === userId) {
-    return { hasAccess: true, knowledgeBase: kbData }
-  }
-
-  // Case 2: Knowledge base belongs to a workspace and user has write/admin permissions
   if (kbData.workspaceId) {
+    // Workspace KB: use workspace permissions only
     const userPermission = await getUserEntityPermissions(userId, 'workspace', kbData.workspaceId)
     if (userPermission === 'write' || userPermission === 'admin') {
       return { hasAccess: true, knowledgeBase: kbData }
     }
+    return { hasAccess: false }
+  }
+
+  // Legacy non-workspace KB: allow owner access
+  if (kbData.userId === userId) {
+    return { hasAccess: true, knowledgeBase: kbData }
   }
 
   return { hasAccess: false }
@@ -232,9 +277,42 @@ export async function checkDocumentWriteAccess(
       processingStartedAt: document.processingStartedAt,
       processingCompletedAt: document.processingCompletedAt,
       knowledgeBaseId: document.knowledgeBaseId,
+      // Text tags
+      tag1: document.tag1,
+      tag2: document.tag2,
+      tag3: document.tag3,
+      tag4: document.tag4,
+      tag5: document.tag5,
+      tag6: document.tag6,
+      tag7: document.tag7,
+      // Number tags (5 slots)
+      number1: document.number1,
+      number2: document.number2,
+      number3: document.number3,
+      number4: document.number4,
+      number5: document.number5,
+      // Date tags (2 slots)
+      date1: document.date1,
+      date2: document.date2,
+      // Boolean tags (3 slots)
+      boolean1: document.boolean1,
+      boolean2: document.boolean2,
+      boolean3: document.boolean3,
+      // Connector fields
+      connectorId: document.connectorId,
+      sourceUrl: document.sourceUrl,
+      externalId: document.externalId,
     })
     .from(document)
-    .where(and(eq(document.id, documentId), isNull(document.deletedAt)))
+    .where(
+      and(
+        eq(document.id, documentId),
+        eq(document.knowledgeBaseId, knowledgeBaseId),
+        eq(document.userExcluded, false),
+        isNull(document.archivedAt),
+        isNull(document.deletedAt)
+      )
+    )
     .limit(1)
 
   if (doc.length === 0) {
@@ -274,6 +352,8 @@ export async function checkDocumentAccess(
       and(
         eq(document.id, documentId),
         eq(document.knowledgeBaseId, knowledgeBaseId),
+        eq(document.userExcluded, false),
+        isNull(document.archivedAt),
         isNull(document.deletedAt)
       )
     )
@@ -317,6 +397,8 @@ export async function checkChunkAccess(
       and(
         eq(document.id, documentId),
         eq(document.knowledgeBaseId, knowledgeBaseId),
+        eq(document.userExcluded, false),
+        isNull(document.archivedAt),
         isNull(document.deletedAt)
       )
     )

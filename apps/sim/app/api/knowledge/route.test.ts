@@ -3,22 +3,16 @@
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  auditMock,
+  authMockFns,
   createMockRequest,
-  mockAuth,
-  mockConsoleLogger,
-  mockDrizzleOrm,
-  mockKnowledgeSchemas,
-} from '@/app/api/__test-utils__/utils'
+  permissionsMock,
+  permissionsMockFns,
+} from '@sim/testing'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-mockKnowledgeSchemas()
-mockDrizzleOrm()
-mockConsoleLogger()
-
-describe('Knowledge Base API Route', () => {
-  const mockAuth$ = mockAuth()
-
+const { mockDbChain } = vi.hoisted(() => {
   const mockDbChain = {
     select: vi.fn().mockReturnThis(),
     from: vi.fn().mockReturnThis(),
@@ -26,25 +20,37 @@ describe('Knowledge Base API Route', () => {
     where: vi.fn().mockReturnThis(),
     groupBy: vi.fn().mockReturnThis(),
     orderBy: vi.fn().mockResolvedValue([]),
+    limit: vi.fn().mockResolvedValue([]),
     insert: vi.fn().mockReturnThis(),
     values: vi.fn().mockResolvedValue(undefined),
   }
+  return { mockDbChain }
+})
 
-  beforeEach(async () => {
+vi.mock('@sim/db', () => ({
+  db: mockDbChain,
+}))
+
+vi.mock('@sim/audit', () => auditMock)
+
+vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
+
+import { GET, POST } from '@/app/api/knowledge/route'
+
+describe('Knowledge Base API Route', () => {
+  beforeEach(() => {
     vi.clearAllMocks()
-
-    vi.doMock('@sim/db', () => ({
-      db: mockDbChain,
-    }))
 
     Object.values(mockDbChain).forEach((fn) => {
       if (typeof fn === 'function') {
         fn.mockClear()
-        if (fn !== mockDbChain.orderBy && fn !== mockDbChain.values) {
+        if (fn !== mockDbChain.orderBy && fn !== mockDbChain.values && fn !== mockDbChain.limit) {
           fn.mockReturnThis()
         }
       }
     })
+
+    permissionsMockFns.mockGetUserEntityPermissions.mockResolvedValue('admin')
 
     vi.stubGlobal('crypto', {
       randomUUID: vi.fn().mockReturnValue('mock-uuid-1234-5678'),
@@ -57,10 +63,9 @@ describe('Knowledge Base API Route', () => {
 
   describe('GET /api/knowledge', () => {
     it('should return unauthorized for unauthenticated user', async () => {
-      mockAuth$.mockUnauthenticated()
+      authMockFns.mockGetSession.mockResolvedValue(null)
 
       const req = createMockRequest('GET')
-      const { GET } = await import('@/app/api/knowledge/route')
       const response = await GET(req)
       const data = await response.json()
 
@@ -69,11 +74,12 @@ describe('Knowledge Base API Route', () => {
     })
 
     it('should handle database errors', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
       mockDbChain.orderBy.mockRejectedValue(new Error('Database error'))
 
       const req = createMockRequest('GET')
-      const { GET } = await import('@/app/api/knowledge/route')
       const response = await GET(req)
       const data = await response.json()
 
@@ -86,6 +92,7 @@ describe('Knowledge Base API Route', () => {
     const validKnowledgeBaseData = {
       name: 'Test Knowledge Base',
       description: 'Test description',
+      workspaceId: 'test-workspace-id',
       chunkingConfig: {
         maxSize: 1024,
         minSize: 100,
@@ -94,10 +101,11 @@ describe('Knowledge Base API Route', () => {
     }
 
     it('should create knowledge base successfully', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
 
       const req = createMockRequest('POST', validKnowledgeBaseData)
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 
@@ -109,10 +117,9 @@ describe('Knowledge Base API Route', () => {
     })
 
     it('should return unauthorized for unauthenticated user', async () => {
-      mockAuth$.mockUnauthenticated()
+      authMockFns.mockGetSession.mockResolvedValue(null)
 
       const req = createMockRequest('POST', validKnowledgeBaseData)
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 
@@ -121,10 +128,11 @@ describe('Knowledge Base API Route', () => {
     })
 
     it('should validate required fields', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
 
       const req = createMockRequest('POST', { description: 'Missing name' })
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 
@@ -133,20 +141,53 @@ describe('Knowledge Base API Route', () => {
       expect(data.details).toBeDefined()
     })
 
+    it('should require workspaceId', async () => {
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
+
+      const req = createMockRequest('POST', { name: 'Test KB' })
+      const response = await POST(req)
+      const data = await response.json()
+
+      expect(response.status).toBe(400)
+      expect(data.error).toBe('Invalid request data')
+      expect(data.details).toBeDefined()
+    })
+
+    it('returns 403 when user lacks permission on target workspace', async () => {
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'attacker', email: 'a@example.com' },
+      })
+      permissionsMockFns.mockGetUserEntityPermissions.mockResolvedValueOnce('read')
+
+      const req = createMockRequest('POST', validKnowledgeBaseData)
+      const response = await POST(req)
+      const data = await response.json()
+
+      expect(response.status).toBe(403)
+      expect(data.error).toBe(
+        'User does not have permission to create knowledge bases in this workspace'
+      )
+      expect(mockDbChain.insert).not.toHaveBeenCalled()
+    })
+
     it('should validate chunking config constraints', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
 
       const invalidData = {
         name: 'Test KB',
+        workspaceId: 'test-workspace-id',
         chunkingConfig: {
-          maxSize: 100,
-          minSize: 200, // Invalid: minSize > maxSize
+          maxSize: 100, // 100 tokens = 400 characters
+          minSize: 500, // Invalid: minSize (500 chars) > maxSize (400 chars)
           overlap: 50,
         },
       }
 
       const req = createMockRequest('POST', invalidData)
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 
@@ -155,11 +196,12 @@ describe('Knowledge Base API Route', () => {
     })
 
     it('should use default values for optional fields', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
 
-      const minimalData = { name: 'Test KB' }
+      const minimalData = { name: 'Test KB', workspaceId: 'test-workspace-id' }
       const req = createMockRequest('POST', minimalData)
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 
@@ -168,17 +210,18 @@ describe('Knowledge Base API Route', () => {
       expect(data.data.embeddingDimension).toBe(1536)
       expect(data.data.chunkingConfig).toEqual({
         maxSize: 1024,
-        minSize: 1,
+        minSize: 100,
         overlap: 200,
       })
     })
 
     it('should handle database errors during creation', async () => {
-      mockAuth$.mockAuthenticatedUser()
+      authMockFns.mockGetSession.mockResolvedValue({
+        user: { id: 'user-123', email: 'test@example.com' },
+      })
       mockDbChain.values.mockRejectedValue(new Error('Database error'))
 
       const req = createMockRequest('POST', validKnowledgeBaseData)
-      const { POST } = await import('@/app/api/knowledge/route')
       const response = await POST(req)
       const data = await response.json()
 

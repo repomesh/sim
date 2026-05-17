@@ -1,7 +1,7 @@
 import { existsSync } from 'fs'
 import path from 'path'
+import { createLogger } from '@sim/logger'
 import type { FileParseResult, FileParser, SupportedFileType } from '@/lib/file-parsers/types'
-import { createLogger } from '@/lib/logs/console/logger'
 
 const logger = createLogger('FileParser')
 
@@ -86,12 +86,21 @@ function getParserInstances(): Record<string, FileParser> {
       }
 
       try {
-        const { parseJSON, parseJSONBuffer } = require('@/lib/file-parsers/json-parser')
+        const {
+          parseJSON,
+          parseJSONBuffer,
+          parseJSONL,
+          parseJSONLBuffer,
+        } = require('@/lib/file-parsers/json-parser')
         parserInstances.json = {
           parseFile: parseJSON,
           parseBuffer: parseJSONBuffer,
         }
-        logger.info('Loaded JSON parser')
+        parserInstances.jsonl = {
+          parseFile: parseJSONL,
+          parseBuffer: parseJSONLBuffer,
+        }
+        logger.info('Loaded JSON/JSONL parser')
       } catch (error) {
         logger.error('Failed to load JSON parser:', error)
       }
@@ -209,4 +218,4 @@ export function isSupportedFileType(extension: string): extension is SupportedFi
   }
 }
 
-export type { FileParseResult, FileParser, SupportedFileType }
+export type { FileParseResult, SupportedFileType }

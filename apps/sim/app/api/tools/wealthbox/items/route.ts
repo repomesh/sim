@@ -1,17 +1,17 @@
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { wealthboxItemsSelectorContract } from '@/lib/api/contracts/selectors/wealthbox'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validatePathSegment } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('WealthboxItemsAPI')
 
-// Interface for transformed Wealthbox items
 interface WealthboxItem {
   id: string
   name: string
@@ -24,53 +24,40 @@ interface WealthboxItem {
 /**
  * Get items (notes, contacts, tasks) from Wealthbox
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
-    const session = await getSession()
+    const parsed = await parseRequest(wealthboxItemsSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credentialId, type } = parsed.data.query
+    const query = parsed.data.query.query ?? ''
 
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthenticated request rejected`)
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
+    const credentialIdValidation = validatePathSegment(credentialId, {
+      paramName: 'credentialId',
+      maxLength: 100,
+      allowHyphens: true,
+      allowUnderscores: true,
+      allowDots: false,
+    })
+    if (!credentialIdValidation.isValid) {
+      logger.warn(`[${requestId}] Invalid credentialId format: ${credentialId}`)
+      return NextResponse.json({ error: credentialIdValidation.error }, { status: 400 })
     }
 
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const type = searchParams.get('type') || 'contact'
-    const query = searchParams.get('query') || ''
-
-    if (!credentialId) {
-      logger.warn(`[${requestId}] Missing credential ID`)
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+    const authz = await authorizeCredentialUse(request, {
+      credentialId,
+      requireWorkflowIdForInternal: false,
+    })
+    if (!authz.ok || !authz.credentialOwnerUserId) {
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    if (type !== 'contact') {
-      logger.warn(`[${requestId}] Invalid item type: ${type}`)
-      return NextResponse.json(
-        { error: 'Invalid item type. Only contact is supported.' },
-        { status: 400 }
-      )
-    }
-
-    const credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-
-    if (!credentials.length) {
-      logger.warn(`[${requestId}] Credential not found`, { credentialId })
-      return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
-    }
-
-    const credential = credentials[0]
-
-    if (credential.userId !== session.user.id) {
-      logger.warn(`[${requestId}] Unauthorized credential access attempt`, {
-        credentialUserId: credential.userId,
-        requestUserId: session.user.id,
-      })
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, session.user.id, requestId)
+    const accessToken = await refreshAccessTokenIfNeeded(
+      credentialId,
+      authz.credentialOwnerUserId,
+      requestId
+    )
 
     if (!accessToken) {
       logger.error(`[${requestId}] Failed to obtain valid access token`)
@@ -113,7 +100,10 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    const data = await response.json()
+    const data = (await response.json()) as { contacts?: Array<Record<string, unknown>> } & Record<
+      string,
+      unknown
+    >
 
     logger.info(`[${requestId}] Wealthbox API raw response`, {
       type,
@@ -135,14 +125,19 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ items: [] }, { status: 200 })
       }
 
-      items = contacts.map((item: any) => ({
-        id: item.id?.toString() || '',
-        name: `${item.first_name || ''} ${item.last_name || ''}`.trim() || `Contact ${item.id}`,
-        type: 'contact',
-        content: item.background_information || '',
-        createdAt: item.created_at,
-        updatedAt: item.updated_at,
-      }))
+      items = contacts.map((item) => {
+        const firstName = typeof item.first_name === 'string' ? item.first_name : ''
+        const lastName = typeof item.last_name === 'string' ? item.last_name : ''
+        return {
+          id: item.id?.toString() || '',
+          name: `${firstName} ${lastName}`.trim() || `Contact ${item.id ?? ''}`,
+          type: 'contact',
+          content:
+            typeof item.background_information === 'string' ? item.background_information : '',
+          createdAt: typeof item.created_at === 'string' ? item.created_at : '',
+          updatedAt: typeof item.updated_at === 'string' ? item.updated_at : '',
+        }
+      })
     }
 
     if (query.trim()) {
@@ -164,4 +159,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Error fetching Wealthbox items`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

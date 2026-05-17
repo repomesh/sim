@@ -1,16 +1,21 @@
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { db } from '@sim/db'
 import { apiKey } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { generateShortId } from '@sim/utils/id'
 import { and, eq } from 'drizzle-orm'
-import { nanoid } from 'nanoid'
 import { type NextRequest, NextResponse } from 'next/server'
+import { createPersonalApiKeyContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
 import { createApiKey, getApiKeyDisplayFormat } from '@/lib/api-key/auth'
+import { hashApiKey } from '@/lib/api-key/crypto'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 const logger = createLogger('ApiKeysAPI')
 
 // GET /api/users/me/api-keys - Get all API keys for the current user
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
@@ -48,10 +53,10 @@ export async function GET(request: NextRequest) {
     logger.error('Failed to fetch API keys', { error })
     return NextResponse.json({ error: 'Failed to fetch API keys' }, { status: 500 })
   }
-}
+})
 
 // POST /api/users/me/api-keys - Create a new API key
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
@@ -59,17 +64,10 @@ export async function POST(request: NextRequest) {
     }
 
     const userId = session.user.id
-    const body = await request.json()
+    const parsed = await parseRequest(createPersonalApiKeyContract, request, {})
+    if (!parsed.success) return parsed.response
 
-    const { name: rawName } = body
-    if (!rawName || typeof rawName !== 'string') {
-      return NextResponse.json({ error: 'Invalid request. Name is required.' }, { status: 400 })
-    }
-
-    const name = rawName.trim()
-    if (!name) {
-      return NextResponse.json({ error: 'Name cannot be empty.' }, { status: 400 })
-    }
+    const { name } = parsed.data.body
 
     const existingKey = await db
       .select()
@@ -95,11 +93,12 @@ export async function POST(request: NextRequest) {
     const [newKey] = await db
       .insert(apiKey)
       .values({
-        id: nanoid(),
+        id: generateShortId(),
         userId,
         workspaceId: null,
         name,
         key: encryptedKey,
+        keyHash: hashApiKey(plainKey),
         type: 'personal',
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -109,6 +108,19 @@ export async function POST(request: NextRequest) {
         name: apiKey.name,
         createdAt: apiKey.createdAt,
       })
+
+    recordAudit({
+      workspaceId: null,
+      actorId: userId,
+      action: AuditAction.PERSONAL_API_KEY_CREATED,
+      resourceType: AuditResourceType.API_KEY,
+      resourceId: newKey.id,
+      actorName: session.user.name ?? undefined,
+      actorEmail: session.user.email ?? undefined,
+      resourceName: name,
+      description: `Created personal API key: ${name}`,
+      request,
+    })
 
     return NextResponse.json({
       key: {
@@ -120,4 +132,4 @@ export async function POST(request: NextRequest) {
     logger.error('Failed to create API key', { error })
     return NextResponse.json({ error: 'Failed to create API key' }, { status: 500 })
   }
-}
+})

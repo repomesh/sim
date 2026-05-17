@@ -1,12 +1,10 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { cn } from '@/lib/utils'
-import { inter } from '@/app/fonts/inter'
+import { Input, Label, Loader } from '@/components/emcn'
+import { cn } from '@/lib/core/utils/cn'
+import { AUTH_SUBMIT_BTN } from '@/app/(auth)/components/auth-button-classes'
 
 interface RequestResetFormProps {
   email: string
@@ -27,42 +25,13 @@ export function RequestResetForm({
   statusMessage,
   className,
 }: RequestResetFormProps) {
-  const [buttonClass, setButtonClass] = useState('auth-button-gradient')
-
-  useEffect(() => {
-    const checkCustomBrand = () => {
-      const computedStyle = getComputedStyle(document.documentElement)
-      const brandAccent = computedStyle.getPropertyValue('--brand-accent-hex').trim()
-
-      if (brandAccent && brandAccent !== '#6f3dfa') {
-        setButtonClass('auth-button-custom')
-      } else {
-        setButtonClass('auth-button-gradient')
-      }
-    }
-
-    checkCustomBrand()
-
-    window.addEventListener('resize', checkCustomBrand)
-    const observer = new MutationObserver(checkCustomBrand)
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['style', 'class'],
-    })
-
-    return () => {
-      window.removeEventListener('resize', checkCustomBrand)
-      observer.disconnect()
-    }
-  }, [])
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     onSubmit(email)
   }
 
   return (
-    <form onSubmit={handleSubmit} className={cn(`${inter.className} space-y-8`, className)}>
+    <form onSubmit={handleSubmit} className={cn('space-y-8', className)}>
       <div className='space-y-6'>
         <div className='space-y-2'>
           <div className='flex items-center justify-between'>
@@ -76,9 +45,8 @@ export function RequestResetForm({
             type='email'
             disabled={isSubmitting}
             required
-            className='rounded-[10px] shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100'
           />
-          <p className='text-muted-foreground text-sm'>
+          <p className='text-[var(--landing-text-muted)] text-sm'>
             We'll send a password reset link to this email address.
           </p>
         </div>
@@ -86,20 +54,26 @@ export function RequestResetForm({
         {/* Status message display */}
         {statusType && statusMessage && (
           <div
-            className={cn('text-xs', statusType === 'success' ? 'text-[#4CAF50]' : 'text-red-400')}
+            className={cn(
+              'text-xs',
+              statusType === 'success' ? 'text-[var(--success)]' : 'text-red-400'
+            )}
           >
             <p>{statusMessage}</p>
           </div>
         )}
       </div>
 
-      <Button
-        type='submit'
-        disabled={isSubmitting}
-        className={`${buttonClass} flex w-full items-center justify-center gap-2 rounded-[10px] border font-medium text-[15px] text-white transition-all duration-200`}
-      >
-        {isSubmitting ? 'Sending...' : 'Send Reset Link'}
-      </Button>
+      <button type='submit' disabled={isSubmitting} className={AUTH_SUBMIT_BTN}>
+        {isSubmitting ? (
+          <span className='flex items-center gap-2'>
+            <Loader className='size-4' animate />
+            Sending…
+          </span>
+        ) : (
+          'Send Reset Link'
+        )}
+      </button>
     </form>
   )
 }
@@ -123,57 +97,54 @@ export function SetNewPasswordForm({
 }: SetNewPasswordFormProps) {
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
-  const [validationMessage, setValidationMessage] = useState('')
+  const [validationMessages, setValidationMessages] = useState<string[]>([])
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
-  const [buttonClass, setButtonClass] = useState('auth-button-gradient')
-
-  useEffect(() => {
-    const checkCustomBrand = () => {
-      const computedStyle = getComputedStyle(document.documentElement)
-      const brandAccent = computedStyle.getPropertyValue('--brand-accent-hex').trim()
-
-      if (brandAccent && brandAccent !== '#6f3dfa') {
-        setButtonClass('auth-button-custom')
-      } else {
-        setButtonClass('auth-button-gradient')
-      }
-    }
-
-    checkCustomBrand()
-
-    window.addEventListener('resize', checkCustomBrand)
-    const observer = new MutationObserver(checkCustomBrand)
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['style', 'class'],
-    })
-
-    return () => {
-      window.removeEventListener('resize', checkCustomBrand)
-      observer.disconnect()
-    }
-  }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
+    const errors: string[] = []
+
     if (password.length < 8) {
-      setValidationMessage('Password must be at least 8 characters long')
-      return
+      errors.push('Password must be at least 8 characters long')
+    }
+
+    if (password.length > 100) {
+      errors.push('Password must not exceed 100 characters')
+    }
+
+    if (!/[A-Z]/.test(password)) {
+      errors.push('Password must contain at least one uppercase letter')
+    }
+
+    if (!/[a-z]/.test(password)) {
+      errors.push('Password must contain at least one lowercase letter')
+    }
+
+    if (!/[0-9]/.test(password)) {
+      errors.push('Password must contain at least one number')
+    }
+
+    if (!/[^A-Za-z0-9]/.test(password)) {
+      errors.push('Password must contain at least one special character')
     }
 
     if (password !== confirmPassword) {
-      setValidationMessage('Passwords do not match')
+      errors.push('Passwords do not match')
+    }
+
+    if (errors.length > 0) {
+      setValidationMessages(errors)
       return
     }
 
-    setValidationMessage('')
+    setValidationMessages([])
     onSubmit(password)
   }
 
   return (
-    <form onSubmit={handleSubmit} className={cn(`${inter.className} space-y-8`, className)}>
+    <form onSubmit={handleSubmit} className={cn('space-y-8', className)}>
       <div className='space-y-6'>
         <div className='space-y-2'>
           <div className='flex items-center justify-between'>
@@ -192,15 +163,14 @@ export function SetNewPasswordForm({
               required
               placeholder='Enter new password'
               className={cn(
-                'rounded-[10px] pr-10 shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
-                validationMessage &&
-                  'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
+                'pr-10',
+                validationMessages.length > 0 && 'border-red-500 focus:border-red-500'
               )}
             />
             <button
               type='button'
               onClick={() => setShowPassword(!showPassword)}
-              className='-translate-y-1/2 absolute top-1/2 right-3 text-gray-500 transition hover:text-gray-700'
+              className='-translate-y-1/2 absolute top-1/2 right-3 text-[var(--landing-text-muted)] transition hover:text-[var(--landing-text)]'
               aria-label={showPassword ? 'Hide password' : 'Show password'}
             >
               {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
@@ -224,15 +194,14 @@ export function SetNewPasswordForm({
               required
               placeholder='Confirm new password'
               className={cn(
-                'rounded-[10px] pr-10 shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
-                validationMessage &&
-                  'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
+                'pr-10',
+                validationMessages.length > 0 && 'border-red-500 focus:border-red-500'
               )}
             />
             <button
               type='button'
               onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-              className='-translate-y-1/2 absolute top-1/2 right-3 text-gray-500 transition hover:text-gray-700'
+              className='-translate-y-1/2 absolute top-1/2 right-3 text-[var(--landing-text-muted)] transition hover:text-[var(--landing-text)]'
               aria-label={showConfirmPassword ? 'Hide password' : 'Show password'}
             >
               {showConfirmPassword ? <EyeOff size={18} /> : <Eye size={18} />}
@@ -240,9 +209,11 @@ export function SetNewPasswordForm({
           </div>
         </div>
 
-        {validationMessage && (
+        {validationMessages.length > 0 && (
           <div className='mt-1 space-y-1 text-red-400 text-xs'>
-            <p>{validationMessage}</p>
+            {validationMessages.map((error) => (
+              <p key={error}>{error}</p>
+            ))}
           </div>
         )}
 
@@ -250,7 +221,7 @@ export function SetNewPasswordForm({
           <div
             className={cn(
               'mt-1 space-y-1 text-xs',
-              statusType === 'success' ? 'text-[#4CAF50]' : 'text-red-400'
+              statusType === 'success' ? 'text-[var(--success)]' : 'text-red-400'
             )}
           >
             <p>{statusMessage}</p>
@@ -258,13 +229,16 @@ export function SetNewPasswordForm({
         )}
       </div>
 
-      <Button
-        disabled={isSubmitting || !token}
-        type='submit'
-        className={`${buttonClass} flex w-full items-center justify-center gap-2 rounded-[10px] border font-medium text-[15px] text-white transition-all duration-200`}
-      >
-        {isSubmitting ? 'Resetting...' : 'Reset Password'}
-      </Button>
+      <button type='submit' disabled={isSubmitting || !token} className={AUTH_SUBMIT_BTN}>
+        {isSubmitting ? (
+          <span className='flex items-center gap-2'>
+            <Loader className='size-4' animate />
+            Resetting…
+          </span>
+        ) : (
+          'Reset Password'
+        )}
+      </button>
     </form>
   )
 }

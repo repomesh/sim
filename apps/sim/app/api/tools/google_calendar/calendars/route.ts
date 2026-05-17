@@ -1,8 +1,12 @@
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
+import { googleCalendarSelectorContract } from '@/lib/api/contracts/selectors/google'
+import { parseRequest } from '@/lib/api/server'
 import { authorizeCredentialUse } from '@/lib/auth/credential-access'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
-import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { getScopesForService } from '@/lib/oauth/utils'
+import { refreshAccessTokenIfNeeded, ServiceAccountTokenError } from '@/app/api/auth/oauth/utils'
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('GoogleCalendarAPI')
@@ -20,37 +24,45 @@ interface CalendarListItem {
 /**
  * Get calendars from Google Calendar
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
   logger.info(`[${requestId}] Google Calendar calendars request received`)
 
   try {
-    // Get the credential ID from the query params
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const workflowId = searchParams.get('workflowId') || undefined
+    const parsed = await parseRequest(
+      googleCalendarSelectorContract,
+      request,
+      {},
+      {
+        validationErrorResponse: () => {
+          logger.warn(`[${requestId}] Missing credentialId parameter`)
+          return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
 
-    if (!credentialId) {
-      logger.warn(`[${requestId}] Missing credentialId parameter`)
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
-    }
+    const { credentialId } = parsed.data.query
+    const workflowId = parsed.data.query.workflowId || undefined
+    const impersonateEmail = parsed.data.query.impersonateEmail || undefined
+
     const authz = await authorizeCredentialUse(request, { credentialId, workflowId })
     if (!authz.ok || !authz.credentialOwnerUserId) {
       return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    // Refresh access token if needed using the utility function
     const accessToken = await refreshAccessTokenIfNeeded(
       credentialId,
       authz.credentialOwnerUserId,
-      requestId
+      requestId,
+      getScopesForService('google-calendar'),
+      impersonateEmail
     )
 
     if (!accessToken) {
       return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
     }
 
-    // Fetch calendars from Google Calendar API
     logger.info(`[${requestId}] Fetching calendars from Google Calendar API`)
     const calendarResponse = await fetch(
       'https://www.googleapis.com/calendar/v3/users/me/calendarList',
@@ -81,7 +93,6 @@ export async function GET(request: NextRequest) {
     const data = await calendarResponse.json()
     const calendars: CalendarListItem[] = data.items || []
 
-    // Sort calendars with primary first, then alphabetically
     calendars.sort((a, b) => {
       if (a.primary && !b.primary) return -1
       if (!a.primary && b.primary) return 1
@@ -102,7 +113,11 @@ export async function GET(request: NextRequest) {
       })),
     })
   } catch (error) {
+    if (error instanceof ServiceAccountTokenError) {
+      logger.warn(`[${requestId}] Service account token error`, { message: error.message })
+      return NextResponse.json({ error: error.message }, { status: 400 })
+    }
     logger.error(`[${requestId}] Error fetching Google calendars`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

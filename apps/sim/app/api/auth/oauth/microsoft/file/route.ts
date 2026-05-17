@@ -1,33 +1,35 @@
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { validateMicrosoftGraphId } from '@/lib/security/input-validation'
-import { generateRequestId } from '@/lib/utils'
-import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
+import { microsoftFileQuerySchema } from '@/lib/api/contracts/selectors/microsoft'
+import { getValidationErrorMessage } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validateMicrosoftGraphId } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { getCredential, refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('MicrosoftFileAPI')
 
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
   try {
-    const session = await getSession()
-
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
-    }
-
     const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const fileId = searchParams.get('fileId')
+    const parsedQuery = microsoftFileQuerySchema.safeParse({
+      credentialId: searchParams.get('credentialId') ?? undefined,
+      fileId: searchParams.get('fileId') ?? undefined,
+      workflowId: searchParams.get('workflowId') ?? undefined,
+    })
 
-    if (!credentialId || !fileId) {
-      return NextResponse.json({ error: 'Credential ID and File ID are required' }, { status: 400 })
+    if (!parsedQuery.success) {
+      return NextResponse.json(
+        { error: getValidationErrorMessage(parsedQuery.error) },
+        { status: 400 }
+      )
     }
+
+    const { credentialId, fileId, workflowId } = parsedQuery.data
 
     const fileIdValidation = validateMicrosoftGraphId(fileId, 'fileId')
     if (!fileIdValidation.isValid) {
@@ -35,19 +37,32 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: fileIdValidation.error }, { status: 400 })
     }
 
-    const credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
+    const authz = await authorizeCredentialUse(request, {
+      credentialId,
+      workflowId,
+      requireWorkflowIdForInternal: false,
+    })
 
-    if (!credentials.length) {
+    if (!authz.ok || !authz.credentialOwnerUserId) {
+      const status = authz.error === 'Credential not found' ? 404 : 403
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status })
+    }
+
+    const resolvedCredentialId = authz.resolvedCredentialId || credentialId
+    const credential = await getCredential(
+      requestId,
+      resolvedCredentialId,
+      authz.credentialOwnerUserId
+    )
+    if (!credential) {
       return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
     }
 
-    const credential = credentials[0]
-
-    if (credential.userId !== session.user.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, session.user.id, requestId)
+    const accessToken = await refreshAccessTokenIfNeeded(
+      resolvedCredentialId,
+      authz.credentialOwnerUserId,
+      requestId
+    )
 
     if (!accessToken) {
       return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
@@ -105,4 +120,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Error fetching file from Microsoft OneDrive`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

@@ -1,25 +1,32 @@
 {
   "title": "Sim Documentation",
   "pages": [
+    "---Getting Started---",
     "./introduction/index",
     "./getting-started/index",
+    "./quick-reference/index",
     "---Building Workflows---",
     "triggers",
     "blocks",
     "tools",
     "connections",
+    "---Features---",
+    "mothership",
     "mcp",
     "copilot",
+    "mailer",
+    "skills",
     "knowledgebase",
-    "---Configuration---",
+    "tables",
     "variables",
-    "---Execution---",
+    "integrations",
+    "credentials",
+    "---Platform---",
     "execution",
-    "---Advanced---",
     "permissions",
-    "yaml",
-    "---SDKs---",
-    "sdks"
+    "self-hosting",
+    "enterprise",
+    "./keyboard-shortcuts/index"
   ],
   "defaultOpen": false
 }

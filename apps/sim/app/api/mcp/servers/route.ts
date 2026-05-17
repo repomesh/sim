@@ -1,30 +1,29 @@
 import { db } from '@sim/db'
 import { mcpServers } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
 import { and, eq, isNull } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
+import { createMcpServerBodySchema, deleteMcpServerByQuerySchema } from '@/lib/api/contracts/mcp'
+import { validationErrorResponse } from '@/lib/api/server'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { getParsedBody, withMcpAuth } from '@/lib/mcp/middleware'
-import { mcpService } from '@/lib/mcp/service'
-import type { McpTransport } from '@/lib/mcp/types'
-import { validateMcpServerUrl } from '@/lib/mcp/url-validator'
-import { createMcpErrorResponse, createMcpSuccessResponse } from '@/lib/mcp/utils'
+import { performCreateMcpServer, performDeleteMcpServer } from '@/lib/mcp/orchestration'
+import {
+  createMcpErrorResponse,
+  createMcpSuccessResponse,
+  mcpOrchestrationStatus,
+} from '@/lib/mcp/utils'
 
 const logger = createLogger('McpServersAPI')
 
 export const dynamic = 'force-dynamic'
 
 /**
- * Check if transport type requires a URL
- */
-function isUrlBasedTransport(transport: McpTransport): boolean {
-  return transport === 'http' || transport === 'sse' || transport === 'streamable-http'
-}
-
-/**
  * GET - List all registered MCP servers for the workspace
  */
-export const GET = withMcpAuth('read')(
-  async (request: NextRequest, { userId, workspaceId, requestId }) => {
+export const GET = withRouteHandler(
+  withMcpAuth('read')(async (request: NextRequest, { userId, workspaceId, requestId }) => {
     try {
       logger.info(`[${requestId}] Listing MCP servers for workspace ${workspaceId}`)
 
@@ -39,128 +38,146 @@ export const GET = withMcpAuth('read')(
       return createMcpSuccessResponse({ servers })
     } catch (error) {
       logger.error(`[${requestId}] Error listing MCP servers:`, error)
-      return createMcpErrorResponse(
-        error instanceof Error ? error : new Error('Failed to list MCP servers'),
-        'Failed to list MCP servers',
-        500
-      )
+      return createMcpErrorResponse(toError(error), 'Failed to list MCP servers', 500)
     }
-  }
+  })
 )
 
 /**
  * POST - Register a new MCP server for the workspace (requires write permission)
+ *
+ * Uses deterministic server IDs based on URL hash to ensure that re-adding
+ * the same server produces the same ID. This prevents "server not found" errors
+ * when workflows reference the old server ID after delete/re-add cycles.
+ *
+ * If a server with the same ID already exists (same URL in same workspace),
+ * it will be updated instead of creating a duplicate.
  */
-export const POST = withMcpAuth('write')(
-  async (request: NextRequest, { userId, workspaceId, requestId }) => {
-    try {
-      const body = getParsedBody(request) || (await request.json())
+export const POST = withRouteHandler(
+  withMcpAuth('write')(
+    async (request: NextRequest, { userId, userName, userEmail, workspaceId, requestId }) => {
+      try {
+        const rawBody = getParsedBody(request) ?? (await request.json())
+        const parsedBody = createMcpServerBodySchema.safeParse(rawBody)
 
-      logger.info(`[${requestId}] Registering new MCP server:`, {
-        name: body.name,
-        transport: body.transport,
-        workspaceId,
-      })
+        if (!parsedBody.success) {
+          return createMcpErrorResponse(parsedBody.error, 'Invalid request format', 400)
+        }
 
-      if (!body.name || !body.transport) {
-        return createMcpErrorResponse(
-          new Error('Missing required fields: name or transport'),
-          'Missing required fields',
-          400
-        )
-      }
+        const body = parsedBody.data
 
-      if (isUrlBasedTransport(body.transport) && body.url) {
-        const urlValidation = validateMcpServerUrl(body.url)
-        if (!urlValidation.isValid) {
+        logger.info(`[${requestId}] Registering MCP server:`, {
+          name: body.name,
+          transport: body.transport,
+          workspaceId,
+        })
+
+        const sourceParam = body.source as string | undefined
+        const source =
+          sourceParam === 'settings' || sourceParam === 'tool_input' ? sourceParam : undefined
+        if (!body.url) {
           return createMcpErrorResponse(
-            new Error(`Invalid MCP server URL: ${urlValidation.error}`),
-            'Invalid server URL',
+            new Error('url is required'),
+            'Missing required parameter',
             400
           )
         }
-        body.url = urlValidation.normalizedUrl
-      }
-
-      const serverId = body.id || crypto.randomUUID()
-
-      await db
-        .insert(mcpServers)
-        .values({
-          id: serverId,
+        const result = await performCreateMcpServer({
           workspaceId,
-          createdBy: userId,
+          userId,
+          actorName: userName,
+          actorEmail: userEmail,
           name: body.name,
           description: body.description,
           transport: body.transport,
           url: body.url,
-          headers: body.headers || {},
-          timeout: body.timeout || 30000,
-          retries: body.retries || 3,
-          enabled: body.enabled !== false,
-          createdAt: new Date(),
-          updatedAt: new Date(),
+          headers: body.headers,
+          timeout: body.timeout,
+          retries: body.retries,
+          enabled: body.enabled,
+          source,
+          request,
         })
-        .returning()
+        if (!result.success || !result.serverId) {
+          return createMcpErrorResponse(
+            new Error(result.error || 'Failed to register MCP server'),
+            result.error || 'Failed to register MCP server',
+            mcpOrchestrationStatus(result.errorCode)
+          )
+        }
 
-      mcpService.clearCache(workspaceId)
+        logger.info(
+          `[${requestId}] Successfully registered MCP server: ${body.name} (ID: ${result.serverId})`
+        )
 
-      logger.info(`[${requestId}] Successfully registered MCP server: ${body.name}`)
-      return createMcpSuccessResponse({ serverId }, 201)
-    } catch (error) {
-      logger.error(`[${requestId}] Error registering MCP server:`, error)
-      return createMcpErrorResponse(
-        error instanceof Error ? error : new Error('Failed to register MCP server'),
-        'Failed to register MCP server',
-        500
-      )
+        return createMcpSuccessResponse(
+          result.updated
+            ? { serverId: result.serverId, updated: true }
+            : { serverId: result.serverId },
+          result.updated ? 200 : 201
+        )
+      } catch (error) {
+        logger.error(`[${requestId}] Error registering MCP server:`, error)
+        return createMcpErrorResponse(toError(error), 'Failed to register MCP server', 500)
+      }
     }
-  }
+  )
 )
 
 /**
  * DELETE - Delete an MCP server from the workspace (requires admin permission)
  */
-export const DELETE = withMcpAuth('admin')(
-  async (request: NextRequest, { userId, workspaceId, requestId }) => {
-    try {
-      const { searchParams } = new URL(request.url)
-      const serverId = searchParams.get('serverId')
-
-      if (!serverId) {
-        return createMcpErrorResponse(
-          new Error('serverId parameter is required'),
-          'Missing required parameter',
-          400
+export const DELETE = withRouteHandler(
+  withMcpAuth('admin')(
+    async (request: NextRequest, { userId, userName, userEmail, workspaceId, requestId }) => {
+      try {
+        const { searchParams } = new URL(request.url)
+        const queryValidation = deleteMcpServerByQuerySchema.safeParse(
+          Object.fromEntries(searchParams)
         )
-      }
+        if (!queryValidation.success) return validationErrorResponse(queryValidation.error)
+        const query = queryValidation.data
+        const serverId = query.serverId
+        const sourceParam = query.source
+        const source =
+          sourceParam === 'settings' || sourceParam === 'tool_input' ? sourceParam : undefined
 
-      logger.info(`[${requestId}] Deleting MCP server: ${serverId} from workspace: ${workspaceId}`)
+        if (!serverId) {
+          return createMcpErrorResponse(
+            new Error('serverId parameter is required'),
+            'Missing required parameter',
+            400
+          )
+        }
 
-      const [deletedServer] = await db
-        .delete(mcpServers)
-        .where(and(eq(mcpServers.id, serverId), eq(mcpServers.workspaceId, workspaceId)))
-        .returning()
-
-      if (!deletedServer) {
-        return createMcpErrorResponse(
-          new Error('Server not found or access denied'),
-          'Server not found',
-          404
+        logger.info(
+          `[${requestId}] Deleting MCP server: ${serverId} from workspace: ${workspaceId}`
         )
+
+        const result = await performDeleteMcpServer({
+          workspaceId,
+          userId,
+          actorName: userName,
+          actorEmail: userEmail,
+          serverId,
+          source,
+          request,
+        })
+        if (!result.success || !result.server) {
+          return createMcpErrorResponse(
+            new Error(result.error || 'Failed to delete MCP server'),
+            result.error || 'Failed to delete MCP server',
+            mcpOrchestrationStatus(result.errorCode)
+          )
+        }
+
+        logger.info(`[${requestId}] Successfully deleted MCP server: ${serverId}`)
+
+        return createMcpSuccessResponse({ message: `Server ${serverId} deleted successfully` })
+      } catch (error) {
+        logger.error(`[${requestId}] Error deleting MCP server:`, error)
+        return createMcpErrorResponse(toError(error), 'Failed to delete MCP server', 500)
       }
-
-      mcpService.clearCache(workspaceId)
-
-      logger.info(`[${requestId}] Successfully deleted MCP server: ${serverId}`)
-      return createMcpSuccessResponse({ message: `Server ${serverId} deleted successfully` })
-    } catch (error) {
-      logger.error(`[${requestId}] Error deleting MCP server:`, error)
-      return createMcpErrorResponse(
-        error instanceof Error ? error : new Error('Failed to delete MCP server'),
-        'Failed to delete MCP server',
-        500
-      )
     }
-  }
+  )
 )

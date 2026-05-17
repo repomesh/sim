@@ -1,6 +1,6 @@
 import { TwilioIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import { AuthMode } from '@/blocks/types'
+import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { TwilioSMSBlockOutput } from '@/tools/twilio/types'
 
 export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
@@ -10,6 +10,9 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
   authMode: AuthMode.ApiKey,
   longDescription: 'Integrate Twilio into the workflow. Can send SMS messages.',
   category: 'tools',
+  integrationType: IntegrationType.Communication,
+  tags: ['messaging', 'automation'],
+  docsLink: 'https://docs.sim.ai/tools/twilio',
   bgColor: '#F22F46', // Twilio brand color
   icon: TwilioIcon,
   subBlocks: [
@@ -17,7 +20,6 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
       id: 'phoneNumbers',
       title: 'Recipient Phone Numbers',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter phone numbers with country code (one per line, e.g., +1234567890)',
       required: true,
     },
@@ -25,7 +27,6 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
       id: 'message',
       title: 'Message',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'e.g. "Hello! This is a test message."',
       required: true,
     },
@@ -33,7 +34,6 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
       id: 'accountSid',
       title: 'Twilio Account SID',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Your Twilio Account SID',
       required: true,
     },
@@ -41,7 +41,6 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
       id: 'authToken',
       title: 'Auth Token',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Your Twilio Auth Token',
       password: true,
       required: true,
@@ -50,7 +49,6 @@ export const TwilioSMSBlock: BlockConfig<TwilioSMSBlockOutput> = {
       id: 'fromNumber',
       title: 'From Twilio Phone Number',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'e.g. +1234567890',
       required: true,
     },

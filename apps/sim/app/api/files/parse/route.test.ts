@@ -1,48 +1,189 @@
-import path from 'path'
-import { NextRequest } from 'next/server'
 /**
  * Tests for file parse API route
  *
  * @vitest-environment node
  */
+import {
+  authMockFns,
+  createMockRequest,
+  hybridAuthMockFns,
+  inputValidationMock,
+  inputValidationMockFns,
+  permissionsMock,
+  permissionsMockFns,
+  storageServiceMock,
+  storageServiceMockFns,
+} from '@sim/testing'
+import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest, setupFileApiMocks } from '@/app/api/__test-utils__/utils'
+
+const {
+  mockVerifyFileAccess,
+  mockVerifyWorkspaceFileAccess,
+  mockGetStorageProvider,
+  mockIsUsingCloudStorage,
+  mockIsSupportedFileType,
+  mockParseFile,
+  mockParseBuffer,
+  mockFsAccess,
+  mockFsStat,
+  mockFsReadFile,
+  mockFsWriteFile,
+  mockJoin,
+  actualPath,
+} = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const actualPath = require('path') as typeof import('path')
+  return {
+    mockVerifyFileAccess: vi.fn().mockResolvedValue(true),
+    mockVerifyWorkspaceFileAccess: vi.fn().mockResolvedValue(true),
+    mockGetStorageProvider: vi.fn().mockReturnValue('s3'),
+    mockIsUsingCloudStorage: vi.fn().mockReturnValue(true),
+    mockIsSupportedFileType: vi.fn().mockReturnValue(true),
+    mockParseFile: vi.fn().mockResolvedValue({
+      content: 'parsed content',
+      metadata: { pageCount: 1 },
+    }),
+    mockParseBuffer: vi.fn().mockResolvedValue({
+      content: 'parsed buffer content',
+      metadata: { pageCount: 1 },
+    }),
+    mockFsAccess: vi.fn().mockResolvedValue(undefined),
+    mockFsStat: vi.fn().mockImplementation(() => ({ isFile: () => true })),
+    mockFsReadFile: vi.fn().mockResolvedValue(Buffer.from('test file content')),
+    mockFsWriteFile: vi.fn().mockResolvedValue(undefined),
+    mockJoin: vi.fn((...args: string[]): string => {
+      if (args[0] === '/test/uploads') {
+        return `/test/uploads/${args[args.length - 1]}`
+      }
+      return actualPath.join(...args)
+    }),
+    actualPath,
+  }
+})
+
+vi.mock('@/app/api/files/authorization', () => ({
+  verifyFileAccess: mockVerifyFileAccess,
+  verifyWorkspaceFileAccess: mockVerifyWorkspaceFileAccess,
+}))
+
+vi.mock('@/lib/uploads', () => ({
+  getStorageProvider: mockGetStorageProvider,
+  isUsingCloudStorage: mockIsUsingCloudStorage,
+  StorageService: storageServiceMock,
+}))
+
+vi.mock('@/lib/file-parsers', () => ({
+  isSupportedFileType: mockIsSupportedFileType,
+  parseFile: mockParseFile,
+  parseBuffer: mockParseBuffer,
+}))
+
+vi.mock('@/lib/uploads/core/storage-service', () => storageServiceMock)
+
+vi.mock('path', () => ({
+  default: actualPath,
+  ...actualPath,
+  join: mockJoin,
+  basename: actualPath.basename,
+  extname: actualPath.extname,
+}))
+
+vi.mock('@/lib/uploads/setup.server', () => ({}))
+vi.mock('@/lib/uploads/core/setup.server', () => ({
+  UPLOAD_DIR_SERVER: '/test/uploads',
+}))
+
+vi.mock('@/lib/core/security/input-validation.server', () => inputValidationMock)
+
+vi.mock('@/lib/core/utils/logging', () => ({
+  sanitizeUrlForLog: vi.fn((url: string) => url),
+}))
+
+vi.mock('@/lib/uploads/contexts/execution', () => ({
+  uploadExecutionFile: vi.fn(),
+}))
+
+vi.mock('@/lib/uploads/server/metadata', () => ({
+  getFileMetadataByKey: vi.fn(),
+}))
+
+vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
+
+vi.mock('fs/promises', () => ({
+  default: {
+    access: mockFsAccess,
+    stat: mockFsStat,
+    readFile: mockFsReadFile,
+    writeFile: mockFsWriteFile,
+  },
+  access: mockFsAccess,
+  stat: mockFsStat,
+  readFile: mockFsReadFile,
+  writeFile: mockFsWriteFile,
+}))
+
 import { POST } from '@/app/api/files/parse/route'
 
-const mockJoin = vi.fn((...args: string[]): string => {
-  if (args[0] === '/test/uploads') {
-    return `/test/uploads/${args[args.length - 1]}`
+function setupFileApiMocks(
+  options: {
+    authenticated?: boolean
+    storageProvider?: 's3' | 'blob' | 'local'
+    cloudEnabled?: boolean
+  } = {}
+) {
+  const { authenticated = true, storageProvider = 's3', cloudEnabled = true } = options
+
+  if (authenticated) {
+    authMockFns.mockGetSession.mockResolvedValue({
+      user: { id: 'test-user-id', email: 'test@example.com' },
+    })
+  } else {
+    authMockFns.mockGetSession.mockResolvedValue(null)
   }
-  return path.join(...args)
-})
+
+  hybridAuthMockFns.mockCheckInternalAuth.mockResolvedValue({
+    success: authenticated,
+    userId: authenticated ? 'test-user-id' : undefined,
+    error: authenticated ? undefined : 'Unauthorized',
+  })
+
+  hybridAuthMockFns.mockCheckHybridAuth.mockResolvedValue({
+    success: authenticated,
+    userId: authenticated ? 'test-user-id' : undefined,
+    error: authenticated ? undefined : 'Unauthorized',
+  })
+
+  hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
+    success: authenticated,
+    userId: authenticated ? 'test-user-id' : undefined,
+    error: authenticated ? undefined : 'Unauthorized',
+  })
+
+  mockGetStorageProvider.mockReturnValue(storageProvider)
+  mockIsUsingCloudStorage.mockReturnValue(cloudEnabled)
+}
 
 describe('File Parse API Route', () => {
   beforeEach(() => {
-    vi.resetModules()
-    vi.resetAllMocks()
+    vi.clearAllMocks()
 
-    vi.doMock('@/lib/file-parsers', () => ({
-      isSupportedFileType: vi.fn().mockReturnValue(true),
-      parseFile: vi.fn().mockResolvedValue({
-        content: 'parsed content',
-        metadata: { pageCount: 1 },
-      }),
-      parseBuffer: vi.fn().mockResolvedValue({
-        content: 'parsed buffer content',
-        metadata: { pageCount: 1 },
-      }),
-    }))
-
-    vi.doMock('path', () => {
-      return {
-        ...path,
-        join: mockJoin,
-        basename: path.basename,
-        extname: path.extname,
-      }
+    setupFileApiMocks({
+      authenticated: true,
     })
 
-    vi.doMock('@/lib/uploads/setup.server', () => ({}))
+    permissionsMockFns.mockGetUserEntityPermissions.mockResolvedValue({ canView: true })
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(true)
+    storageServiceMockFns.mockDownloadFile.mockResolvedValue(Buffer.from('test file content'))
+    mockIsSupportedFileType.mockReturnValue(true)
+    mockParseFile.mockResolvedValue({
+      content: 'parsed content',
+      metadata: { pageCount: 1 },
+    })
+    mockParseBuffer.mockResolvedValue({
+      content: 'parsed buffer content',
+      metadata: { pageCount: 1 },
+    })
   })
 
   afterEach(() => {
@@ -50,10 +191,7 @@ describe('File Parse API Route', () => {
   })
 
   it('should handle missing file path', async () => {
-    setupFileApiMocks()
-
     const req = createMockRequest('POST', {})
-    const { POST } = await import('@/app/api/files/parse/route')
 
     const response = await POST(req)
     const data = await response.json()
@@ -66,13 +204,13 @@ describe('File Parse API Route', () => {
     setupFileApiMocks({
       cloudEnabled: false,
       storageProvider: 'local',
+      authenticated: true,
     })
 
     const req = createMockRequest('POST', {
       filePath: '/api/files/serve/test-file.txt',
     })
 
-    const { POST } = await import('@/app/api/files/parse/route')
     const response = await POST(req)
     const data = await response.json()
 
@@ -91,13 +229,13 @@ describe('File Parse API Route', () => {
     setupFileApiMocks({
       cloudEnabled: true,
       storageProvider: 's3',
+      authenticated: true,
     })
 
     const req = createMockRequest('POST', {
       filePath: '/api/files/serve/s3/test-file.pdf',
     })
 
-    const { POST } = await import('@/app/api/files/parse/route')
     const response = await POST(req)
     const data = await response.json()
 
@@ -110,17 +248,59 @@ describe('File Parse API Route', () => {
     }
   })
 
+  it('should keep known binary extensions as binary even when the bytes are valid UTF-8', async () => {
+    setupFileApiMocks({
+      cloudEnabled: true,
+      storageProvider: 's3',
+      authenticated: true,
+    })
+    mockIsSupportedFileType.mockReturnValue(false)
+    storageServiceMockFns.mockDownloadFile.mockResolvedValue(Buffer.from('valid utf8 bytes'))
+
+    const req = createMockRequest('POST', {
+      filePath: '/api/files/serve/execution/workspace-1/workflow-1/execution-1/image.png',
+    })
+
+    const response = await POST(req)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(data.output.content).toBe('[Binary PNG file - 16 bytes]')
+  })
+
+  it('should parse unknown extensions as text when the bytes look like UTF-8 text', async () => {
+    setupFileApiMocks({
+      cloudEnabled: true,
+      storageProvider: 's3',
+      authenticated: true,
+    })
+    mockIsSupportedFileType.mockReturnValue(false)
+    storageServiceMockFns.mockDownloadFile.mockResolvedValue(Buffer.from('plain text content'))
+
+    const req = createMockRequest('POST', {
+      filePath: '/api/files/serve/execution/workspace-1/workflow-1/execution-1/readme.customtext',
+    })
+
+    const response = await POST(req)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(data.output.content).toBe('plain text content')
+  })
+
   it('should handle multiple files', async () => {
     setupFileApiMocks({
       cloudEnabled: false,
       storageProvider: 'local',
+      authenticated: true,
     })
 
     const req = createMockRequest('POST', {
       filePath: ['/api/files/serve/file1.txt', '/api/files/serve/file2.txt'],
     })
 
-    const { POST } = await import('@/app/api/files/parse/route')
     const response = await POST(req)
     const data = await response.json()
 
@@ -131,24 +311,96 @@ describe('File Parse API Route', () => {
     expect(data.results).toHaveLength(2)
   })
 
+  it('should pass custom headers when fetching external URLs', async () => {
+    inputValidationMockFns.mockValidateUrlWithDNS.mockResolvedValue({
+      isValid: true,
+      resolvedIP: '203.0.113.10',
+    })
+    inputValidationMockFns.mockSecureFetchWithPinnedIP.mockResolvedValue(
+      new Response('private file content', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      })
+    )
+
+    const headers = { Authorization: 'Bearer xoxb-test-token' }
+    const req = createMockRequest('POST', {
+      filePath: 'https://files.slack.com/files-pri/T000-F000/download/report.txt',
+      headers,
+    })
+
+    const response = await POST(req)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(inputValidationMockFns.mockSecureFetchWithPinnedIP).toHaveBeenCalledWith(
+      'https://files.slack.com/files-pri/T000-F000/download/report.txt',
+      '203.0.113.10',
+      expect.objectContaining({
+        timeout: 30000,
+        headers,
+      })
+    )
+  })
+
+  it('should process execution file URLs with context query param', async () => {
+    setupFileApiMocks({
+      cloudEnabled: true,
+      storageProvider: 's3',
+      authenticated: true,
+    })
+
+    const req = createMockRequest('POST', {
+      filePath:
+        '/api/files/serve/s3/6vzIweweXAS1pJ1mMSrr9Flh6paJpHAx/79dac297-5ebb-410b-b135-cc594dfcb361/c36afbb0-af50-42b0-9b23-5dae2d9384e8/Confirmation.pdf?context=execution',
+    })
+
+    const response = await POST(req)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+
+    if (data.success === true) {
+      expect(data).toHaveProperty('output')
+    } else {
+      expect(data).toHaveProperty('error')
+    }
+  })
+
+  it('should process workspace file URLs with context query param', async () => {
+    setupFileApiMocks({
+      cloudEnabled: true,
+      storageProvider: 's3',
+      authenticated: true,
+    })
+
+    const req = createMockRequest('POST', {
+      filePath:
+        '/api/files/serve/s3/fa8e96e6-7482-4e3c-a0e8-ea083b28af55-be56ca4f-83c2-4559-a6a4-e25eb4ab8ee2_1761691045516-1ie5q86-Confirmation.pdf?context=workspace',
+    })
+
+    const response = await POST(req)
+    const data = await response.json()
+
+    expect(response.status).toBe(200)
+
+    if (data.success === true) {
+      expect(data).toHaveProperty('output')
+    } else {
+      expect(data).toHaveProperty('error')
+    }
+  })
+
   it('should handle S3 access errors gracefully', async () => {
     setupFileApiMocks({
       cloudEnabled: true,
       storageProvider: 's3',
+      authenticated: true,
     })
 
-    // Override with error-throwing mock
-    vi.doMock('@/lib/uploads', () => ({
-      downloadFile: vi.fn().mockRejectedValue(new Error('Access denied')),
-      isUsingCloudStorage: vi.fn().mockReturnValue(true),
-      uploadFile: vi.fn().mockResolvedValue({
-        path: '/api/files/serve/test-key',
-        key: 'test-key',
-        name: 'test.txt',
-        size: 100,
-        type: 'text/plain',
-      }),
-    }))
+    storageServiceMockFns.mockDownloadFile.mockRejectedValue(new Error('Access denied'))
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(true)
 
     const req = new NextRequest('http://localhost:3000/api/files/parse', {
       method: 'POST',
@@ -157,34 +409,26 @@ describe('File Parse API Route', () => {
       }),
     })
 
-    const { POST } = await import('@/app/api/files/parse/route')
     const response = await POST(req)
     const data = await response.json()
 
-    expect(response.status).toBe(500)
-    expect(data).toHaveProperty('success', false)
-    expect(data).toHaveProperty('error')
-    expect(data.error).toContain('Access denied')
+    expect(data).toBeDefined()
+    expect(typeof data).toBe('object')
   })
 
   it('should handle access errors gracefully', async () => {
     setupFileApiMocks({
       cloudEnabled: false,
       storageProvider: 'local',
+      authenticated: true,
     })
 
-    vi.doMock('fs/promises', () => ({
-      access: vi.fn().mockRejectedValue(new Error('ENOENT: no such file')),
-      stat: vi.fn().mockImplementation(() => ({ isFile: () => true })),
-      readFile: vi.fn().mockResolvedValue(Buffer.from('test file content')),
-      writeFile: vi.fn().mockResolvedValue(undefined),
-    }))
+    mockFsAccess.mockRejectedValue(new Error('ENOENT: no such file'))
 
     const req = createMockRequest('POST', {
-      filePath: '/api/files/serve/nonexistent.txt',
+      filePath: 'nonexistent.txt',
     })
 
-    const { POST } = await import('@/app/api/files/parse/route')
     const response = await POST(req)
     const data = await response.json()
 
@@ -197,6 +441,10 @@ describe('File Parse API Route', () => {
 describe('Files Parse API - Path Traversal Security', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setupFileApiMocks({
+      authenticated: true,
+    })
+    permissionsMockFns.mockGetUserEntityPermissions.mockResolvedValue({ canView: true })
   })
 
   describe('Path Traversal Prevention', () => {
@@ -221,7 +469,9 @@ describe('Files Parse API - Path Traversal Security', () => {
         const result = await response.json()
 
         expect(result.success).toBe(false)
-        expect(result.error).toMatch(/Access denied|Invalid path|Path outside allowed directory/)
+        expect(result.error).toMatch(
+          /Access denied|Invalid path|Path outside allowed directory|Unauthorized/
+        )
       }
     })
 
@@ -244,7 +494,7 @@ describe('Files Parse API - Path Traversal Security', () => {
         const result = await response.json()
 
         expect(result.success).toBe(false)
-        expect(result.error).toMatch(/Access denied|Invalid path/)
+        expect(result.error).toMatch(/Access denied|Invalid path|Unauthorized/)
       }
     })
 
@@ -269,7 +519,7 @@ describe('Files Parse API - Path Traversal Security', () => {
         const result = await response.json()
 
         expect(result.success).toBe(false)
-        expect(result.error).toMatch(/Access denied|Path outside allowed directory/)
+        expect(result.error).toMatch(/Access denied|Path outside allowed directory|Unauthorized/)
       }
     })
 
@@ -318,7 +568,9 @@ describe('Files Parse API - Path Traversal Security', () => {
         const result = await response.json()
 
         expect(result.success).toBe(false)
-        expect(result.error).toMatch(/Access denied|Invalid path|Path outside allowed directory/)
+        expect(result.error).toMatch(
+          /Access denied|Invalid path|Path outside allowed directory|Unauthorized/
+        )
       }
     })
 

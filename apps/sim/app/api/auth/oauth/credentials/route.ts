@@ -1,186 +1,319 @@
 import { db } from '@sim/db'
-import { account, user, workflow } from '@sim/db/schema'
+import { account, credential, credentialMember } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { and, eq } from 'drizzle-orm'
-import { jwtDecode } from 'jwt-decode'
 import { type NextRequest, NextResponse } from 'next/server'
-import { checkHybridAuth } from '@/lib/auth/hybrid'
-import { createLogger } from '@/lib/logs/console/logger'
-import type { OAuthService } from '@/lib/oauth/oauth'
-import { parseProvider } from '@/lib/oauth/oauth'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
-import { generateRequestId } from '@/lib/utils'
+import { oauthCredentialsQuerySchema } from '@/lib/api/contracts/credentials'
+import { getValidationErrorMessage } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { syncWorkspaceOAuthCredentialsForUser } from '@/lib/credentials/oauth'
+import {
+  getCanonicalScopesForProvider,
+  getServiceAccountProviderForProviderId,
+} from '@/lib/oauth/utils'
+import { checkWorkspaceAccess } from '@/lib/workspaces/permissions/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('OAuthCredentialsAPI')
 
-interface GoogleIdToken {
-  email?: string
-  sub?: string
-  name?: string
+function toCredentialResponse(
+  id: string,
+  displayName: string,
+  providerId: string,
+  updatedAt: Date,
+  scope: string | null,
+  credentialType: 'oauth' | 'service_account' = 'oauth'
+) {
+  const storedScope = scope?.trim()
+  // Some providers (e.g. Box) don't return scopes in their token response,
+  // so the DB column stays empty. Fall back to the configured scopes for
+  // the provider so the credential-selector doesn't show a false
+  // "Additional permissions required" banner.
+  const scopes = storedScope
+    ? storedScope.split(/[\s,]+/).filter(Boolean)
+    : getCanonicalScopesForProvider(providerId)
+  const [_, featureType = 'default'] = providerId.split('-')
+
+  return {
+    id,
+    name: displayName,
+    provider: providerId,
+    type: credentialType,
+    lastUsed: updatedAt.toISOString(),
+    isDefault: featureType === 'default',
+    scopes,
+  }
 }
 
 /**
  * Get credentials for a specific provider
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
-    // Get query params
     const { searchParams } = new URL(request.url)
-    const providerParam = searchParams.get('provider') as OAuthService | null
-    const workflowId = searchParams.get('workflowId')
-    const credentialId = searchParams.get('credentialId')
+    const rawQuery = {
+      provider: searchParams.get('provider'),
+      workflowId: searchParams.get('workflowId'),
+      workspaceId: searchParams.get('workspaceId'),
+      credentialId: searchParams.get('credentialId'),
+    }
 
-    // Authenticate requester (supports session, API key, internal JWT)
-    const authResult = await checkHybridAuth(request)
+    const parseResult = oauthCredentialsQuerySchema.safeParse(rawQuery)
+
+    if (!parseResult.success) {
+      const refinementError = parseResult.error.issues.find((err) => err.code === 'custom')
+      if (refinementError) {
+        logger.warn(`[${requestId}] Invalid query parameters: ${refinementError.message}`)
+        return NextResponse.json({ error: refinementError.message }, { status: 400 })
+      }
+
+      logger.warn(`[${requestId}] Invalid query parameters`, {
+        errors: parseResult.error.issues,
+      })
+
+      return NextResponse.json(
+        { error: getValidationErrorMessage(parseResult.error, 'Validation failed') },
+        { status: 400 }
+      )
+    }
+
+    const { provider: providerParam, workflowId, workspaceId, credentialId } = parseResult.data
+
+    // Authenticate requester (supports session and internal JWT)
+    const authResult = await checkSessionOrInternalAuth(request)
     if (!authResult.success || !authResult.userId) {
       logger.warn(`[${requestId}] Unauthenticated credentials request rejected`)
       return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
     }
     const requesterUserId = authResult.userId
 
-    // Resolve effective user id: workflow owner if workflowId provided (with access check); else requester
-    let effectiveUserId: string
+    let effectiveWorkspaceId = workspaceId ?? undefined
     if (workflowId) {
-      // Load workflow owner and workspace for access control
-      const rows = await db
-        .select({ userId: workflow.userId, workspaceId: workflow.workspaceId })
-        .from(workflow)
-        .where(eq(workflow.id, workflowId))
-        .limit(1)
-
-      if (!rows.length) {
-        logger.warn(`[${requestId}] Workflow not found for credentials request`, { workflowId })
-        return NextResponse.json({ error: 'Workflow not found' }, { status: 404 })
+      const workflowAuthorization = await authorizeWorkflowByWorkspacePermission({
+        workflowId,
+        userId: requesterUserId,
+        action: 'read',
+      })
+      if (!workflowAuthorization.allowed) {
+        logger.warn(`[${requestId}] Forbidden credentials request for workflow`, {
+          requesterUserId,
+          workflowId,
+          status: workflowAuthorization.status,
+        })
+        return NextResponse.json(
+          { error: workflowAuthorization.message || 'Forbidden' },
+          { status: workflowAuthorization.status }
+        )
       }
-
-      const wf = rows[0]
-
-      if (requesterUserId !== wf.userId) {
-        if (!wf.workspaceId) {
-          logger.warn(
-            `[${requestId}] Forbidden - workflow has no workspace and requester is not owner`,
-            {
-              requesterUserId,
-            }
-          )
-          return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-        }
-
-        const perm = await getUserEntityPermissions(requesterUserId, 'workspace', wf.workspaceId)
-        if (perm === null) {
-          logger.warn(`[${requestId}] Forbidden credentials request - no workspace access`, {
-            requesterUserId,
-            workspaceId: wf.workspaceId,
-          })
-          return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-        }
-      }
-
-      effectiveUserId = wf.userId
-    } else {
-      effectiveUserId = requesterUserId
+      effectiveWorkspaceId = workflowAuthorization.workflow?.workspaceId || undefined
     }
 
-    if (!providerParam && !credentialId) {
-      logger.warn(`[${requestId}] Missing provider parameter`)
-      return NextResponse.json({ error: 'Provider or credentialId is required' }, { status: 400 })
+    if (effectiveWorkspaceId) {
+      const workspaceAccess = await checkWorkspaceAccess(effectiveWorkspaceId, requesterUserId)
+      if (!workspaceAccess.hasAccess) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      }
     }
-
-    // Parse the provider to get base provider and feature type (if provider is present)
-    const { baseProvider } = parseProvider(providerParam || 'google-default')
-
-    let accountsData
 
     if (credentialId) {
-      // Foreign-aware lookup for a specific credential by id
-      // If workflowId is provided and requester has access (checked above), allow fetching by id only
-      if (workflowId) {
-        accountsData = await db.select().from(account).where(eq(account.id, credentialId))
-      } else {
-        // Fallback: constrain to requester's own credentials when not in a workflow context
-        accountsData = await db
-          .select()
-          .from(account)
-          .where(and(eq(account.userId, effectiveUserId), eq(account.id, credentialId)))
-      }
-    } else {
-      // Fetch all credentials for provider and effective user
-      accountsData = await db
-        .select()
-        .from(account)
-        .where(and(eq(account.userId, effectiveUserId), eq(account.providerId, providerParam!)))
-    }
+      const [platformCredential] = await db
+        .select({
+          id: credential.id,
+          workspaceId: credential.workspaceId,
+          type: credential.type,
+          displayName: credential.displayName,
+          providerId: credential.providerId,
+          accountId: credential.accountId,
+          updatedAt: credential.updatedAt,
+          accountProviderId: account.providerId,
+          accountScope: account.scope,
+          accountUpdatedAt: account.updatedAt,
+        })
+        .from(credential)
+        .leftJoin(account, eq(credential.accountId, account.id))
+        .where(eq(credential.id, credentialId))
+        .limit(1)
 
-    // Transform accounts into credentials
-    const credentials = await Promise.all(
-      accountsData.map(async (acc) => {
-        // Extract the feature type from providerId (e.g., 'google-default' -> 'default')
-        const [_, featureType = 'default'] = acc.providerId.split('-')
-
-        // Try multiple methods to get a user-friendly display name
-        let displayName = ''
-
-        // Method 1: Try to extract email from ID token (works for Google, etc.)
-        if (acc.idToken) {
-          try {
-            const decoded = jwtDecode<GoogleIdToken>(acc.idToken)
-            if (decoded.email) {
-              displayName = decoded.email
-            } else if (decoded.name) {
-              displayName = decoded.name
-            }
-          } catch (_error) {
-            logger.warn(`[${requestId}] Error decoding ID token`, {
-              accountId: acc.id,
-            })
+      if (platformCredential) {
+        if (platformCredential.type === 'service_account') {
+          if (
+            workflowId &&
+            (!effectiveWorkspaceId || platformCredential.workspaceId !== effectiveWorkspaceId)
+          ) {
+            return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
           }
-        }
 
-        // Method 2: For GitHub, the accountId might be the username
-        if (!displayName && baseProvider === 'github') {
-          displayName = `${acc.accountId} (GitHub)`
-        }
-
-        // Method 3: Try to get the user's email from our database
-        if (!displayName) {
-          try {
-            const userRecord = await db
-              .select({ email: user.email })
-              .from(user)
-              .where(eq(user.id, acc.userId))
+          if (!workflowId) {
+            const [membership] = await db
+              .select({ id: credentialMember.id })
+              .from(credentialMember)
+              .where(
+                and(
+                  eq(credentialMember.credentialId, platformCredential.id),
+                  eq(credentialMember.userId, requesterUserId),
+                  eq(credentialMember.status, 'active')
+                )
+              )
               .limit(1)
 
-            if (userRecord.length > 0) {
-              displayName = userRecord[0].email
+            if (!membership) {
+              return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
             }
-          } catch (_error) {
-            logger.warn(`[${requestId}] Error fetching user email`, {
-              userId: acc.userId,
-            })
+          }
+
+          return NextResponse.json(
+            {
+              credentials: [
+                toCredentialResponse(
+                  platformCredential.id,
+                  platformCredential.displayName,
+                  platformCredential.providerId || 'google-service-account',
+                  platformCredential.updatedAt,
+                  null,
+                  'service_account'
+                ),
+              ],
+            },
+            { status: 200 }
+          )
+        }
+
+        if (platformCredential.type !== 'oauth' || !platformCredential.accountId) {
+          return NextResponse.json({ credentials: [] }, { status: 200 })
+        }
+
+        if (workflowId) {
+          if (!effectiveWorkspaceId || platformCredential.workspaceId !== effectiveWorkspaceId) {
+            return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+          }
+        } else {
+          const [membership] = await db
+            .select({ id: credentialMember.id })
+            .from(credentialMember)
+            .where(
+              and(
+                eq(credentialMember.credentialId, platformCredential.id),
+                eq(credentialMember.userId, requesterUserId),
+                eq(credentialMember.status, 'active')
+              )
+            )
+            .limit(1)
+
+          if (!membership) {
+            return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
           }
         }
 
-        // Fallback: Use accountId with provider type as context
-        if (!displayName) {
-          displayName = `${acc.accountId} (${baseProvider})`
+        if (!platformCredential.accountProviderId || !platformCredential.accountUpdatedAt) {
+          return NextResponse.json({ credentials: [] }, { status: 200 })
         }
 
-        return {
-          id: acc.id,
-          name: displayName,
-          provider: acc.providerId,
-          lastUsed: acc.updatedAt.toISOString(),
-          isDefault: featureType === 'default',
-        }
+        return NextResponse.json(
+          {
+            credentials: [
+              toCredentialResponse(
+                platformCredential.id,
+                platformCredential.displayName,
+                platformCredential.accountProviderId,
+                platformCredential.accountUpdatedAt,
+                platformCredential.accountScope
+              ),
+            ],
+          },
+          { status: 200 }
+        )
+      }
+    }
+
+    if (effectiveWorkspaceId && providerParam) {
+      await syncWorkspaceOAuthCredentialsForUser({
+        workspaceId: effectiveWorkspaceId,
+        userId: requesterUserId,
       })
-    )
 
-    return NextResponse.json({ credentials }, { status: 200 })
+      const credentialsData = await db
+        .select({
+          id: credential.id,
+          displayName: credential.displayName,
+          providerId: account.providerId,
+          scope: account.scope,
+          updatedAt: account.updatedAt,
+        })
+        .from(credential)
+        .innerJoin(account, eq(credential.accountId, account.id))
+        .innerJoin(
+          credentialMember,
+          and(
+            eq(credentialMember.credentialId, credential.id),
+            eq(credentialMember.userId, requesterUserId),
+            eq(credentialMember.status, 'active')
+          )
+        )
+        .where(
+          and(
+            eq(credential.workspaceId, effectiveWorkspaceId),
+            eq(credential.type, 'oauth'),
+            eq(account.providerId, providerParam)
+          )
+        )
+
+      const results = credentialsData.map((row) =>
+        toCredentialResponse(row.id, row.displayName, row.providerId, row.updatedAt, row.scope)
+      )
+
+      const saProviderId = getServiceAccountProviderForProviderId(providerParam)
+
+      if (saProviderId) {
+        const serviceAccountCreds = await db
+          .select({
+            id: credential.id,
+            displayName: credential.displayName,
+            providerId: credential.providerId,
+            updatedAt: credential.updatedAt,
+          })
+          .from(credential)
+          .innerJoin(
+            credentialMember,
+            and(
+              eq(credentialMember.credentialId, credential.id),
+              eq(credentialMember.userId, requesterUserId),
+              eq(credentialMember.status, 'active')
+            )
+          )
+          .where(
+            and(
+              eq(credential.workspaceId, effectiveWorkspaceId),
+              eq(credential.type, 'service_account'),
+              eq(credential.providerId, saProviderId)
+            )
+          )
+
+        for (const sa of serviceAccountCreds) {
+          results.push(
+            toCredentialResponse(
+              sa.id,
+              sa.displayName,
+              sa.providerId || saProviderId,
+              sa.updatedAt,
+              null,
+              'service_account'
+            )
+          )
+        }
+      }
+
+      return NextResponse.json({ credentials: results }, { status: 200 })
+    }
+
+    return NextResponse.json({ credentials: [] }, { status: 200 })
   } catch (error) {
     logger.error(`[${requestId}] Error fetching OAuth credentials`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

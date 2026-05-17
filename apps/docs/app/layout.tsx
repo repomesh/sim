@@ -1,62 +1,89 @@
 import type { ReactNode } from 'react'
+import type { Viewport } from 'next'
+import { DOCS_BASE_URL } from '@/lib/urls'
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return children
 }
 
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  themeColor: '#000000',
+}
+
 export const metadata = {
-  metadataBase: new URL('https://docs.sim.ai'),
+  metadataBase: new URL(DOCS_BASE_URL),
   title: {
-    default: 'Sim Documentation - Visual Workflow Builder for AI Applications',
-    template: '%s',
+    default: 'Sim Documentation — The AI Workspace for Teams',
+    template: '%s | Sim Docs',
   },
   description:
-    'Comprehensive documentation for Sim - the visual workflow builder for AI applications. Create powerful AI agents, automation workflows, and data processing pipelines by connecting blocks on a canvas—no coding required.',
+    'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents. Connect 1,000+ integrations and every major LLM.',
+  applicationName: 'Sim Docs',
+  generator: 'Next.js',
+  referrer: 'origin-when-cross-origin' as const,
   keywords: [
-    'AI workflow builder',
-    'visual workflow editor',
-    'AI automation',
-    'workflow automation',
+    'AI workspace',
+    'AI agent builder',
     'AI agents',
-    'no-code AI',
-    'drag and drop workflows',
+    'build AI agents',
+    'open-source AI agents',
+    'LLM orchestration',
     'AI integrations',
-    'workflow canvas',
-    'AI development platform',
+    'knowledge base',
+    'AI automation',
+    'visual workflow builder',
+    'enterprise AI',
+    'AI agent deployment',
+    'AI tools',
   ],
   authors: [{ name: 'Sim Team', url: 'https://sim.ai' }],
+  creator: 'Sim',
+  publisher: 'Sim',
   category: 'Developer Tools',
   classification: 'Developer Documentation',
   manifest: '/favicon/site.webmanifest',
   icons: {
-    icon: [
-      { url: '/favicon/favicon-16x16.png', sizes: '16x16', type: 'image/png' },
-      { url: '/favicon/favicon-32x32.png', sizes: '32x32', type: 'image/png' },
-    ],
     apple: '/favicon/apple-touch-icon.png',
-    shortcut: '/favicon/favicon.ico',
   },
   appleWebApp: {
     capable: true,
     statusBarStyle: 'default',
     title: 'Sim Docs',
   },
+  formatDetection: {
+    telephone: false,
+  },
+  other: {
+    'msapplication-TileColor': '#000000',
+  },
   openGraph: {
     type: 'website',
     locale: 'en_US',
-    alternateLocale: ['fr_FR', 'zh_CN'],
-    url: 'https://docs.sim.ai',
+    alternateLocale: ['es_ES', 'fr_FR', 'de_DE', 'ja_JP', 'zh_CN'],
+    url: DOCS_BASE_URL,
     siteName: 'Sim Documentation',
-    title: 'Sim Documentation - Visual Workflow Builder for AI Applications',
+    title: 'Sim Documentation — The AI Workspace for Teams',
     description:
-      'Comprehensive documentation for Sim - the visual workflow builder for AI applications. Create powerful AI agents, automation workflows, and data processing pipelines.',
+      'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents. Connect 1,000+ integrations and every major LLM.',
+    images: [
+      {
+        url: `${DOCS_BASE_URL}/api/og?title=Sim%20Documentation`,
+        width: 1200,
+        height: 630,
+        alt: 'Sim Documentation',
+      },
+    ],
   },
   twitter: {
-    card: 'summary',
-    title: 'Sim Documentation - Visual Workflow Builder for AI Applications',
+    card: 'summary_large_image',
+    title: 'Sim Documentation — The AI Workspace for Teams',
     description:
-      'Comprehensive documentation for Sim - the visual workflow builder for AI applications.',
-    creator: '@sim_ai',
+      'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents. Connect 1,000+ integrations and every major LLM.',
+    creator: '@simdotai',
+    site: '@simdotai',
+    images: [`${DOCS_BASE_URL}/api/og?title=Sim%20Documentation`],
   },
   robots: {
     index: true,
@@ -70,11 +97,15 @@ export const metadata = {
     },
   },
   alternates: {
-    canonical: 'https://docs.sim.ai',
+    canonical: DOCS_BASE_URL,
     languages: {
-      en: '/en',
-      fr: '/fr',
-      zh: '/zh',
+      'x-default': DOCS_BASE_URL,
+      en: DOCS_BASE_URL,
+      es: `${DOCS_BASE_URL}/es`,
+      fr: `${DOCS_BASE_URL}/fr`,
+      de: `${DOCS_BASE_URL}/de`,
+      ja: `${DOCS_BASE_URL}/ja`,
+      zh: `${DOCS_BASE_URL}/zh`,
     },
   },
 }

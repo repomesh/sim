@@ -1,11 +1,17 @@
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { and, eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
-import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
+import { gmailLabelsSelectorContract } from '@/lib/api/contracts/selectors/google'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validateAlphanumericId } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { getScopesForService } from '@/lib/oauth/utils'
+import {
+  getServiceAccountToken,
+  refreshAccessTokenIfNeeded,
+  ServiceAccountTokenError,
+} from '@/app/api/auth/oauth/utils'
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('GmailLabelsAPI')
@@ -18,47 +24,45 @@ interface GmailLabel {
   messagesUnread?: number
 }
 
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
-    const session = await getSession()
+    const parsed = await parseRequest(gmailLabelsSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credentialId, query } = parsed.data.query
+    const impersonateEmail = parsed.data.query.impersonateEmail || undefined
 
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthenticated labels request rejected`)
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
+    const credentialIdValidation = validateAlphanumericId(credentialId, 'credentialId', 255)
+    if (!credentialIdValidation.isValid) {
+      logger.warn(`[${requestId}] Invalid credential ID: ${credentialIdValidation.error}`)
+      return NextResponse.json({ error: credentialIdValidation.error }, { status: 400 })
     }
 
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const query = searchParams.get('query')
-
-    if (!credentialId) {
-      logger.warn(`[${requestId}] Missing credentialId parameter`)
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+    const authz = await authorizeCredentialUse(request, {
+      credentialId,
+      requireWorkflowIdForInternal: false,
+    })
+    if (!authz.ok || !authz.credentialOwnerUserId || !authz.resolvedCredentialId) {
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    let credentials = await db
-      .select()
-      .from(account)
-      .where(and(eq(account.id, credentialId), eq(account.userId, session.user.id)))
-      .limit(1)
+    let accessToken: string | null = null
 
-    if (!credentials.length) {
-      credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-      if (!credentials.length) {
-        logger.warn(`[${requestId}] Credential not found`)
-        return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
-      }
+    if (authz.credentialType === 'service_account') {
+      accessToken = await getServiceAccountToken(
+        authz.resolvedCredentialId,
+        getScopesForService('gmail'),
+        impersonateEmail
+      )
+    } else {
+      accessToken = await refreshAccessTokenIfNeeded(
+        credentialId,
+        authz.credentialOwnerUserId,
+        requestId,
+        getScopesForService('gmail')
+      )
     }
-
-    const credential = credentials[0]
-
-    logger.info(
-      `[${requestId}] Using credential: ${credential.id}, provider: ${credential.providerId}`
-    )
-
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, credential.userId, requestId)
 
     if (!accessToken) {
       return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
@@ -114,7 +118,10 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ labels: filteredLabels }, { status: 200 })
   } catch (error) {
+    if (error instanceof ServiceAccountTokenError) {
+      return NextResponse.json({ error: error.message }, { status: 400 })
+    }
     logger.error(`[${requestId}] Error fetching Gmail labels:`, error)
     return NextResponse.json({ error: 'Failed to fetch Gmail labels' }, { status: 500 })
   }
-}
+})

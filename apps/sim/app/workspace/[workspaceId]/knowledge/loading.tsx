@@ -1,54 +1,62 @@
-'use client'
+import { Skeleton } from '@/components/emcn'
 
-import { Plus, Search } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import {
-  KnowledgeBaseCardSkeletonGrid,
-  KnowledgeHeader,
-} from '@/app/workspace/[workspaceId]/knowledge/components'
+const SKELETON_ROW_COUNT = 5
+const COLUMN_COUNT = 7
 
 export default function KnowledgeLoading() {
-  const breadcrumbs = [{ id: 'knowledge', label: 'Knowledge' }]
-
   return (
-    <div className='flex h-screen flex-col pl-64'>
-      {/* Header */}
-      <KnowledgeHeader breadcrumbs={breadcrumbs} />
-
-      <div className='flex flex-1 overflow-hidden'>
-        <div className='flex flex-1 flex-col overflow-hidden'>
-          {/* Main Content */}
-          <div className='flex-1 overflow-auto'>
-            <div className='px-6 pb-6'>
-              {/* Search and Create Section */}
-              <div className='mb-4 flex items-center justify-between pt-1'>
-                <div className='relative max-w-md flex-1'>
-                  <div className='relative flex items-center'>
-                    <Search className='-translate-y-1/2 pointer-events-none absolute top-1/2 left-3 h-[18px] w-[18px] transform text-muted-foreground' />
-                    <input
-                      type='text'
-                      placeholder='Search knowledge bases...'
-                      disabled
-                      className='h-10 w-full rounded-md border bg-background px-9 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:font-medium file:text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50'
-                    />
-                  </div>
-                </div>
-
-                <Button
-                  disabled
-                  size='sm'
-                  className='flex items-center gap-1 bg-[var(--brand-primary-hex)] font-[480] text-muted-foreground shadow-[0_0_0_0_var(--brand-primary-hex)] transition-all duration-200 hover:bg-[var(--brand-primary-hover-hex)] hover:shadow-[0_0_0_4px_rgba(127,47,255,0.15)] disabled:opacity-50'
-                >
-                  <Plus className='h-3.5 w-3.5' />
-                  <span>Create</span>
-                </Button>
-              </div>
-
-              {/* Content Area */}
-              <KnowledgeBaseCardSkeletonGrid count={8} />
-            </div>
+    <div className='flex h-full flex-1 flex-col overflow-hidden bg-[var(--bg)]'>
+      <div className='border-[var(--border)] border-b px-[24px] py-[10px]'>
+        <div className='flex items-center justify-between'>
+          <div className='flex items-center gap-[12px]'>
+            <Skeleton className='size-[14px] rounded-[2px]' />
+            <Skeleton className='h-[14px] w-[96px] rounded-[4px]' />
+          </div>
+          <div className='flex items-center gap-[6px]'>
+            <Skeleton className='h-[28px] w-[80px] rounded-[6px]' />
           </div>
         </div>
+      </div>
+
+      <div className='border-[var(--border)] border-b px-[24px] py-[10px]'>
+        <div className='flex items-center'>
+          <Skeleton className='size-[14px] rounded-[2px]' />
+          <Skeleton className='ml-[10px] h-[14px] w-[160px] rounded-[4px]' />
+        </div>
+      </div>
+
+      <div className='min-h-0 flex-1 overflow-auto'>
+        <table className='w-full'>
+          <thead>
+            <tr className='border-[var(--border)] border-b'>
+              <th className='w-[40px] px-[12px] py-[8px]'>
+                <Skeleton className='size-[14px] rounded-[2px]' />
+              </th>
+              {Array.from({ length: COLUMN_COUNT }).map((_, i) => (
+                <th key={i} className='px-[12px] py-[8px] text-left'>
+                  <Skeleton className='h-[12px] w-[56px] rounded-[4px]' />
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {Array.from({ length: SKELETON_ROW_COUNT }).map((_, rowIndex) => (
+              <tr key={rowIndex} className='border-[var(--border)] border-b'>
+                <td className='w-[40px] px-[12px] py-[10px]'>
+                  <Skeleton className='size-[14px] rounded-[2px]' />
+                </td>
+                {Array.from({ length: COLUMN_COUNT }).map((_, colIndex) => (
+                  <td key={colIndex} className='px-[12px] py-[10px]'>
+                    <Skeleton
+                      className='h-[14px] rounded-[4px]'
+                      style={{ width: colIndex === 0 ? '128px' : '80px' }}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   )

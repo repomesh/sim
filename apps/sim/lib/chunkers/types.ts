@@ -1,18 +1,12 @@
-export interface ChunkMetadata {
-  startIndex: number
-  endIndex: number
-  tokenCount: number
-}
-
-export interface TextChunk {
-  text: string
-  metadata: ChunkMetadata
-}
-
+/**
+ * Units:
+ * - chunkSize/chunkOverlap: TOKENS (1 token ≈ 4 characters)
+ * - minCharactersPerChunk: CHARACTERS
+ */
 export interface ChunkerOptions {
   chunkSize?: number
-  minChunkSize?: number
-  overlap?: number
+  chunkOverlap?: number
+  minCharactersPerChunk?: number
 }
 
 export interface Chunk {
@@ -24,7 +18,7 @@ export interface Chunk {
   }
 }
 
-export interface StructuredDataOptions {
+export interface StructuredDataOptions extends ChunkerOptions {
   headers?: string[]
   totalRows?: number
   sheetName?: string
@@ -50,4 +44,35 @@ export interface DocChunk {
 
 export interface DocsChunkerOptions extends ChunkerOptions {
   baseUrl?: string
+}
+
+export type ChunkingStrategy = 'auto' | 'text' | 'regex' | 'recursive' | 'sentence' | 'token'
+
+export type RecursiveRecipe = 'plain' | 'markdown' | 'code'
+
+export interface StrategyOptions {
+  pattern?: string
+  separators?: string[]
+  recipe?: RecursiveRecipe
+  strictBoundaries?: boolean
+}
+
+export interface SentenceChunkerOptions extends ChunkerOptions {
+  minSentencesPerChunk?: number
+}
+
+export interface RecursiveChunkerOptions extends ChunkerOptions {
+  separators?: string[]
+  recipe?: RecursiveRecipe
+}
+
+export interface RegexChunkerOptions extends ChunkerOptions {
+  pattern: string
+  /**
+   * When true, each regex match becomes its own chunk and small adjacent
+   * segments are not merged together. Overlap is also disabled. Useful for
+   * structural inputs where boundaries (e.g. one record per match) must be
+   * preserved exactly.
+   */
+  strictBoundaries?: boolean
 }

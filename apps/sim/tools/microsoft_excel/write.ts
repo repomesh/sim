@@ -1,19 +1,36 @@
+import { ErrorExtractorId } from '@/tools/error-extractors'
 import type {
   MicrosoftExcelToolParams,
+  MicrosoftExcelV2ToolParams,
+  MicrosoftExcelV2WriteResponse,
   MicrosoftExcelWriteResponse,
 } from '@/tools/microsoft_excel/types'
+import { getItemBasePath, getSpreadsheetWebUrl } from '@/tools/microsoft_excel/utils'
 import type { ToolConfig } from '@/tools/types'
+
+/**
+ * Range writes (PATCH /workbook/.../range) are semantically idempotent —
+ * the same payload produces the same result — so we permit retries on
+ * transient 429/5xx even though PATCH is not in the default idempotent set.
+ */
+const EXCEL_RETRY_CONFIG = {
+  enabled: true,
+  maxRetries: 3,
+  initialDelayMs: 500,
+  maxDelayMs: 30000,
+  retryIdempotentOnly: false,
+} as const
 
 export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWriteResponse> = {
   id: 'microsoft_excel_write',
   name: 'Write to Microsoft Excel',
   description: 'Write data to a Microsoft Excel spreadsheet',
   version: '1.0',
+  errorExtractor: ErrorExtractorId.MICROSOFT_GRAPH_ERRORS,
 
   oauth: {
     required: true,
     provider: 'microsoft-excel',
-    additionalScopes: [],
   },
 
   params: {
@@ -26,20 +43,28 @@ export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWrite
     spreadsheetId: {
       type: 'string',
       required: true,
-      visibility: 'user-only',
-      description: 'The ID of the spreadsheet to write to',
+      visibility: 'user-or-llm',
+      description: 'The ID of the spreadsheet/workbook to write to (e.g., "01ABC123DEF456")',
+    },
+    driveId: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'The ID of the drive containing the spreadsheet. Required for SharePoint files. If omitted, uses personal OneDrive.',
     },
     range: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'The range of cells to write to',
+      description: 'The range of cells to write to (e.g., "Sheet1!A1:B2")',
     },
     values: {
       type: 'array',
       required: true,
       visibility: 'user-or-llm',
-      description: 'The data to write to the spreadsheet',
+      description:
+        'The data to write as a 2D array (e.g., [["Name", "Age"], ["Alice", 30]]) or array of objects',
     },
     valueInputOption: {
       type: 'string',
@@ -67,8 +92,9 @@ export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWrite
       const sheetName = encodeURIComponent(match[1])
       const address = encodeURIComponent(match[2])
 
+      const basePath = getItemBasePath(params.spreadsheetId!, params.driveId)
       const url = new URL(
-        `https://graph.microsoft.com/v1.0/me/drive/items/${params.spreadsheetId}/workbook/worksheets('${sheetName}')/range(address='${address}')`
+        `${basePath}/workbook/worksheets('${sheetName}')/range(address='${address}')`
       )
 
       const valueInputOption = params.valueInputOption || 'USER_ENTERED'
@@ -129,21 +155,22 @@ export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWrite
 
       return body
     },
+    retry: EXCEL_RETRY_CONFIG,
   },
 
-  transformResponse: async (response: Response) => {
+  transformResponse: async (response: Response, params?: MicrosoftExcelToolParams) => {
     const data = await response.json()
 
-    const urlParts = response.url.split('/drive/items/')
-    const spreadsheetId = urlParts[1]?.split('/')[0] || ''
+    const spreadsheetId = params?.spreadsheetId?.trim() || ''
+    const driveId = params?.driveId
 
-    const metadata = {
-      spreadsheetId,
-      properties: {},
-      spreadsheetUrl: `https://graph.microsoft.com/v1.0/me/drive/items/${spreadsheetId}`,
+    const accessToken = params?.accessToken
+    if (!accessToken) {
+      throw new Error('Access token is required')
     }
+    const webUrl = await getSpreadsheetWebUrl(spreadsheetId, accessToken, driveId)
 
-    const result = {
+    return {
       success: true,
       output: {
         updatedRange: data.updatedRange,
@@ -151,13 +178,11 @@ export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWrite
         updatedColumns: data.updatedColumns,
         updatedCells: data.updatedCells,
         metadata: {
-          spreadsheetId: metadata.spreadsheetId,
-          spreadsheetUrl: metadata.spreadsheetUrl,
+          spreadsheetId,
+          spreadsheetUrl: webUrl,
         },
       },
     }
-
-    return result
   },
 
   outputs: {
@@ -171,6 +196,194 @@ export const writeTool: ToolConfig<MicrosoftExcelToolParams, MicrosoftExcelWrite
       properties: {
         spreadsheetId: { type: 'string', description: 'The ID of the spreadsheet' },
         spreadsheetUrl: { type: 'string', description: 'URL to access the spreadsheet' },
+      },
+    },
+  },
+}
+
+export const writeV2Tool: ToolConfig<MicrosoftExcelV2ToolParams, MicrosoftExcelV2WriteResponse> = {
+  id: 'microsoft_excel_write_v2',
+  name: 'Write to Microsoft Excel V2',
+  description: 'Write data to a specific sheet in a Microsoft Excel spreadsheet',
+  version: '2.0.0',
+  errorExtractor: ErrorExtractorId.MICROSOFT_GRAPH_ERRORS,
+
+  oauth: {
+    required: true,
+    provider: 'microsoft-excel',
+  },
+
+  params: {
+    accessToken: {
+      type: 'string',
+      required: true,
+      visibility: 'hidden',
+      description: 'The access token for the Microsoft Excel API',
+    },
+    spreadsheetId: {
+      type: 'string',
+      required: true,
+      visibility: 'user-or-llm',
+      description: 'The ID of the spreadsheet/workbook to write to (e.g., "01ABC123DEF456")',
+    },
+    driveId: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'The ID of the drive containing the spreadsheet. Required for SharePoint files. If omitted, uses personal OneDrive.',
+    },
+    sheetName: {
+      type: 'string',
+      required: true,
+      visibility: 'user-or-llm',
+      description: 'The name of the sheet/tab to write to (e.g., "Sheet1", "Sales Data")',
+    },
+    cellRange: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'The cell range to write to (e.g., "A1:D10", "A1"). Defaults to "A1" if not specified.',
+    },
+    values: {
+      type: 'array',
+      required: true,
+      visibility: 'user-or-llm',
+      description:
+        'The data to write as a 2D array (e.g. [["Name", "Age"], ["Alice", 30], ["Bob", 25]]) or array of objects.',
+    },
+    valueInputOption: {
+      type: 'string',
+      required: false,
+      visibility: 'hidden',
+      description: 'The format of the data to write',
+    },
+    includeValuesInResponse: {
+      type: 'boolean',
+      required: false,
+      visibility: 'hidden',
+      description: 'Whether to include the written values in the response',
+    },
+  },
+
+  request: {
+    url: (params) => {
+      const spreadsheetId = params.spreadsheetId?.trim()
+      if (!spreadsheetId) {
+        throw new Error('Spreadsheet ID is required')
+      }
+
+      const sheetName = params.sheetName?.trim()
+      if (!sheetName) {
+        throw new Error('Sheet name is required')
+      }
+
+      const cellRange = params.cellRange?.trim() || 'A1'
+      const encodedSheetName = encodeURIComponent(sheetName)
+      const encodedAddress = encodeURIComponent(cellRange)
+
+      const basePath = getItemBasePath(spreadsheetId, params.driveId)
+      const url = new URL(
+        `${basePath}/workbook/worksheets('${encodedSheetName}')/range(address='${encodedAddress}')`
+      )
+
+      const valueInputOption = params.valueInputOption || 'USER_ENTERED'
+      url.searchParams.append('valueInputOption', valueInputOption)
+
+      if (params.includeValuesInResponse) {
+        url.searchParams.append('includeValuesInResponse', 'true')
+      }
+
+      return url.toString()
+    },
+    method: 'PATCH',
+    headers: (params) => ({
+      Authorization: `Bearer ${params.accessToken}`,
+      'Content-Type': 'application/json',
+    }),
+    body: (params) => {
+      let processedValues: any = params.values || []
+
+      // Handle array of objects
+      if (
+        Array.isArray(processedValues) &&
+        processedValues.length > 0 &&
+        typeof processedValues[0] === 'object' &&
+        !Array.isArray(processedValues[0])
+      ) {
+        const allKeys = new Set<string>()
+        processedValues.forEach((obj: any) => {
+          if (obj && typeof obj === 'object') {
+            Object.keys(obj).forEach((key) => allKeys.add(key))
+          }
+        })
+        const headers = Array.from(allKeys)
+
+        const rows = processedValues.map((obj: any) => {
+          if (!obj || typeof obj !== 'object') {
+            return Array(headers.length).fill('')
+          }
+          return headers.map((key) => {
+            const value = obj[key]
+            if (value !== null && typeof value === 'object') {
+              return JSON.stringify(value)
+            }
+            return value === undefined ? '' : value
+          })
+        })
+
+        processedValues = [headers, ...rows]
+      }
+
+      const body: Record<string, any> = {
+        majorDimension: params.majorDimension || 'ROWS',
+        values: processedValues,
+      }
+
+      return body
+    },
+    retry: EXCEL_RETRY_CONFIG,
+  },
+
+  transformResponse: async (response: Response, params?: MicrosoftExcelV2ToolParams) => {
+    const data = await response.json()
+
+    const spreadsheetId = params?.spreadsheetId?.trim() || ''
+    const driveId = params?.driveId
+
+    const accessToken = params?.accessToken
+    if (!accessToken) {
+      throw new Error('Access token is required')
+    }
+    const webUrl = await getSpreadsheetWebUrl(spreadsheetId, accessToken, driveId)
+
+    return {
+      success: true,
+      output: {
+        updatedRange: data.address ?? null,
+        updatedRows: data.rowCount ?? 0,
+        updatedColumns: data.columnCount ?? 0,
+        updatedCells: (data.rowCount ?? 0) * (data.columnCount ?? 0),
+        metadata: {
+          spreadsheetId,
+          spreadsheetUrl: webUrl,
+        },
+      },
+    }
+  },
+
+  outputs: {
+    updatedRange: { type: 'string', description: 'Range of cells that were updated' },
+    updatedRows: { type: 'number', description: 'Number of rows updated' },
+    updatedColumns: { type: 'number', description: 'Number of columns updated' },
+    updatedCells: { type: 'number', description: 'Number of cells updated' },
+    metadata: {
+      type: 'json',
+      description: 'Spreadsheet metadata including ID and URL',
+      properties: {
+        spreadsheetId: { type: 'string', description: 'Microsoft Excel spreadsheet ID' },
+        spreadsheetUrl: { type: 'string', description: 'Spreadsheet URL' },
       },
     },
   },

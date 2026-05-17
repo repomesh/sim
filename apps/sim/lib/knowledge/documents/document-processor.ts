@@ -1,23 +1,37 @@
-import { type Chunk, JsonYamlChunker, StructuredDataChunker, TextChunker } from '@/lib/chunkers'
-import { env } from '@/lib/env'
-import { parseBuffer, parseFile } from '@/lib/file-parsers'
-import { retryWithExponentialBackoff } from '@/lib/knowledge/documents/utils'
-import { createLogger } from '@/lib/logs/console/logger'
+import { randomBytes } from 'crypto'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage, toError } from '@sim/utils/errors'
+import { PDFDocument } from 'pdf-lib'
+import { getBYOKKey } from '@/lib/api-key/byok'
 import {
-  type CustomStorageConfig,
-  getPresignedUrlWithConfig,
-  getStorageProvider,
-  uploadFile,
-} from '@/lib/uploads'
-import { BLOB_KB_CONFIG, S3_KB_CONFIG } from '@/lib/uploads/setup'
+  type Chunk,
+  JsonYamlChunker,
+  RecursiveChunker,
+  RegexChunker,
+  SentenceChunker,
+  StructuredDataChunker,
+  TextChunker,
+  TokenChunker,
+} from '@/lib/chunkers'
+import type { ChunkingStrategy, StrategyOptions } from '@/lib/chunkers/types'
+import { env, envNumber } from '@/lib/core/config/env'
+import { parseBuffer } from '@/lib/file-parsers'
+import type { FileParseMetadata } from '@/lib/file-parsers/types'
+import { resolveParserExtension } from '@/lib/knowledge/documents/parser-extension'
+import { retryWithExponentialBackoff } from '@/lib/knowledge/documents/utils'
+import { StorageService } from '@/lib/uploads'
+import { isInternalFileUrl } from '@/lib/uploads/utils/file-utils'
+import { downloadFileFromUrl } from '@/lib/uploads/utils/file-utils.server'
 import { mistralParserTool } from '@/tools/mistral/parser'
 
 const logger = createLogger('DocumentProcessor')
 
 const TIMEOUTS = {
-  FILE_DOWNLOAD: 180000,
+  FILE_DOWNLOAD: 600000,
   MISTRAL_OCR_API: 120000,
 } as const
+
+const MAX_CONCURRENT_CHUNKS = envNumber(env.KB_CONFIG_CHUNK_CONCURRENCY, 10)
 
 type OCRResult = {
   success: boolean
@@ -40,24 +54,57 @@ type OCRRequestBody = {
   include_image_base64: boolean
 }
 
+const MISTRAL_MAX_PAGES = 1000
+
+async function getPdfPageCount(buffer: Buffer): Promise<number> {
+  try {
+    const { getDocumentProxy } = await import('unpdf')
+    const uint8Array = new Uint8Array(buffer)
+    const pdf = await getDocumentProxy(uint8Array)
+    return pdf.numPages
+  } catch (error) {
+    logger.warn('Failed to get PDF page count:', error)
+    return 0
+  }
+}
+
+async function splitPdfIntoChunks(
+  pdfBuffer: Buffer,
+  maxPages: number
+): Promise<{ buffer: Buffer; startPage: number; endPage: number }[]> {
+  const sourcePdf = await PDFDocument.load(pdfBuffer)
+  const totalPages = sourcePdf.getPageCount()
+
+  if (totalPages <= maxPages) {
+    return [{ buffer: pdfBuffer, startPage: 0, endPage: totalPages - 1 }]
+  }
+
+  const chunks: { buffer: Buffer; startPage: number; endPage: number }[] = []
+
+  for (let startPage = 0; startPage < totalPages; startPage += maxPages) {
+    const endPage = Math.min(startPage + maxPages - 1, totalPages - 1)
+    const pageCount = endPage - startPage + 1
+
+    const newPdf = await PDFDocument.create()
+    const pageIndices = Array.from({ length: pageCount }, (_, i) => startPage + i)
+    const copiedPages = await newPdf.copyPages(sourcePdf, pageIndices)
+
+    copiedPages.forEach((page) => newPdf.addPage(page))
+
+    const pdfBytes = await newPdf.save()
+    chunks.push({
+      buffer: Buffer.from(pdfBytes),
+      startPage,
+      endPage,
+    })
+  }
+
+  return chunks
+}
+
 type AzureOCRResponse = {
   pages?: OCRPage[]
   [key: string]: unknown
-}
-
-const getKBConfig = (): CustomStorageConfig => {
-  const provider = getStorageProvider()
-  return provider === 'blob'
-    ? {
-        containerName: BLOB_KB_CONFIG.containerName,
-        accountName: BLOB_KB_CONFIG.accountName,
-        accountKey: BLOB_KB_CONFIG.accountKey,
-        connectionString: BLOB_KB_CONFIG.connectionString,
-      }
-    : {
-        bucket: S3_KB_CONFIG.bucket,
-        region: S3_KB_CONFIG.region,
-      }
 }
 
 class APIError extends Error {
@@ -70,13 +117,66 @@ class APIError extends Error {
   }
 }
 
+async function applyStrategy(
+  strategy: ChunkingStrategy,
+  content: string,
+  chunkSize: number,
+  chunkOverlap: number,
+  minCharactersPerChunk: number,
+  strategyOptions?: StrategyOptions
+): Promise<Chunk[]> {
+  const baseOptions = { chunkSize, chunkOverlap, minCharactersPerChunk }
+
+  switch (strategy) {
+    case 'token': {
+      const chunker = new TokenChunker(baseOptions)
+      return chunker.chunk(content)
+    }
+    case 'sentence': {
+      const chunker = new SentenceChunker(baseOptions)
+      return chunker.chunk(content)
+    }
+    case 'recursive': {
+      const chunker = new RecursiveChunker({
+        ...baseOptions,
+        separators: strategyOptions?.separators,
+        recipe: strategyOptions?.recipe,
+      })
+      return chunker.chunk(content)
+    }
+    case 'regex': {
+      if (!strategyOptions?.pattern) {
+        logger.warn(
+          'Regex strategy requested but no pattern provided, falling back to text chunker'
+        )
+        const chunker = new TextChunker(baseOptions)
+        return chunker.chunk(content)
+      }
+      const chunker = new RegexChunker({
+        ...baseOptions,
+        pattern: strategyOptions.pattern,
+        strictBoundaries: strategyOptions.strictBoundaries,
+      })
+      return chunker.chunk(content)
+    }
+    default: {
+      const chunker = new TextChunker(baseOptions)
+      return chunker.chunk(content)
+    }
+  }
+}
+
 export async function processDocument(
   fileUrl: string,
   filename: string,
   mimeType: string,
-  chunkSize = 1000,
+  chunkSize = 1024,
   chunkOverlap = 200,
-  minChunkSize = 1
+  minCharactersPerChunk = 100,
+  userId?: string,
+  workspaceId?: string | null,
+  strategy?: ChunkingStrategy,
+  strategyOptions?: StrategyOptions
 ): Promise<{
   chunks: Chunk[]
   metadata: {
@@ -93,35 +193,49 @@ export async function processDocument(
   logger.info(`Processing document: ${filename}`)
 
   try {
-    const parseResult = await parseDocument(fileUrl, filename, mimeType)
+    const parseResult = await parseDocument(fileUrl, filename, mimeType, userId, workspaceId)
     const { content, processingMethod } = parseResult
     const cloudUrl = 'cloudUrl' in parseResult ? parseResult.cloudUrl : undefined
 
     let chunks: Chunk[]
-    const metadata = 'metadata' in parseResult ? parseResult.metadata : {}
+    const metadata: FileParseMetadata = parseResult.metadata ?? {}
 
-    const isJsonYaml =
-      metadata.type === 'json' ||
-      metadata.type === 'yaml' ||
-      mimeType.includes('json') ||
-      mimeType.includes('yaml')
-
-    if (isJsonYaml && JsonYamlChunker.isStructuredData(content)) {
-      logger.info('Using JSON/YAML chunker for structured data')
-      chunks = await JsonYamlChunker.chunkJsonYaml(content, {
+    if (strategy && strategy !== 'auto') {
+      logger.info(`Using explicit chunking strategy: ${strategy}`)
+      chunks = await applyStrategy(
+        strategy,
+        content,
         chunkSize,
-        minChunkSize,
-      })
-    } else if (StructuredDataChunker.isStructuredData(content, mimeType)) {
-      logger.info('Using structured data chunker for spreadsheet/CSV content')
-      chunks = await StructuredDataChunker.chunkStructuredData(content, {
-        headers: metadata.headers,
-        totalRows: metadata.totalRows || metadata.rowCount,
-        sheetName: metadata.sheetNames?.[0],
-      })
+        chunkOverlap,
+        minCharactersPerChunk,
+        strategyOptions
+      )
     } else {
-      const chunker = new TextChunker({ chunkSize, overlap: chunkOverlap, minChunkSize })
-      chunks = await chunker.chunk(content)
+      const isJsonYaml =
+        metadata.type === 'json' ||
+        metadata.type === 'yaml' ||
+        mimeType.includes('json') ||
+        mimeType.includes('yaml')
+
+      if (isJsonYaml && JsonYamlChunker.isStructuredData(content)) {
+        logger.info('Using JSON/YAML chunker for structured data')
+        chunks = await JsonYamlChunker.chunkJsonYaml(content, {
+          chunkSize,
+          minCharactersPerChunk,
+        })
+      } else if (StructuredDataChunker.isStructuredData(content, mimeType)) {
+        logger.info('Using structured data chunker for spreadsheet/CSV content')
+        const rowCount = metadata.totalRows ?? metadata.rowCount
+        chunks = await StructuredDataChunker.chunkStructuredData(content, {
+          chunkSize,
+          headers: metadata.headers,
+          totalRows: typeof rowCount === 'number' ? rowCount : undefined,
+          sheetName: metadata.sheetNames?.[0],
+        })
+      } else {
+        const chunker = new TextChunker({ chunkSize, chunkOverlap, minCharactersPerChunk })
+        chunks = await chunker.chunk(content)
+      }
     }
 
     const characterCount = content.length
@@ -148,20 +262,35 @@ export async function processDocument(
   }
 }
 
+async function getMistralApiKey(workspaceId?: string | null): Promise<string | null> {
+  if (workspaceId) {
+    const byokResult = await getBYOKKey(workspaceId, 'mistral')
+    if (byokResult) {
+      logger.info('Using workspace BYOK key for Mistral OCR')
+      return byokResult.apiKey
+    }
+  }
+  return env.MISTRAL_API_KEY || null
+}
+
 async function parseDocument(
   fileUrl: string,
   filename: string,
-  mimeType: string
+  mimeType: string,
+  userId?: string,
+  workspaceId?: string | null
 ): Promise<{
   content: string
   processingMethod: 'file-parser' | 'mistral-ocr'
   cloudUrl?: string
-  metadata?: any
+  metadata?: FileParseMetadata
 }> {
   const isPDF = mimeType === 'application/pdf'
   const hasAzureMistralOCR =
     env.OCR_AZURE_API_KEY && env.OCR_AZURE_ENDPOINT && env.OCR_AZURE_MODEL_NAME
-  const hasMistralOCR = env.MISTRAL_API_KEY
+
+  const mistralApiKey = await getMistralApiKey(workspaceId)
+  const hasMistralOCR = !!mistralApiKey
 
   if (isPDF && (hasAzureMistralOCR || hasMistralOCR)) {
     if (hasAzureMistralOCR) {
@@ -171,7 +300,7 @@ async function parseDocument(
 
     if (hasMistralOCR) {
       logger.info(`Using Mistral OCR: ${filename}`)
-      return parseWithMistralOCR(fileUrl, filename, mimeType)
+      return parseWithMistralOCR(fileUrl, filename, mimeType, userId, workspaceId, mistralApiKey)
     }
   }
 
@@ -179,94 +308,94 @@ async function parseDocument(
   return parseWithFileParser(fileUrl, filename, mimeType)
 }
 
-async function handleFileForOCR(fileUrl: string, filename: string, mimeType: string) {
-  const isExternalHttps = fileUrl.startsWith('https://') && !fileUrl.includes('/api/files/serve/')
+async function handleFileForOCR(
+  fileUrl: string,
+  filename: string,
+  mimeType: string,
+  userId?: string,
+  workspaceId?: string | null
+) {
+  const isExternalHttps = /^https:\/\//i.test(fileUrl) && !isInternalFileUrl(fileUrl)
 
   if (isExternalHttps) {
-    return { httpsUrl: fileUrl }
+    if (mimeType === 'application/pdf') {
+      logger.info(`handleFileForOCR: Downloading external PDF to check page count`)
+      try {
+        const buffer = await downloadFileWithTimeout(fileUrl)
+        logger.info(`handleFileForOCR: Downloaded external PDF: ${buffer.length} bytes`)
+        return { httpsUrl: fileUrl, buffer }
+      } catch (error) {
+        logger.warn(
+          `handleFileForOCR: Failed to download external PDF for page count check, proceeding without batching`,
+          {
+            error: toError(error).message,
+          }
+        )
+        return { httpsUrl: fileUrl, buffer: undefined }
+      }
+    }
+    logger.info(`handleFileForOCR: Using external URL directly`)
+    return { httpsUrl: fileUrl, buffer: undefined }
   }
 
   logger.info(`Uploading "${filename}" to cloud storage for OCR`)
 
   const buffer = await downloadFileWithTimeout(fileUrl)
-  const kbConfig = getKBConfig()
 
-  validateCloudConfig(kbConfig)
+  logger.info(`Downloaded ${filename}: ${buffer.length} bytes`)
 
   try {
-    const cloudResult = await uploadFile(buffer, filename, mimeType, kbConfig)
-    const httpsUrl = await getPresignedUrlWithConfig(cloudResult.key, kbConfig, 900)
-    logger.info(`Successfully uploaded for OCR: ${cloudResult.key}`)
-    return { httpsUrl, cloudUrl: httpsUrl }
+    const metadata: Record<string, string> = {
+      originalName: filename,
+      uploadedAt: new Date().toISOString(),
+      purpose: 'knowledge-base',
+      ...(userId && { userId }),
+      ...(workspaceId && { workspaceId }),
+    }
+
+    const timestamp = Date.now()
+    const uniqueId = randomBytes(8).toString('hex')
+    const safeFileName = filename.replace(/[^a-zA-Z0-9.-]/g, '_')
+    const customKey = `kb/${timestamp}-${uniqueId}-${safeFileName}`
+
+    const cloudResult = await StorageService.uploadFile({
+      file: buffer,
+      fileName: filename,
+      contentType: mimeType,
+      context: 'knowledge-base',
+      customKey,
+      metadata,
+    })
+
+    const httpsUrl = await StorageService.generatePresignedDownloadUrl(
+      cloudResult.key,
+      'knowledge-base',
+      900 // 15 minutes
+    )
+
+    return { httpsUrl, cloudUrl: httpsUrl, buffer }
   } catch (uploadError) {
-    const message = uploadError instanceof Error ? uploadError.message : 'Unknown error'
+    const message = getErrorMessage(uploadError, 'Unknown error')
     throw new Error(`Cloud upload failed: ${message}. Cloud upload is required for OCR.`)
   }
 }
 
 async function downloadFileWithTimeout(fileUrl: string): Promise<Buffer> {
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), TIMEOUTS.FILE_DOWNLOAD)
-
-  try {
-    const isInternalFileServe = fileUrl.includes('/api/files/serve/')
-    const headers: HeadersInit = {}
-
-    if (isInternalFileServe) {
-      const { generateInternalToken } = await import('@/lib/auth/internal')
-      const token = await generateInternalToken()
-      headers.Authorization = `Bearer ${token}`
-    }
-
-    const response = await fetch(fileUrl, { signal: controller.signal, headers })
-    clearTimeout(timeoutId)
-
-    if (!response.ok) {
-      throw new Error(`Failed to download file: ${response.statusText}`)
-    }
-
-    return Buffer.from(await response.arrayBuffer())
-  } catch (error) {
-    clearTimeout(timeoutId)
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('File download timed out')
-    }
-    throw error
-  }
+  return downloadFileFromUrl(fileUrl, TIMEOUTS.FILE_DOWNLOAD)
 }
 
 async function downloadFileForBase64(fileUrl: string): Promise<Buffer> {
-  if (fileUrl.startsWith('data:')) {
+  if (/^data:/i.test(fileUrl)) {
     const [, base64Data] = fileUrl.split(',')
     if (!base64Data) {
       throw new Error('Invalid data URI format')
     }
     return Buffer.from(base64Data, 'base64')
   }
-  if (fileUrl.startsWith('http')) {
+  if (/^https?:\/\//i.test(fileUrl)) {
     return downloadFileWithTimeout(fileUrl)
   }
-  const fs = await import('fs/promises')
-  return fs.readFile(fileUrl)
-}
-
-function validateCloudConfig(kbConfig: CustomStorageConfig) {
-  const provider = getStorageProvider()
-
-  if (provider === 'blob') {
-    if (
-      !kbConfig.containerName ||
-      (!kbConfig.connectionString && (!kbConfig.accountName || !kbConfig.accountKey))
-    ) {
-      throw new Error(
-        'Azure Blob configuration missing. Set AZURE_CONNECTION_STRING or AZURE_ACCOUNT_NAME + AZURE_ACCOUNT_KEY + AZURE_KB_CONTAINER_NAME'
-      )
-    }
-  } else {
-    if (!kbConfig.bucket || !kbConfig.region) {
-      throw new Error('S3 configuration missing. Set AWS_REGION and S3_KB_BUCKET_NAME')
-    }
-  }
+  throw new Error('Unsupported fileUrl scheme: only data: URIs and http(s):// URLs are allowed')
 }
 
 function processOCRContent(result: OCRResult, filename: string): string {
@@ -348,6 +477,19 @@ async function parseWithAzureMistralOCR(fileUrl: string, filename: string, mimeT
   )
 
   const fileBuffer = await downloadFileForBase64(fileUrl)
+
+  if (mimeType === 'application/pdf') {
+    const pageCount = await getPdfPageCount(fileBuffer)
+    if (pageCount > MISTRAL_MAX_PAGES) {
+      logger.info(
+        `PDF has ${pageCount} pages, exceeds Azure OCR limit of ${MISTRAL_MAX_PAGES}. ` +
+          `Falling back to file parser.`
+      )
+      return parseWithFileParser(fileUrl, filename, mimeType)
+    }
+    logger.info(`Azure Mistral OCR: PDF page count for ${filename}: ${pageCount}`)
+  }
+
   const base64Data = fileBuffer.toString('base64')
   const dataUri = `data:${mimeType};base64,${base64Data}`
 
@@ -383,53 +525,7 @@ async function parseWithAzureMistralOCR(fileUrl: string, filename: string, mimeT
     return { content, processingMethod: 'mistral-ocr' as const, cloudUrl: undefined }
   } catch (error) {
     logger.error(`Azure Mistral OCR failed for ${filename}:`, {
-      message: error instanceof Error ? error.message : String(error),
-    })
-
-    return env.MISTRAL_API_KEY
-      ? parseWithMistralOCR(fileUrl, filename, mimeType)
-      : parseWithFileParser(fileUrl, filename, mimeType)
-  }
-}
-
-async function parseWithMistralOCR(fileUrl: string, filename: string, mimeType: string) {
-  if (!env.MISTRAL_API_KEY) {
-    throw new Error('Mistral API key required')
-  }
-
-  if (!mistralParserTool.request?.body) {
-    throw new Error('Mistral parser tool not configured')
-  }
-
-  const { httpsUrl, cloudUrl } = await handleFileForOCR(fileUrl, filename, mimeType)
-  const params = { filePath: httpsUrl, apiKey: env.MISTRAL_API_KEY, resultType: 'text' as const }
-
-  try {
-    const response = await retryWithExponentialBackoff(
-      async () => {
-        const url =
-          typeof mistralParserTool.request!.url === 'function'
-            ? mistralParserTool.request!.url(params)
-            : mistralParserTool.request!.url
-
-        const headers =
-          typeof mistralParserTool.request!.headers === 'function'
-            ? mistralParserTool.request!.headers(params)
-            : mistralParserTool.request!.headers
-
-        const requestBody = mistralParserTool.request!.body!(params) as OCRRequestBody
-        return makeOCRRequest(url, headers as Record<string, string>, requestBody)
-      },
-      { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 10000 }
-    )
-
-    const result = (await mistralParserTool.transformResponse!(response, params)) as OCRResult
-    const content = processOCRContent(result, filename)
-
-    return { content, processingMethod: 'mistral-ocr' as const, cloudUrl }
-  } catch (error) {
-    logger.error(`Mistral OCR failed for ${filename}:`, {
-      message: error instanceof Error ? error.message : String(error),
+      message: toError(error).message,
     })
 
     logger.info(`Falling back to file parser: ${filename}`)
@@ -437,21 +533,263 @@ async function parseWithMistralOCR(fileUrl: string, filename: string, mimeType: 
   }
 }
 
+async function parseWithMistralOCR(
+  fileUrl: string,
+  filename: string,
+  mimeType: string,
+  userId?: string,
+  workspaceId?: string | null,
+  mistralApiKey?: string | null
+) {
+  const apiKey = mistralApiKey || env.MISTRAL_API_KEY
+  if (!apiKey) {
+    throw new Error('Mistral API key required')
+  }
+
+  if (!mistralParserTool.request?.body) {
+    throw new Error('Mistral parser tool not configured')
+  }
+
+  const { httpsUrl, cloudUrl, buffer } = await handleFileForOCR(
+    fileUrl,
+    filename,
+    mimeType,
+    userId,
+    workspaceId
+  )
+
+  logger.info(`Mistral OCR: Using presigned URL for ${filename}: ${httpsUrl}`)
+
+  let pageCount = 0
+  if (mimeType === 'application/pdf' && buffer) {
+    pageCount = await getPdfPageCount(buffer)
+    logger.info(`PDF page count for ${filename}: ${pageCount}`)
+  }
+
+  const needsBatching = pageCount > MISTRAL_MAX_PAGES
+
+  if (needsBatching && buffer) {
+    logger.info(
+      `PDF has ${pageCount} pages, exceeds limit of ${MISTRAL_MAX_PAGES}. Splitting and processing in chunks.`
+    )
+    return processMistralOCRInBatches(filename, apiKey, buffer, userId, cloudUrl)
+  }
+
+  const params = { filePath: httpsUrl, apiKey, resultType: 'text' as const }
+
+  try {
+    const response = await executeMistralOCRRequest(params, userId)
+    const result = (await mistralParserTool.transformResponse!(response, params)) as OCRResult
+    const content = processOCRContent(result, filename)
+
+    return { content, processingMethod: 'mistral-ocr' as const, cloudUrl }
+  } catch (error) {
+    logger.error(`Mistral OCR failed for ${filename}:`, {
+      message: toError(error).message,
+    })
+
+    logger.info(`Falling back to file parser: ${filename}`)
+    return parseWithFileParser(fileUrl, filename, mimeType)
+  }
+}
+
+async function executeMistralOCRRequest(
+  params: { filePath: string; apiKey: string; resultType: 'text' },
+  userId?: string
+): Promise<Response> {
+  return retryWithExponentialBackoff(
+    async () => {
+      let url =
+        typeof mistralParserTool.request!.url === 'function'
+          ? mistralParserTool.request!.url(params)
+          : mistralParserTool.request!.url
+
+      const isInternalRoute = url.startsWith('/')
+
+      if (isInternalRoute) {
+        const { getInternalApiBaseUrl } = await import('@/lib/core/utils/urls')
+        url = `${getInternalApiBaseUrl()}${url}`
+      }
+
+      let headers =
+        typeof mistralParserTool.request!.headers === 'function'
+          ? mistralParserTool.request!.headers(params)
+          : mistralParserTool.request!.headers
+
+      if (isInternalRoute) {
+        const { generateInternalToken } = await import('@/lib/auth/internal')
+        const internalToken = await generateInternalToken(userId)
+        headers = {
+          ...headers,
+          Authorization: `Bearer ${internalToken}`,
+        }
+      }
+
+      const requestBody = mistralParserTool.request!.body!(params) as OCRRequestBody
+      return makeOCRRequest(url, headers as Record<string, string>, requestBody)
+    },
+    { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 10000 }
+  )
+}
+
+async function processChunk(
+  chunk: { buffer: Buffer; startPage: number; endPage: number },
+  chunkIndex: number,
+  totalChunks: number,
+  filename: string,
+  apiKey: string,
+  userId?: string
+): Promise<{ index: number; content: string | null }> {
+  const chunkPageCount = chunk.endPage - chunk.startPage + 1
+
+  logger.info(
+    `Processing chunk ${chunkIndex + 1}/${totalChunks} (pages ${chunk.startPage + 1}-${chunk.endPage + 1}, ${chunkPageCount} pages)`
+  )
+
+  let uploadedKey: string | null = null
+
+  try {
+    const timestamp = Date.now()
+    const uniqueId = randomBytes(8).toString('hex')
+    const safeFileName = filename.replace(/[^a-zA-Z0-9.-]/g, '_')
+    const chunkKey = `kb/${timestamp}-${uniqueId}-chunk${chunkIndex + 1}-${safeFileName}`
+
+    const metadata: Record<string, string> = {
+      originalName: `${filename}_chunk${chunkIndex + 1}`,
+      uploadedAt: new Date().toISOString(),
+      purpose: 'knowledge-base',
+      ...(userId && { userId }),
+    }
+
+    const uploadResult = await StorageService.uploadFile({
+      file: chunk.buffer,
+      fileName: `${filename}_chunk${chunkIndex + 1}`,
+      contentType: 'application/pdf',
+      context: 'knowledge-base',
+      customKey: chunkKey,
+      metadata,
+    })
+
+    uploadedKey = uploadResult.key
+
+    const chunkUrl = await StorageService.generatePresignedDownloadUrl(
+      uploadResult.key,
+      'knowledge-base',
+      900 // 15 minutes
+    )
+
+    logger.info(`Uploaded chunk ${chunkIndex + 1} to S3: ${chunkKey}`)
+
+    const params = {
+      filePath: chunkUrl,
+      apiKey,
+      resultType: 'text' as const,
+    }
+
+    const response = await executeMistralOCRRequest(params, userId)
+    const result = (await mistralParserTool.transformResponse!(response, params)) as OCRResult
+
+    if (result.success && result.output?.content) {
+      logger.info(`Chunk ${chunkIndex + 1}/${totalChunks} completed successfully`)
+      return { index: chunkIndex, content: result.output.content }
+    }
+    logger.warn(`Chunk ${chunkIndex + 1}/${totalChunks} returned no content`)
+    return { index: chunkIndex, content: null }
+  } catch (error) {
+    logger.error(`Chunk ${chunkIndex + 1}/${totalChunks} failed:`, {
+      message: toError(error).message,
+    })
+    return { index: chunkIndex, content: null }
+  } finally {
+    if (uploadedKey) {
+      try {
+        await StorageService.deleteFile({ key: uploadedKey, context: 'knowledge-base' })
+        logger.info(`Cleaned up chunk ${chunkIndex + 1} from S3`)
+      } catch (deleteError) {
+        logger.warn(`Failed to clean up chunk ${chunkIndex + 1} from S3:`, {
+          message: toError(deleteError).message,
+        })
+      }
+    }
+  }
+}
+
+async function processMistralOCRInBatches(
+  filename: string,
+  apiKey: string,
+  pdfBuffer: Buffer,
+  userId?: string,
+  cloudUrl?: string
+): Promise<{
+  content: string
+  processingMethod: 'mistral-ocr'
+  cloudUrl?: string
+}> {
+  const totalPages = await getPdfPageCount(pdfBuffer)
+  logger.info(
+    `Splitting ${filename} (${totalPages} pages) into chunks of ${MISTRAL_MAX_PAGES} pages`
+  )
+
+  const pdfChunks = await splitPdfIntoChunks(pdfBuffer, MISTRAL_MAX_PAGES)
+  logger.info(
+    `Split into ${pdfChunks.length} chunks, processing with concurrency ${MAX_CONCURRENT_CHUNKS}`
+  )
+
+  const results: { index: number; content: string | null }[] = []
+
+  for (let i = 0; i < pdfChunks.length; i += MAX_CONCURRENT_CHUNKS) {
+    const batch = pdfChunks.slice(i, i + MAX_CONCURRENT_CHUNKS)
+    const batchPromises = batch.map((chunk, batchIndex) =>
+      processChunk(chunk, i + batchIndex, pdfChunks.length, filename, apiKey, userId)
+    )
+
+    const batchResults = await Promise.all(batchPromises)
+    for (const result of batchResults) {
+      results.push(result)
+    }
+
+    logger.info(
+      `Completed batch ${Math.floor(i / MAX_CONCURRENT_CHUNKS) + 1}/${Math.ceil(pdfChunks.length / MAX_CONCURRENT_CHUNKS)}`
+    )
+  }
+
+  const sortedResults = results
+    .sort((a, b) => a.index - b.index)
+    .filter((r) => r.content !== null)
+    .map((r) => r.content as string)
+
+  if (sortedResults.length === 0) {
+    throw new Error(
+      `OCR failed for all ${pdfChunks.length} chunks of ${filename}. ` +
+        `Large PDFs require OCR - file parser fallback would produce poor results.`
+    )
+  }
+
+  const combinedContent = sortedResults.join('\n\n')
+  logger.info(
+    `Successfully processed ${sortedResults.length}/${pdfChunks.length} chunks for ${filename}`
+  )
+
+  return {
+    content: combinedContent,
+    processingMethod: 'mistral-ocr',
+    cloudUrl,
+  }
+}
+
 async function parseWithFileParser(fileUrl: string, filename: string, mimeType: string) {
   try {
     let content: string
-    let metadata: any = {}
+    let metadata: FileParseMetadata = {}
 
-    if (fileUrl.startsWith('data:')) {
+    if (/^data:/i.test(fileUrl)) {
       content = await parseDataURI(fileUrl, filename, mimeType)
-    } else if (fileUrl.startsWith('http')) {
-      const result = await parseHttpFile(fileUrl, filename)
+    } else if (/^https?:\/\//i.test(fileUrl)) {
+      const result = await parseHttpFile(fileUrl, filename, mimeType)
       content = result.content
       metadata = result.metadata || {}
     } else {
-      const result = await parseFile(fileUrl)
-      content = result.content
-      metadata = result.metadata || {}
+      throw new Error('Unsupported fileUrl scheme: only data: URIs and http(s):// URLs are allowed')
     }
 
     if (!content.trim()) {
@@ -477,7 +815,7 @@ async function parseDataURI(fileUrl: string, filename: string, mimeType: string)
       : decodeURIComponent(base64Data)
   }
 
-  const extension = filename.split('.').pop()?.toLowerCase() || 'txt'
+  const extension = resolveParserExtension(filename, mimeType, 'txt')
   const buffer = Buffer.from(base64Data, 'base64')
   const result = await parseBuffer(buffer, extension)
   return result.content
@@ -485,15 +823,12 @@ async function parseDataURI(fileUrl: string, filename: string, mimeType: string)
 
 async function parseHttpFile(
   fileUrl: string,
-  filename: string
-): Promise<{ content: string; metadata?: any }> {
+  filename: string,
+  mimeType?: string
+): Promise<{ content: string; metadata?: FileParseMetadata }> {
   const buffer = await downloadFileWithTimeout(fileUrl)
 
-  const extension = filename.split('.').pop()?.toLowerCase()
-  if (!extension) {
-    throw new Error(`Could not determine file extension: ${filename}`)
-  }
-
+  const extension = resolveParserExtension(filename, mimeType)
   const result = await parseBuffer(buffer, extension)
   return result
 }

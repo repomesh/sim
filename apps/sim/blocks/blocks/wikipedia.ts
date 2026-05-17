@@ -1,5 +1,6 @@
 import { WikipediaIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
+import { IntegrationType } from '@/blocks/types'
 import type { WikipediaResponse } from '@/tools/wikipedia/types'
 
 export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
@@ -10,6 +11,8 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
     'Integrate Wikipedia into the workflow. Can get page summary, search pages, get page content, and get random page.',
   docsLink: 'https://docs.sim.ai/tools/wikipedia',
   category: 'tools',
+  integrationType: IntegrationType.Search,
+  tags: ['knowledge-base', 'web-scraping'],
   bgColor: '#000000',
   icon: WikipediaIcon,
   subBlocks: [
@@ -17,7 +20,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Get Page Summary', id: 'wikipedia_summary' },
         { label: 'Search Pages', id: 'wikipedia_search' },
@@ -31,7 +33,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
       id: 'pageTitle',
       title: 'Page Title',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter Wikipedia page title (e.g., "Python programming language")...',
       condition: { field: 'operation', value: 'wikipedia_summary' },
       required: true,
@@ -41,7 +42,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
       id: 'query',
       title: 'Search Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter search terms...',
       condition: { field: 'operation', value: 'wikipedia_search' },
       required: true,
@@ -50,7 +50,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
       id: 'searchLimit',
       title: 'Max Results',
       type: 'short-input',
-      layout: 'full',
       placeholder: '10',
       condition: { field: 'operation', value: 'wikipedia_search' },
     },
@@ -59,7 +58,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
       id: 'pageTitle',
       title: 'Page Title',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter Wikipedia page title...',
       condition: { field: 'operation', value: 'wikipedia_content' },
       required: true,
@@ -69,11 +67,6 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
     access: ['wikipedia_summary', 'wikipedia_search', 'wikipedia_content', 'wikipedia_random'],
     config: {
       tool: (params) => {
-        // Convert searchLimit to a number for search operation
-        if (params.searchLimit) {
-          params.searchLimit = Number(params.searchLimit)
-        }
-
         switch (params.operation) {
           case 'wikipedia_summary':
             return 'wikipedia_summary'
@@ -86,6 +79,11 @@ export const WikipediaBlock: BlockConfig<WikipediaResponse> = {
           default:
             return 'wikipedia_summary'
         }
+      },
+      params: (params) => {
+        const result: Record<string, unknown> = {}
+        if (params.searchLimit) result.searchLimit = Number(params.searchLimit)
+        return result
       },
     },
   },

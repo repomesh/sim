@@ -1,6 +1,8 @@
+import { toError } from '@sim/utils/errors'
 import { Mem0Icon } from '@/components/icons'
-import { AuthMode, type BlockConfig } from '@/blocks/types'
+import { AuthMode, type BlockConfig, IntegrationType } from '@/blocks/types'
 import type { Mem0Response } from '@/tools/mem0/types'
+import { parseMem0Messages } from '@/tools/mem0/utils'
 
 export const Mem0Block: BlockConfig<Mem0Response> = {
   type: 'mem0',
@@ -11,13 +13,14 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
   bgColor: '#181C1E',
   icon: Mem0Icon,
   category: 'tools',
+  integrationType: IntegrationType.AI,
+  tags: ['llm', 'knowledge-base', 'agentic'],
   docsLink: 'https://docs.sim.ai/tools/mem0',
   subBlocks: [
     {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'half',
       options: [
         { label: 'Add Memories', id: 'add' },
         { label: 'Search Memories', id: 'search' },
@@ -30,16 +33,13 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
       id: 'userId',
       title: 'User ID',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter user identifier',
-      value: () => 'userid', // Default to the working user ID from curl example
       required: true,
     },
     {
       id: 'messages',
       title: 'Messages',
       type: 'code',
-      layout: 'full',
       placeholder: 'JSON array, e.g. [{"role": "user", "content": "I love Sim!"}]',
       language: 'json',
       condition: {
@@ -52,7 +52,6 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
       id: 'query',
       title: 'Search Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter search query to find relevant memories',
       condition: {
         field: 'operation',
@@ -64,7 +63,6 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
       id: 'memoryId',
       title: 'Memory ID',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Specific memory ID to retrieve',
       condition: {
         field: 'operation',
@@ -75,38 +73,73 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
       id: 'startDate',
       title: 'Start Date',
       type: 'short-input',
-      layout: 'half',
       placeholder: 'YYYY-MM-DD',
       condition: {
         field: 'operation',
         value: 'get',
+      },
+      mode: 'advanced',
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate a date in YYYY-MM-DD format based on the user's description.
+Examples:
+- "last week" -> Calculate 7 days ago
+- "beginning of this month" -> First day of current month
+- "30 days ago" -> Calculate 30 days ago
+- "start of year" -> January 1 of current year
+
+Return ONLY the date string in YYYY-MM-DD format - no explanations, no quotes, no extra text.`,
+        placeholder: 'Describe the start date (e.g., "last week", "30 days ago")...',
+        generationType: 'timestamp',
       },
     },
     {
       id: 'endDate',
       title: 'End Date',
       type: 'short-input',
-      layout: 'half',
       placeholder: 'YYYY-MM-DD',
       condition: {
         field: 'operation',
         value: 'get',
+      },
+      mode: 'advanced',
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate a date in YYYY-MM-DD format based on the user's description.
+Examples:
+- "today" -> Today's date
+- "yesterday" -> Yesterday's date
+- "end of last week" -> Last Sunday's date
+- "now" -> Today's date
+
+Return ONLY the date string in YYYY-MM-DD format - no explanations, no quotes, no extra text.`,
+        placeholder: 'Describe the end date (e.g., "today", "yesterday")...',
+        generationType: 'timestamp',
       },
     },
     {
       id: 'apiKey',
       title: 'API Key',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter your Mem0 API key',
       password: true,
       required: true,
     },
     {
+      id: 'page',
+      title: 'Page',
+      type: 'short-input',
+      placeholder: '1',
+      condition: {
+        field: 'operation',
+        value: 'get',
+      },
+      mode: 'advanced',
+    },
+    {
       id: 'limit',
       title: 'Result Limit',
       type: 'slider',
-      layout: 'full',
       min: 1,
       max: 50,
       step: 1,
@@ -115,6 +148,7 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
         field: 'operation',
         value: ['search', 'get'],
       },
+      mode: 'advanced',
     },
   ],
   tools: {
@@ -134,16 +168,14 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
         }
       },
       params: (params: Record<string, any>) => {
-        // Create detailed error information for any missing required fields
         const errors: string[] = []
+        const operation = params.operation || 'add'
 
-        // Validate required API key for all operations
         if (!params.apiKey) {
           errors.push('API Key is required')
         }
 
-        // For search operation, validate required fields
-        if (params.operation === 'search') {
+        if (operation === 'search') {
           if (!params.query || params.query.trim() === '') {
             errors.push('Search Query is required')
           }
@@ -153,36 +185,12 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
           }
         }
 
-        // For add operation, validate required fields
-        if (params.operation === 'add') {
-          if (!params.messages) {
-            errors.push('Messages are required for add operation')
-          } else {
-            try {
-              const messagesArray =
-                typeof params.messages === 'string' ? JSON.parse(params.messages) : params.messages
-
-              if (!Array.isArray(messagesArray) || messagesArray.length === 0) {
-                errors.push('Messages must be a non-empty array')
-              } else {
-                for (const msg of messagesArray) {
-                  if (!msg.role || !msg.content) {
-                    errors.push("Each message must have 'role' and 'content' properties")
-                    break
-                  }
-                }
-              }
-            } catch (_e: any) {
-              errors.push('Messages must be valid JSON')
-            }
-          }
-
+        if (operation === 'add') {
           if (!params.userId) {
             errors.push('User ID is required')
           }
         }
 
-        // Throw error if any required fields are missing
         if (errors.length > 0) {
           throw new Error(`Mem0 Block Error: ${errors.join(', ')}`)
         }
@@ -191,63 +199,22 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
           apiKey: params.apiKey,
         }
 
-        // Add any identifiers that are present
         if (params.userId) result.userId = params.userId
 
-        // Add version if specified
-        if (params.version) result.version = params.version
+        if (params.limit) result.limit = Number(params.limit)
 
-        if (params.limit) result.limit = params.limit
-
-        const operation = params.operation || 'add'
-
-        // Process operation-specific parameters
         switch (operation) {
           case 'add':
-            if (params.messages) {
-              try {
-                // Ensure messages are properly formatted
-                const messagesArray =
-                  typeof params.messages === 'string'
-                    ? JSON.parse(params.messages)
-                    : params.messages
-
-                // Validate message structure
-                if (Array.isArray(messagesArray) && messagesArray.length > 0) {
-                  let validMessages = true
-                  for (const msg of messagesArray) {
-                    if (!msg.role || !msg.content) {
-                      validMessages = false
-                      break
-                    }
-                  }
-                  if (validMessages) {
-                    result.messages = messagesArray
-                  } else {
-                    // Consistent with other error handling - collect in errors array
-                    errors.push('Invalid message format - each message must have role and content')
-                    throw new Error(
-                      'Mem0 Block Error: Invalid message format - each message must have role and content'
-                    )
-                  }
-                } else {
-                  // Consistent with other error handling
-                  errors.push('Messages must be a non-empty array')
-                  throw new Error('Mem0 Block Error: Messages must be a non-empty array')
-                }
-              } catch (e: any) {
-                if (!errors.includes('Messages must be valid JSON')) {
-                  errors.push('Messages must be valid JSON')
-                }
-                throw new Error(`Mem0 Block Error: ${e.message || 'Messages must be valid JSON'}`)
-              }
+            try {
+              result.messages = parseMem0Messages(params.messages)
+            } catch (error) {
+              throw new Error(`Mem0 Block Error: ${toError(error).message}`)
             }
             break
           case 'search':
             if (params.query) {
               result.query = params.query
 
-              // Check if we have at least one identifier for search
               if (!params.userId) {
                 errors.push('Search requires a User ID')
                 throw new Error('Mem0 Block Error: Search requires a User ID')
@@ -257,17 +224,16 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
               throw new Error('Mem0 Block Error: Search requires a query parameter')
             }
 
-            // Include limit if specified
-            if (params.limit) {
-              result.limit = Number(params.limit)
-            }
             break
           case 'get':
             if (params.memoryId) {
               result.memoryId = params.memoryId
             }
 
-            // Add date range filtering for v2 get memories
+            if (params.page) {
+              result.page = Number(params.page)
+            }
+
             if (params.startDate) {
               result.startDate = params.startDate
             }
@@ -286,17 +252,23 @@ export const Mem0Block: BlockConfig<Mem0Response> = {
     operation: { type: 'string', description: 'Operation to perform' },
     apiKey: { type: 'string', description: 'Mem0 API key' },
     userId: { type: 'string', description: 'User identifier' },
-    version: { type: 'string', description: 'API version' },
     messages: { type: 'json', description: 'Message data array' },
     query: { type: 'string', description: 'Search query' },
     memoryId: { type: 'string', description: 'Memory identifier' },
     startDate: { type: 'string', description: 'Start date filter' },
     endDate: { type: 'string', description: 'End date filter' },
+    page: { type: 'number', description: 'Page number for paginated get results' },
     limit: { type: 'number', description: 'Result limit' },
   },
   outputs: {
-    ids: { type: 'json', description: 'Memory identifiers' },
-    memories: { type: 'json', description: 'Memory data' },
-    searchResults: { type: 'json', description: 'Search results' },
+    ids: { type: 'json', description: 'Memory identifiers returned by search or get operations' },
+    memories: { type: 'json', description: 'Memory records returned by get operations' },
+    searchResults: { type: 'json', description: 'Ranked memory records returned by search' },
+    message: { type: 'string', description: 'Add operation status message' },
+    status: { type: 'string', description: 'Add operation processing status' },
+    event_id: { type: 'string', description: 'Add operation event ID for status polling' },
+    count: { type: 'number', description: 'Total memory count for get operations' },
+    next: { type: 'string', description: 'Next page URL for get operations' },
+    previous: { type: 'string', description: 'Previous page URL for get operations' },
   },
 }

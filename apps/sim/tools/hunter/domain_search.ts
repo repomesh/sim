@@ -1,4 +1,9 @@
-import type { HunterDomainSearchParams, HunterDomainSearchResponse } from '@/tools/hunter/types'
+import type {
+  HunterDomainSearchParams,
+  HunterDomainSearchResponse,
+  HunterEmail,
+} from '@/tools/hunter/types'
+import { EMAILS_OUTPUT } from '@/tools/hunter/types'
 import type { ToolConfig } from '@/tools/types'
 
 export const domainSearchTool: ToolConfig<HunterDomainSearchParams, HunterDomainSearchResponse> = {
@@ -12,37 +17,38 @@ export const domainSearchTool: ToolConfig<HunterDomainSearchParams, HunterDomain
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Domain name to search for email addresses',
+      description: 'Domain name to search for email addresses (e.g., "stripe.com", "company.io")',
     },
     limit: {
       type: 'number',
       required: false,
-      visibility: 'user-only',
-      description: 'Maximum email addresses to return (default: 10)',
+      visibility: 'user-or-llm',
+      description: 'Maximum email addresses to return (e.g., 10, 25, 50). Default: 10',
     },
     offset: {
       type: 'number',
       required: false,
-      visibility: 'hidden',
-      description: 'Number of email addresses to skip',
+      visibility: 'user-or-llm',
+      description: 'Number of email addresses to skip for pagination (e.g., 0, 10, 20)',
     },
     type: {
       type: 'string',
       required: false,
-      visibility: 'user-only',
-      description: 'Filter for personal or generic emails',
+      visibility: 'user-or-llm',
+      description: 'Filter for personal or generic emails (e.g., "personal", "generic", "all")',
     },
     seniority: {
       type: 'string',
       required: false,
-      visibility: 'user-only',
-      description: 'Filter by seniority level: junior, senior, or executive',
+      visibility: 'user-or-llm',
+      description: 'Filter by seniority level (e.g., "junior", "senior", "executive")',
     },
     department: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'Filter by specific departments (e.g., sales, marketing)',
+      description:
+        'Filter by specific department (e.g., "sales", "marketing", "engineering", "hr")',
     },
     apiKey: {
       type: 'string',
@@ -58,8 +64,8 @@ export const domainSearchTool: ToolConfig<HunterDomainSearchParams, HunterDomain
       url.searchParams.append('domain', params.domain)
       url.searchParams.append('api_key', params.apiKey)
 
-      if (params.limit) url.searchParams.append('limit', params.limit.toString())
-      if (params.offset) url.searchParams.append('offset', params.offset.toString())
+      if (params.limit) url.searchParams.append('limit', Number(params.limit).toString())
+      if (params.offset) url.searchParams.append('offset', Number(params.offset).toString())
       if (params.type && params.type !== 'all') url.searchParams.append('type', params.type)
       if (params.seniority && params.seniority !== 'all')
         url.searchParams.append('seniority', params.seniority)
@@ -75,45 +81,35 @@ export const domainSearchTool: ToolConfig<HunterDomainSearchParams, HunterDomain
 
   transformResponse: async (response: Response) => {
     const data = await response.json()
+    const d = data.data ?? {}
 
     return {
       success: true,
       output: {
-        domain: data.data?.domain || '',
-        disposable: data.data?.disposable || false,
-        webmail: data.data?.webmail || false,
-        accept_all: data.data?.accept_all || false,
-        pattern: data.data?.pattern || '',
-        organization: data.data?.organization || '',
-        description: data.data?.description || '',
-        industry: data.data?.industry || '',
-        twitter: data.data?.twitter || '',
-        facebook: data.data?.facebook || '',
-        linkedin: data.data?.linkedin || '',
-        instagram: data.data?.instagram || '',
-        youtube: data.data?.youtube || '',
-        technologies: data.data?.technologies || [],
-        country: data.data?.country || '',
-        state: data.data?.state || '',
-        city: data.data?.city || '',
-        postal_code: data.data?.postal_code || '',
-        street: data.data?.street || '',
+        domain: d.domain ?? '',
+        disposable: d.disposable ?? false,
+        webmail: d.webmail ?? false,
+        accept_all: d.accept_all ?? false,
+        pattern: d.pattern ?? '',
+        organization: d.organization ?? '',
+        linked_domains: d.linked_domains ?? [],
         emails:
-          data.data?.emails?.map((email: any) => ({
-            value: email.value || '',
-            type: email.type || '',
-            confidence: email.confidence || 0,
-            sources: email.sources || [],
-            first_name: email.first_name || '',
-            last_name: email.last_name || '',
-            position: email.position || '',
-            seniority: email.seniority || '',
-            department: email.department || '',
-            linkedin: email.linkedin || '',
-            twitter: email.twitter || '',
-            phone_number: email.phone_number || '',
-            verification: email.verification || {},
-          })) || [],
+          d.emails?.map((email: Partial<HunterEmail>) => ({
+            value: email.value ?? '',
+            type: email.type ?? '',
+            confidence: email.confidence ?? 0,
+            sources: email.sources ?? [],
+            first_name: email.first_name ?? null,
+            last_name: email.last_name ?? null,
+            position: email.position ?? null,
+            position_raw: email.position_raw ?? null,
+            seniority: email.seniority ?? null,
+            department: email.department ?? null,
+            linkedin: email.linkedin ?? null,
+            twitter: email.twitter ?? null,
+            phone_number: email.phone_number ?? null,
+            verification: email.verification ?? { date: null, status: 'unknown' },
+          })) ?? [],
       },
     }
   },
@@ -125,80 +121,29 @@ export const domainSearchTool: ToolConfig<HunterDomainSearchParams, HunterDomain
     },
     disposable: {
       type: 'boolean',
-      description: 'Whether the domain accepts disposable email addresses',
+      description: 'Whether the domain is a disposable email service',
     },
     webmail: {
       type: 'boolean',
-      description: 'Whether the domain is a webmail provider',
+      description: 'Whether the domain is a webmail provider (e.g., Gmail)',
     },
     accept_all: {
       type: 'boolean',
-      description: 'Whether the domain accepts all email addresses',
+      description: 'Whether the server accepts all email addresses (may cause false positives)',
     },
     pattern: {
       type: 'string',
-      description: 'The email pattern used by the organization',
+      description: 'The email pattern used by the organization (e.g., {first}, {first}.{last})',
     },
     organization: {
       type: 'string',
-      description: 'The organization name',
+      description: 'The organization/company name',
     },
-    description: {
-      type: 'string',
-      description: 'Description of the organization',
-    },
-    industry: {
-      type: 'string',
-      description: 'Industry of the organization',
-    },
-    twitter: {
-      type: 'string',
-      description: 'Twitter profile of the organization',
-    },
-    facebook: {
-      type: 'string',
-      description: 'Facebook profile of the organization',
-    },
-    linkedin: {
-      type: 'string',
-      description: 'LinkedIn profile of the organization',
-    },
-    instagram: {
-      type: 'string',
-      description: 'Instagram profile of the organization',
-    },
-    youtube: {
-      type: 'string',
-      description: 'YouTube channel of the organization',
-    },
-    technologies: {
+    linked_domains: {
       type: 'array',
-      description: 'Array of technologies used by the organization',
+      description: 'Other domains linked to the organization',
+      items: { type: 'string', description: 'Domain name' },
     },
-    country: {
-      type: 'string',
-      description: 'Country where the organization is located',
-    },
-    state: {
-      type: 'string',
-      description: 'State where the organization is located',
-    },
-    city: {
-      type: 'string',
-      description: 'City where the organization is located',
-    },
-    postal_code: {
-      type: 'string',
-      description: 'Postal code of the organization',
-    },
-    street: {
-      type: 'string',
-      description: 'Street address of the organization',
-    },
-    emails: {
-      type: 'array',
-      description:
-        'Array of email addresses found for the domain, each containing value, type, confidence, sources, and person details',
-    },
+    emails: EMAILS_OUTPUT,
   },
 }

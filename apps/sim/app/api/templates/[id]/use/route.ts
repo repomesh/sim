@@ -1,201 +1,235 @@
 import { db } from '@sim/db'
-import { templates, workflow, workflowBlocks, workflowEdges } from '@sim/db/schema'
+import { templates, workflow, workflowDeploymentVersion } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
 import { eq, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { v4 as uuidv4 } from 'uuid'
+import { useTemplateContract } from '@/lib/api/contracts/templates'
+import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { getInternalApiBaseUrl } from '@/lib/core/utils/urls'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { canAccessTemplate, verifyTemplateOwnership } from '@/lib/templates/permissions'
+import {
+  type RegenerateStateInput,
+  regenerateWorkflowStateIds,
+} from '@/lib/workflows/persistence/utils'
+import { deduplicateWorkflowName } from '@/lib/workflows/utils'
+import { getUserEntityPermissions, getWorkspaceById } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('TemplateUseAPI')
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 
+// Type for template details
+interface TemplateDetails {
+  tagline?: string
+  about?: string
+}
+
 // POST /api/templates/[id]/use - Use a template (increment views and create workflow)
-export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const requestId = generateRequestId()
-  const { id } = await params
+export const POST = withRouteHandler(
+  async (request: NextRequest, context: { params: Promise<{ id: string }> }) => {
+    const requestId = generateRequestId()
 
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized use attempt for template: ${id}`)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    try {
+      const session = await getSession()
+      if (!session?.user?.id) {
+        logger.warn(`[${requestId}] Unauthorized template use attempt`)
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
 
-    // Get workspace ID from request body
-    const body = await request.json()
-    const { workspaceId } = body
+      const parsed = await parseRequest(useTemplateContract, request, context)
+      if (!parsed.success) return parsed.response
+      const { id } = parsed.data.params
+      const { workspaceId, connectToTemplate = false } = parsed.data.body
 
-    if (!workspaceId) {
-      logger.warn(`[${requestId}] Missing workspaceId in request body`)
-      return NextResponse.json({ error: 'Workspace ID is required' }, { status: 400 })
-    }
+      if (!workspaceId) {
+        logger.warn(`[${requestId}] Missing workspaceId in request body`)
+        return NextResponse.json({ error: 'Workspace ID is required' }, { status: 400 })
+      }
 
-    logger.debug(
-      `[${requestId}] Using template: ${id}, user: ${session.user.id}, workspace: ${workspaceId}`
-    )
+      const workspace = await getWorkspaceById(workspaceId)
+      if (!workspace) {
+        return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+      }
 
-    // Get the template with its data
-    const template = await db
-      .select({
-        id: templates.id,
-        name: templates.name,
-        description: templates.description,
-        state: templates.state,
-        color: templates.color,
-      })
-      .from(templates)
-      .where(eq(templates.id, id))
-      .limit(1)
+      const permission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
+      if (permission !== 'admin' && permission !== 'write') {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      }
 
-    if (template.length === 0) {
-      logger.warn(`[${requestId}] Template not found: ${id}`)
-      return NextResponse.json({ error: 'Template not found' }, { status: 404 })
-    }
+      logger.debug(
+        `[${requestId}] Using template: ${id}, user: ${session.user.id}, workspace: ${workspaceId}, connect: ${connectToTemplate}`
+      )
 
-    const templateData = template[0]
+      // Get the template
+      const templateAccess = await canAccessTemplate(id, session.user.id)
+      if (!templateAccess.allowed) {
+        logger.warn(`[${requestId}] Template not found: ${id}`)
+        return NextResponse.json({ error: 'Template not found' }, { status: 404 })
+      }
 
-    // Create a new workflow ID
-    const newWorkflowId = uuidv4()
-
-    // Use a transaction to ensure consistency
-    const result = await db.transaction(async (tx) => {
-      // Increment the template views
-      await tx
-        .update(templates)
-        .set({
-          views: sql`${templates.views} + 1`,
-          updatedAt: new Date(),
-        })
-        .where(eq(templates.id, id))
-
-      const now = new Date()
-
-      // Create a new workflow from the template
-      const newWorkflow = await tx
-        .insert(workflow)
-        .values({
-          id: newWorkflowId,
-          workspaceId: workspaceId,
-          name: `${templateData.name} (copy)`,
-          description: templateData.description,
-          color: templateData.color,
-          userId: session.user.id,
-          createdAt: now,
-          updatedAt: now,
-          lastSynced: now,
-        })
-        .returning({ id: workflow.id })
-
-      // Create workflow_blocks entries from the template state
-      const templateState = templateData.state as any
-      if (templateState?.blocks) {
-        // Create a mapping from old block IDs to new block IDs for reference updates
-        const blockIdMap = new Map<string, string>()
-
-        const blockEntries = Object.values(templateState.blocks).map((block: any) => {
-          const newBlockId = uuidv4()
-          blockIdMap.set(block.id, newBlockId)
-
-          return {
-            id: newBlockId,
-            workflowId: newWorkflowId,
-            type: block.type,
-            name: block.name,
-            positionX: block.position?.x?.toString() || '0',
-            positionY: block.position?.y?.toString() || '0',
-            enabled: block.enabled !== false,
-            horizontalHandles: block.horizontalHandles !== false,
-            isWide: block.isWide || false,
-            advancedMode: block.advancedMode || false,
-            height: block.height?.toString() || '0',
-            subBlocks: block.subBlocks || {},
-            outputs: block.outputs || {},
-            data: block.data || {},
-            parentId: block.parentId ? blockIdMap.get(block.parentId) || null : null,
-            extent: block.extent || null,
-            createdAt: now,
-            updatedAt: now,
-          }
-        })
-
-        // Create edge entries with new IDs
-        const edgeEntries = (templateState.edges || []).map((edge: any) => ({
-          id: uuidv4(),
-          workflowId: newWorkflowId,
-          sourceBlockId: blockIdMap.get(edge.source) || edge.source,
-          targetBlockId: blockIdMap.get(edge.target) || edge.target,
-          sourceHandle: edge.sourceHandle || null,
-          targetHandle: edge.targetHandle || null,
-          createdAt: now,
-        }))
-
-        // Update the workflow state with new block IDs
-        const updatedState = { ...templateState }
-        if (updatedState.blocks) {
-          const newBlocks: any = {}
-          Object.entries(updatedState.blocks).forEach(([oldId, blockData]: [string, any]) => {
-            const newId = blockIdMap.get(oldId)
-            if (newId) {
-              newBlocks[newId] = {
-                ...blockData,
-                id: newId,
-              }
-            }
-          })
-          updatedState.blocks = newBlocks
-        }
-
-        // Update edges to use new block IDs
-        if (updatedState.edges) {
-          updatedState.edges = updatedState.edges.map((edge: any) => ({
-            ...edge,
-            id: uuidv4(),
-            source: blockIdMap.get(edge.source) || edge.source,
-            target: blockIdMap.get(edge.target) || edge.target,
-          }))
-        }
-
-        // Insert blocks and edges
-        if (blockEntries.length > 0) {
-          await tx.insert(workflowBlocks).values(blockEntries)
-        }
-        if (edgeEntries.length > 0) {
-          await tx.insert(workflowEdges).values(edgeEntries)
+      if (connectToTemplate) {
+        const ownership = await verifyTemplateOwnership(id, session.user.id, 'admin')
+        if (!ownership.authorized) {
+          return NextResponse.json(
+            { error: ownership.error || 'Access denied' },
+            { status: ownership.status || 403 }
+          )
         }
       }
 
-      return newWorkflow[0]
-    })
+      const template = await db
+        .select({
+          id: templates.id,
+          name: templates.name,
+          details: templates.details,
+          state: templates.state,
+          workflowId: templates.workflowId,
+        })
+        .from(templates)
+        .where(eq(templates.id, id))
+        .limit(1)
 
-    logger.info(
-      `[${requestId}] Successfully used template: ${id}, created workflow: ${newWorkflowId}, database returned: ${result.id}`
-    )
+      const templateData = template[0]
 
-    // Verify the workflow was actually created
-    const verifyWorkflow = await db
-      .select({ id: workflow.id })
-      .from(workflow)
-      .where(eq(workflow.id, newWorkflowId))
-      .limit(1)
+      // Create a new workflow ID
+      const newWorkflowId = generateId()
+      const now = new Date()
 
-    if (verifyWorkflow.length === 0) {
-      logger.error(`[${requestId}] Workflow was not created properly: ${newWorkflowId}`)
-      return NextResponse.json({ error: 'Failed to create workflow' }, { status: 500 })
-    }
+      // Extract variables from the template state and remap to the new workflow
+      const templateVariables = (templateData.state as any)?.variables as
+        | Record<string, any>
+        | undefined
+      const remappedVariables: Record<string, any> = (() => {
+        if (!templateVariables || typeof templateVariables !== 'object') return {}
+        const mapped: Record<string, any> = {}
+        for (const [, variable] of Object.entries(templateVariables)) {
+          const newVarId = generateId()
+          mapped[newVarId] = { ...variable, id: newVarId, workflowId: newWorkflowId }
+        }
+        return mapped
+      })()
 
-    return NextResponse.json(
-      {
-        message: 'Template used successfully',
-        workflowId: newWorkflowId,
+      const rawName =
+        connectToTemplate && !templateData.workflowId
+          ? templateData.name
+          : `${templateData.name} (copy)`
+      const dedupedName = await deduplicateWorkflowName(rawName, workspaceId, null)
+
+      await db.insert(workflow).values({
+        id: newWorkflowId,
         workspaceId: workspaceId,
-      },
-      { status: 201 }
-    )
-  } catch (error: any) {
-    logger.error(`[${requestId}] Error using template: ${id}`, error)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+        name: dedupedName,
+        description: (templateData.details as TemplateDetails | null)?.tagline || null,
+        userId: session.user.id,
+        variables: remappedVariables, // Remap variable IDs and workflowId for the new workflow
+        createdAt: now,
+        updatedAt: now,
+        lastSynced: now,
+        isDeployed: connectToTemplate && !templateData.workflowId,
+        deployedAt: connectToTemplate && !templateData.workflowId ? now : null,
+      })
+
+      // Step 2: Regenerate IDs when creating a copy (not when connecting/editing template)
+      // When connecting to template (edit mode), keep original IDs
+      // When using template (copy mode), regenerate all IDs to avoid conflicts
+      const templateState = templateData.state as RegenerateStateInput
+      const workflowState = connectToTemplate
+        ? templateState
+        : regenerateWorkflowStateIds(templateState)
+
+      // Step 3: Save the workflow state using the existing state endpoint (like imports do)
+      // Ensure variables in state are remapped for the new workflow as well
+      const workflowStateWithVariables = { ...workflowState, variables: remappedVariables }
+      const stateResponse = await fetch(
+        `${getInternalApiBaseUrl()}/api/workflows/${newWorkflowId}/state`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            // Forward the session cookie for authentication
+            cookie: request.headers.get('cookie') || '',
+          },
+          body: JSON.stringify(workflowStateWithVariables),
+        }
+      )
+
+      if (!stateResponse.ok) {
+        logger.error(`[${requestId}] Failed to save workflow state for template use`)
+        // Clean up the workflow we created
+        await db.delete(workflow).where(eq(workflow.id, newWorkflowId))
+        return NextResponse.json(
+          { error: 'Failed to create workflow from template' },
+          { status: 500 }
+        )
+      }
+
+      // Use a transaction for template updates and deployment version
+      const result = await db.transaction(async (tx) => {
+        // Prepare template update data
+        const updateData: any = {
+          views: sql`${templates.views} + 1`,
+        }
+
+        // If connecting to template for editing, also update the workflowId
+        // Also create a new deployment version for this workflow with the same state
+        if (connectToTemplate && !templateData.workflowId) {
+          updateData.workflowId = newWorkflowId
+
+          // Create a deployment version for the new workflow
+          if (templateData.state) {
+            const newDeploymentVersionId = generateId()
+            await tx.insert(workflowDeploymentVersion).values({
+              id: newDeploymentVersionId,
+              workflowId: newWorkflowId,
+              version: 1,
+              state: templateData.state,
+              isActive: true,
+              createdAt: now,
+              createdBy: session.user.id,
+            })
+          }
+        }
+
+        // Update template with view count and potentially new workflow connection
+        await tx.update(templates).set(updateData).where(eq(templates.id, id))
+
+        return { id: newWorkflowId }
+      })
+
+      logger.info(
+        `[${requestId}] Successfully used template: ${id}, created workflow: ${newWorkflowId}`
+      )
+
+      try {
+        const { PlatformEvents } = await import('@/lib/core/telemetry')
+        const templateState = templateData.state as any
+        PlatformEvents.templateUsed({
+          templateId: id,
+          templateName: templateData.name,
+          newWorkflowId,
+          blocksCount: templateState?.blocks ? Object.keys(templateState.blocks).length : 0,
+          workspaceId,
+        })
+      } catch (_e) {
+        // Silently fail
+      }
+
+      return NextResponse.json(
+        {
+          message: 'Template used successfully',
+          workflowId: newWorkflowId,
+          workspaceId: workspaceId,
+        },
+        { status: 201 }
+      )
+    } catch (error: any) {
+      logger.error(`[${requestId}] Error using template`, error)
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    }
   }
-}
+)

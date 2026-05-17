@@ -1,9 +1,14 @@
 import { type NextRequest, NextResponse } from 'next/server'
+import { generateCopilotApiKeyContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { env } from '@/lib/env'
-import { SIM_AGENT_API_URL_DEFAULT } from '@/lib/sim-agent/constants'
+import { TraceAttr } from '@/lib/copilot/generated/trace-attributes-v1'
+import { fetchGo } from '@/lib/copilot/request/go/fetch'
+import { getMothershipBaseURL } from '@/lib/copilot/server/agent-url'
+import { env } from '@/lib/core/config/env'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
-export async function POST(req: NextRequest) {
+export const POST = withRouteHandler(async (req: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
@@ -11,19 +16,23 @@ export async function POST(req: NextRequest) {
     }
 
     const userId = session.user.id
+    const mothershipBaseURL = await getMothershipBaseURL({ userId })
 
-    // Move environment variable access inside the function
-    const SIM_AGENT_API_URL = env.SIM_AGENT_API_URL || SIM_AGENT_API_URL_DEFAULT
+    const parsed = await parseRequest(generateCopilotApiKeyContract, req, {})
+    if (!parsed.success) return parsed.response
 
-    await req.json().catch(() => ({}))
+    const { name } = parsed.data.body
 
-    const res = await fetch(`${SIM_AGENT_API_URL}/api/validate-key/generate`, {
+    const res = await fetchGo(`${mothershipBaseURL}/api/validate-key/generate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(env.COPILOT_API_KEY ? { 'x-api-key': env.COPILOT_API_KEY } : {}),
       },
-      body: JSON.stringify({ userId }),
+      body: JSON.stringify({ userId, name }),
+      spanName: 'sim → go /api/validate-key/generate',
+      operation: 'generate_api_key',
+      attributes: { [TraceAttr.UserId]: userId },
     })
 
     if (!res.ok) {
@@ -46,4 +55,4 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     return NextResponse.json({ error: 'Failed to generate copilot API key' }, { status: 500 })
   }
-}
+})

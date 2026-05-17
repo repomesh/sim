@@ -1,25 +1,25 @@
-import { createLogger } from '@/lib/logs/console/logger'
-import type { BlockOutput } from '@/blocks/types'
-import { BlockType } from '@/executor/consts'
-import type { BlockHandler } from '@/executor/types'
+import { createLogger } from '@sim/logger'
+import { BlockType, HTTP } from '@/executor/constants'
+import type { BlockHandler, ExecutionContext, NormalizedBlockOutput } from '@/executor/types'
+import {
+  convertBuilderDataToJson,
+  convertBuilderDataToJsonString,
+} from '@/executor/utils/builder-data'
+import { parseObjectStrings } from '@/executor/utils/json'
 import type { SerializedBlock } from '@/serializer/types'
 
 const logger = createLogger('ResponseBlockHandler')
-
-interface JSONProperty {
-  id: string
-  name: string
-  type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'files'
-  value: any
-  collapsed?: boolean
-}
 
 export class ResponseBlockHandler implements BlockHandler {
   canHandle(block: SerializedBlock): boolean {
     return block.metadata?.id === BlockType.RESPONSE
   }
 
-  async execute(block: SerializedBlock, inputs: Record<string, any>): Promise<BlockOutput> {
+  async execute(
+    ctx: ExecutionContext,
+    block: SerializedBlock,
+    inputs: Record<string, any>
+  ): Promise<NormalizedBlockOutput> {
     logger.info(`Executing response block: ${block.id}`)
 
     try {
@@ -34,23 +34,19 @@ export class ResponseBlockHandler implements BlockHandler {
       })
 
       return {
-        response: {
-          data: responseData,
-          status: statusCode,
-          headers: responseHeaders,
-        },
+        data: responseData,
+        status: statusCode,
+        headers: responseHeaders,
       }
     } catch (error: any) {
       logger.error('Response block execution failed:', error)
       return {
-        response: {
-          data: {
-            error: 'Response block execution failed',
-            message: error.message || 'Unknown error',
-          },
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
+        data: {
+          error: 'Response block execution failed',
+          message: error.message || 'Unknown error',
         },
+        status: HTTP.STATUS.SERVER_ERROR,
+        headers: { 'Content-Type': HTTP.CONTENT_TYPE.JSON },
       }
     }
   }
@@ -59,7 +55,6 @@ export class ResponseBlockHandler implements BlockHandler {
     const dataMode = inputs.dataMode || 'structured'
 
     if (dataMode === 'json' && inputs.data) {
-      // Handle JSON mode - data comes from code editor
       if (typeof inputs.data === 'string') {
         try {
           return JSON.parse(inputs.data)
@@ -68,189 +63,28 @@ export class ResponseBlockHandler implements BlockHandler {
           return inputs.data
         }
       } else if (typeof inputs.data === 'object' && inputs.data !== null) {
-        // Data is already an object, return as-is
         return inputs.data
       }
       return inputs.data
     }
 
     if (dataMode === 'structured' && inputs.builderData) {
-      // Handle structured mode - convert builderData to JSON
-      const convertedData = this.convertBuilderDataToJson(inputs.builderData)
-      return this.parseObjectStrings(convertedData)
+      const convertedData = convertBuilderDataToJson(inputs.builderData)
+      return parseObjectStrings(convertedData)
     }
 
-    // Fallback to inputs.data for backward compatibility
     return inputs.data || {}
   }
 
-  private convertBuilderDataToJson(builderData: JSONProperty[]): any {
-    if (!Array.isArray(builderData)) {
-      return {}
-    }
-
-    const result: any = {}
-
-    for (const prop of builderData) {
-      if (!prop.name || !prop.name.trim()) {
-        continue
-      }
-
-      const value = this.convertPropertyValue(prop)
-      result[prop.name] = value
-    }
-
-    return result
-  }
-
-  // Static method for UI conversion from Builder to Editor mode
-  static convertBuilderDataToJsonString(builderData: JSONProperty[]): string {
-    if (!Array.isArray(builderData) || builderData.length === 0) {
-      return '{\n  \n}'
-    }
-
-    const result: any = {}
-
-    for (const prop of builderData) {
-      if (!prop.name || !prop.name.trim()) {
-        continue
-      }
-
-      // For UI display, keep variable references as-is without processing
-      result[prop.name] = prop.value
-    }
-
-    // Convert to JSON string, then replace quoted variable references with unquoted ones
-    let jsonString = JSON.stringify(result, null, 2)
-
-    // Replace quoted variable references with unquoted ones
-    // Pattern: "<variable.name>" -> <variable.name>
-    jsonString = jsonString.replace(/"(<[^>]+>)"/g, '$1')
-
-    return jsonString
-  }
-
-  private convertPropertyValue(prop: JSONProperty): any {
-    switch (prop.type) {
-      case 'object':
-        return this.convertObjectValue(prop.value)
-      case 'array':
-        return this.convertArrayValue(prop.value)
-      case 'number':
-        return this.convertNumberValue(prop.value)
-      case 'boolean':
-        return this.convertBooleanValue(prop.value)
-      case 'files':
-        // File values should be passed through as-is (UserFile objects)
-        return prop.value
-      default:
-        return prop.value
-    }
-  }
-
-  private convertObjectValue(value: any): any {
-    if (Array.isArray(value)) {
-      return this.convertBuilderDataToJson(value)
-    }
-
-    if (typeof value === 'string' && !this.isVariableReference(value)) {
-      return this.tryParseJson(value, value)
-    }
-
-    // Keep variable references or other values as-is (they'll be resolved later)
-    return value
-  }
-
-  private convertArrayValue(value: any): any {
-    if (Array.isArray(value)) {
-      return value.map((item: any) => this.convertArrayItem(item))
-    }
-
-    if (typeof value === 'string' && !this.isVariableReference(value)) {
-      const parsed = this.tryParseJson(value, value)
-      return Array.isArray(parsed) ? parsed : value
-    }
-
-    // Keep variable references or other values as-is
-    return value
-  }
-
-  private convertArrayItem(item: any): any {
-    if (typeof item !== 'object' || !item.type) {
-      return item
-    }
-
-    if (item.type === 'object' && Array.isArray(item.value)) {
-      return this.convertBuilderDataToJson(item.value)
-    }
-
-    if (item.type === 'array' && Array.isArray(item.value)) {
-      return item.value.map((subItem: any) =>
-        typeof subItem === 'object' && subItem.type ? subItem.value : subItem
-      )
-    }
-
-    return item.value
-  }
-
-  private convertNumberValue(value: any): any {
-    if (this.isVariableReference(value)) {
-      return value
-    }
-
-    const numValue = Number(value)
-    return Number.isNaN(numValue) ? value : numValue
-  }
-
-  private convertBooleanValue(value: any): any {
-    if (this.isVariableReference(value)) {
-      return value
-    }
-
-    return value === 'true' || value === true
-  }
-
-  private tryParseJson(jsonString: string, fallback: any): any {
-    try {
-      return JSON.parse(jsonString)
-    } catch {
-      return fallback
-    }
-  }
-
-  private isVariableReference(value: any): boolean {
-    return typeof value === 'string' && value.trim().startsWith('<') && value.trim().includes('>')
-  }
-
-  private parseObjectStrings(data: any): any {
-    if (typeof data === 'string') {
-      // Try to parse strings that might be JSON objects
-      try {
-        const parsed = JSON.parse(data)
-        if (typeof parsed === 'object' && parsed !== null) {
-          return this.parseObjectStrings(parsed) // Recursively parse nested objects
-        }
-        return parsed
-      } catch {
-        return data // Return as string if not valid JSON
-      }
-    } else if (Array.isArray(data)) {
-      return data.map((item) => this.parseObjectStrings(item))
-    } else if (typeof data === 'object' && data !== null) {
-      const result: any = {}
-      for (const [key, value] of Object.entries(data)) {
-        result[key] = this.parseObjectStrings(value)
-      }
-      return result
-    }
-    return data
+  static convertBuilderDataToJsonString(builderData: any[]): string {
+    return convertBuilderDataToJsonString(builderData)
   }
 
   private parseStatus(status?: string): number {
-    if (!status) return 200
+    if (!status) return HTTP.STATUS.OK
     const parsed = Number(status)
     if (Number.isNaN(parsed) || parsed < 100 || parsed > 599) {
-      return 200
+      return HTTP.STATUS.OK
     }
     return parsed
   }
@@ -261,7 +95,7 @@ export class ResponseBlockHandler implements BlockHandler {
       cells: { Key: string; Value: string }
     }[]
   ): Record<string, string> {
-    const defaultHeaders = { 'Content-Type': 'application/json' }
+    const defaultHeaders = { 'Content-Type': HTTP.CONTENT_TYPE.JSON }
     if (!headers) return defaultHeaders
 
     const headerObj = headers.reduce((acc: Record<string, string>, header) => {

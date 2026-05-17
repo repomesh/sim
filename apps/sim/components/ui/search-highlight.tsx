@@ -1,5 +1,3 @@
-'use client'
-
 interface SearchHighlightProps {
   text: string
   searchQuery: string
@@ -11,7 +9,6 @@ export function SearchHighlight({ text, searchQuery, className = '' }: SearchHig
     return <span className={className}>{text}</span>
   }
 
-  // Create regex pattern for all search terms
   const searchTerms = searchQuery
     .trim()
     .split(/\s+/)
@@ -35,7 +32,7 @@ export function SearchHighlight({ text, searchQuery, className = '' }: SearchHig
         return isMatch ? (
           <span
             key={index}
-            className='bg-yellow-200 text-yellow-900 dark:bg-yellow-900/50 dark:text-yellow-200'
+            className='bg-[var(--highlight-match-bg)] text-[var(--highlight-match-text)]'
           >
             {part}
           </span>

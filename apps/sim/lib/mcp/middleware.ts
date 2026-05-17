@@ -1,24 +1,27 @@
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
 import type { NextRequest, NextResponse } from 'next/server'
-import { checkHybridAuth } from '@/lib/auth/hybrid'
-import { createLogger } from '@/lib/logs/console/logger'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
 import { createMcpErrorResponse } from '@/lib/mcp/utils'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
-import { generateRequestId } from '@/lib/utils'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('McpAuthMiddleware')
 
 export type McpPermissionLevel = 'read' | 'write' | 'admin'
 
-export interface McpAuthContext {
+interface McpAuthContext {
   userId: string
+  userName?: string | null
+  userEmail?: string | null
   workspaceId: string
   requestId: string
 }
 
-export type McpRouteHandler = (
+export type McpRouteHandler<TParams = Record<string, string>> = (
   request: NextRequest,
   context: McpAuthContext,
-  ...args: any[]
+  routeContext: { params: Promise<TParams> }
 ) => Promise<NextResponse>
 
 interface AuthResult {
@@ -43,7 +46,7 @@ async function validateMcpAuth(
   const requestId = generateRequestId()
 
   try {
-    const auth = await checkHybridAuth(request, { requireWorkflowId: false })
+    const auth = await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
     if (!auth.success || !auth.userId) {
       logger.warn(`[${requestId}] Authentication failed: ${auth.error}`)
       return {
@@ -69,9 +72,7 @@ async function validateMcpAuth(
           workspaceId = body.workspaceId
           ;(request as any)._parsedBody = body
         }
-      } catch (error) {
-        logger.debug(`[${requestId}] Could not parse request body for workspaceId extraction`)
-      }
+      } catch {}
     }
 
     if (!workspaceId) {
@@ -114,6 +115,8 @@ async function validateMcpAuth(
       success: true,
       context: {
         userId: auth.userId,
+        userName: auth.userName,
+        userEmail: auth.userEmail,
         workspaceId,
         requestId,
       },
@@ -123,7 +126,7 @@ async function validateMcpAuth(
     return {
       success: false,
       errorResponse: createMcpErrorResponse(
-        error instanceof Error ? error : new Error('Authentication validation failed'),
+        toError(error),
         'Authentication validation failed',
         500
       ),
@@ -170,11 +173,13 @@ function getPermissionErrorMessage(permissionLevel: McpPermissionLevel): string 
  * @returns Middleware wrapper function
  *
  */
-export function withMcpAuth(permissionLevel: McpPermissionLevel = 'read') {
-  return function middleware(handler: McpRouteHandler) {
+export function withMcpAuth<TParams = Record<string, string>>(
+  permissionLevel: McpPermissionLevel = 'read'
+) {
+  return function middleware(handler: McpRouteHandler<TParams>) {
     return async function wrappedHandler(
       request: NextRequest,
-      ...args: any[]
+      routeContext: { params: Promise<TParams> }
     ): Promise<NextResponse> {
       const authResult = await validateMcpAuth(request, permissionLevel)
 
@@ -183,17 +188,13 @@ export function withMcpAuth(permissionLevel: McpPermissionLevel = 'read') {
       }
 
       try {
-        return await handler(request, (authResult as AuthResult).context, ...args)
+        return await handler(request, (authResult as AuthResult).context, routeContext)
       } catch (error) {
         logger.error(
           `[${(authResult as AuthResult).context.requestId}] Error in MCP route handler:`,
           error
         )
-        return createMcpErrorResponse(
-          error instanceof Error ? error : new Error('Internal server error'),
-          'Internal server error',
-          500
-        )
+        return createMcpErrorResponse(toError(error), 'Internal server error', 500)
       }
     }
   }

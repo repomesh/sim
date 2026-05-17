@@ -1,77 +1,29 @@
 'use client'
 
-import { type KeyboardEvent, useEffect, useState } from 'react'
+import { useState } from 'react'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
 import { Eye, EyeOff } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { createLogger } from '@/lib/logs/console/logger'
-import { cn } from '@/lib/utils'
-import Nav from '@/app/(landing)/components/nav/nav'
-import { inter } from '@/app/fonts/inter'
-import { soehne } from '@/app/fonts/soehne/soehne'
+import { Input, Label, Loader } from '@/components/emcn'
+import { cn } from '@/lib/core/utils/cn'
+import AuthBackground from '@/app/(auth)/components/auth-background'
+import { AUTH_SUBMIT_BTN } from '@/app/(auth)/components/auth-button-classes'
+import { SupportFooter } from '@/app/(auth)/components/support-footer'
+import Navbar from '@/app/(landing)/components/navbar/navbar'
+import { useChatPasswordAuth } from '@/hooks/queries/chats'
 
 const logger = createLogger('PasswordAuth')
 
 interface PasswordAuthProps {
   identifier: string
-  onAuthSuccess: () => void
-  title?: string
-  primaryColor?: string
 }
 
-export default function PasswordAuth({
-  identifier,
-  onAuthSuccess,
-  title = 'chat',
-  primaryColor = 'var(--brand-primary-hover-hex)',
-}: PasswordAuthProps) {
-  // Password auth state
+export default function PasswordAuth({ identifier }: PasswordAuthProps) {
   const [password, setPassword] = useState('')
-  const [authError, setAuthError] = useState<string | null>(null)
-  const [isAuthenticating, setIsAuthenticating] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [showValidationError, setShowValidationError] = useState(false)
   const [passwordErrors, setPasswordErrors] = useState<string[]>([])
-  const [buttonClass, setButtonClass] = useState('auth-button-gradient')
-
-  useEffect(() => {
-    // Check if CSS variable has been customized
-    const checkCustomBrand = () => {
-      const computedStyle = getComputedStyle(document.documentElement)
-      const brandAccent = computedStyle.getPropertyValue('--brand-accent-hex').trim()
-
-      // Check if the CSS variable exists and is different from the default
-      if (brandAccent && brandAccent !== '#6f3dfa') {
-        setButtonClass('auth-button-custom')
-      } else {
-        setButtonClass('auth-button-gradient')
-      }
-    }
-
-    checkCustomBrand()
-
-    // Also check on window resize or theme changes
-    window.addEventListener('resize', checkCustomBrand)
-    const observer = new MutationObserver(checkCustomBrand)
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['style', 'class'],
-    })
-
-    return () => {
-      window.removeEventListener('resize', checkCustomBrand)
-      observer.disconnect()
-    }
-  }, [])
-
-  // Handle keyboard input for auth forms
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      handleAuthenticate()
-    }
-  }
+  const authenticate = useChatPasswordAuth(identifier)
 
   const handlePasswordChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newPassword = e.target.value
@@ -80,7 +32,6 @@ export default function PasswordAuth({
     setPasswordErrors([])
   }
 
-  // Handle authentication
   const handleAuthenticate = async () => {
     if (!password.trim()) {
       setPasswordErrors(['Password is required'])
@@ -88,125 +39,114 @@ export default function PasswordAuth({
       return
     }
 
-    setAuthError(null)
-    setIsAuthenticating(true)
-
     try {
-      const payload = { password }
-
-      const response = await fetch(`/api/chat/${identifier}`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: JSON.stringify(payload),
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        setPasswordErrors([errorData.error || 'Invalid password. Please try again.'])
-        setShowValidationError(true)
-        return
-      }
-
-      // Authentication successful, notify parent
-      onAuthSuccess()
-
-      // Reset auth state
+      await authenticate.mutateAsync({ password })
       setPassword('')
     } catch (error) {
       logger.error('Authentication error:', error)
-      setPasswordErrors(['An error occurred during authentication'])
+      setPasswordErrors([toError(error).message || 'Invalid password. Please try again.'])
       setShowValidationError(true)
-    } finally {
-      setIsAuthenticating(false)
     }
   }
 
   return (
-    <div className='bg-white'>
-      <Nav variant='auth' />
-      <div className='flex min-h-[calc(100vh-120px)] items-center justify-center px-4'>
-        <div className='w-full max-w-[410px]'>
-          <div className='flex flex-col items-center justify-center'>
-            {/* Header */}
-            <div className='space-y-1 text-center'>
-              <h1
-                className={`${soehne.className} font-medium text-[32px] text-black tracking-tight`}
-              >
-                Password Required
-              </h1>
-              <p className={`${inter.className} font-[380] text-[16px] text-muted-foreground`}>
-                This chat is password-protected
-              </p>
-            </div>
+    <AuthBackground className='dark font-[430] font-season'>
+      <main className='relative flex min-h-full flex-col text-[var(--landing-text)]'>
+        <header className='shrink-0 bg-[var(--landing-bg)]'>
+          <Navbar logoOnly />
+        </header>
+        <div className='relative z-30 flex flex-1 items-center justify-center px-4 pb-24'>
+          <div className='w-full max-w-lg px-4'>
+            <div className='flex flex-col items-center justify-center'>
+              <div className='space-y-1 text-center'>
+                <h1 className='text-balance font-[430] font-season text-[40px] text-white leading-[110%] tracking-[-0.02em]'>
+                  Password Required
+                </h1>
+                <p className='font-[430] font-season text-[color-mix(in_srgb,var(--landing-text-subtle)_60%,transparent)] text-lg leading-[125%] tracking-[0.02em]'>
+                  This chat is password-protected
+                </p>
+              </div>
 
-            {/* Form */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                handleAuthenticate()
-              }}
-              className={`${inter.className} mt-8 w-full space-y-8`}
-            >
-              <div className='space-y-6'>
-                <div className='space-y-2'>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  handleAuthenticate()
+                }}
+                className='mt-8 w-full max-w-[410px] space-y-6'
+              >
+                <div className='space-y-6'>
                   <div className='flex items-center justify-between'>
                     <Label htmlFor='password'>Password</Label>
                   </div>
                   <div className='relative'>
-                    <Input
-                      id='password'
-                      name='password'
-                      required
-                      type={showPassword ? 'text' : 'password'}
-                      autoCapitalize='none'
-                      autoComplete='new-password'
-                      autoCorrect='off'
-                      placeholder='Enter password'
-                      value={password}
-                      onChange={handlePasswordChange}
-                      onKeyDown={handleKeyDown}
-                      className={cn(
-                        'rounded-[10px] pr-10 shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
-                        showValidationError &&
-                          passwordErrors.length > 0 &&
-                          'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
-                      )}
-                      autoFocus
-                    />
-                    <button
-                      type='button'
-                      onClick={() => setShowPassword(!showPassword)}
-                      className='-translate-y-1/2 absolute top-1/2 right-3 text-gray-500 transition hover:text-gray-700'
-                      aria-label={showPassword ? 'Hide password' : 'Show password'}
-                    >
-                      {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                    </button>
-                  </div>
-                  {showValidationError && passwordErrors.length > 0 && (
-                    <div className='mt-1 space-y-1 text-red-400 text-xs'>
-                      {passwordErrors.map((error, index) => (
-                        <p key={index}>{error}</p>
-                      ))}
+                    <div className='relative'>
+                      <Input
+                        id='password'
+                        name='password'
+                        required
+                        type={showPassword ? 'text' : 'password'}
+                        autoCapitalize='none'
+                        autoComplete='new-password'
+                        autoCorrect='off'
+                        placeholder='Enter password'
+                        value={password}
+                        onChange={handlePasswordChange}
+                        className={cn(
+                          'pr-10',
+                          showValidationError &&
+                            passwordErrors.length > 0 &&
+                            'border-red-500 focus:border-red-500'
+                        )}
+                      />
+                      <button
+                        type='button'
+                        onClick={() => setShowPassword(!showPassword)}
+                        className='-translate-y-1/2 absolute top-1/2 right-3 text-[var(--landing-text-muted)] hover:text-[var(--landing-text)]'
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      >
+                        {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                      </button>
                     </div>
-                  )}
+                    <div
+                      className={cn(
+                        'absolute right-0 left-0 z-10 grid transition-[grid-template-rows] duration-200 ease-out',
+                        showValidationError && passwordErrors.length > 0
+                          ? 'grid-rows-[1fr]'
+                          : 'grid-rows-[0fr]'
+                      )}
+                      aria-live='polite'
+                    >
+                      <div className='overflow-hidden'>
+                        <div className='mt-1 space-y-1 text-red-400 text-xs'>
+                          {passwordErrors.map((error) => (
+                            <p key={error}>{error}</p>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
 
-              <Button
-                type='submit'
-                className={`${buttonClass} flex w-full items-center justify-center gap-2 rounded-[10px] border font-medium text-[15px] text-white transition-all duration-200`}
-                disabled={isAuthenticating}
-              >
-                {isAuthenticating ? 'Authenticating...' : 'Continue'}
-              </Button>
-            </form>
+                <button
+                  type='submit'
+                  disabled={!password.trim() || authenticate.isPending}
+                  className={AUTH_SUBMIT_BTN}
+                >
+                  {authenticate.isPending ? (
+                    <span className='flex items-center gap-2'>
+                      <Loader className='size-4' animate />
+                      Authenticating…
+                    </span>
+                  ) : (
+                    'Continue'
+                  )}
+                </button>
+              </form>
+            </div>
           </div>
         </div>
-      </div>
-    </div>
+        <SupportFooter position='absolute' />
+      </main>
+    </AuthBackground>
   )
 }

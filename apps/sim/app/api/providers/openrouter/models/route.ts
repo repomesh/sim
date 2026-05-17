@@ -1,15 +1,50 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
+import {
+  openRouterUpstreamResponseSchema,
+  providerModelsResponseSchema,
+} from '@/lib/api/contracts/providers'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { filterBlacklistedModels, isProviderBlacklisted } from '@/providers/utils'
 
 const logger = createLogger('OpenRouterModelsAPI')
 
-export const dynamic = 'force-dynamic'
+interface OpenRouterModel {
+  id: string
+  context_length?: number
+  supported_parameters?: string[]
+  pricing?: {
+    prompt?: string
+    completion?: string
+  }
+}
 
-export async function GET(_request: NextRequest) {
+interface OpenRouterResponse {
+  data: OpenRouterModel[]
+}
+
+export interface OpenRouterModelInfo {
+  id: string
+  contextLength?: number
+  supportsStructuredOutputs?: boolean
+  supportsTools?: boolean
+  pricing?: {
+    input: number
+    output: number
+  }
+}
+
+export const GET = withRouteHandler(async (_request: NextRequest) => {
+  if (isProviderBlacklisted('openrouter')) {
+    logger.info('OpenRouter provider is blacklisted, returning empty models')
+    return NextResponse.json({ models: [], modelInfo: {} })
+  }
+
   try {
     const response = await fetch('https://openrouter.ai/api/v1/models', {
       headers: { 'Content-Type': 'application/json' },
-      cache: 'no-store',
+      next: { revalidate: 300 },
     })
 
     if (!response.ok) {
@@ -17,30 +52,51 @@ export async function GET(_request: NextRequest) {
         status: response.status,
         statusText: response.statusText,
       })
-      return NextResponse.json({ models: [] })
+      return NextResponse.json({ models: [], modelInfo: {} })
     }
 
-    const data = await response.json()
-    const models = Array.isArray(data?.data)
-      ? Array.from(
-          new Set(
-            data.data
-              .map((m: any) => m?.id)
-              .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
-              .map((id: string) => `openrouter/${id}`)
-          )
-        )
-      : []
+    const data: OpenRouterResponse = openRouterUpstreamResponseSchema.parse(await response.json())
+
+    const modelInfo: Record<string, OpenRouterModelInfo> = {}
+    const allModels: string[] = []
+
+    for (const model of data.data ?? []) {
+      const modelId = `openrouter/${model.id}`
+      allModels.push(modelId)
+
+      const supportedParams = model.supported_parameters ?? []
+      modelInfo[modelId] = {
+        id: modelId,
+        contextLength: model.context_length,
+        supportsStructuredOutputs: supportedParams.includes('structured_outputs'),
+        supportsTools: supportedParams.includes('tools'),
+        pricing: model.pricing
+          ? {
+              input: Number.parseFloat(model.pricing.prompt ?? '0') * 1000000,
+              output: Number.parseFloat(model.pricing.completion ?? '0') * 1000000,
+            }
+          : undefined,
+      }
+    }
+
+    const uniqueModels = Array.from(new Set(allModels))
+    const models = filterBlacklistedModels(uniqueModels)
+
+    const structuredOutputCount = Object.values(modelInfo).filter(
+      (m) => m.supportsStructuredOutputs
+    ).length
 
     logger.info('Successfully fetched OpenRouter models', {
       count: models.length,
+      filtered: uniqueModels.length - models.length,
+      withStructuredOutputs: structuredOutputCount,
     })
 
-    return NextResponse.json({ models })
+    return NextResponse.json(providerModelsResponseSchema.parse({ models, modelInfo }))
   } catch (error) {
     logger.error('Error fetching OpenRouter models', {
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: getErrorMessage(error, 'Unknown error'),
     })
-    return NextResponse.json({ models: [] })
+    return NextResponse.json({ models: [], modelInfo: {} })
   }
-}
+})

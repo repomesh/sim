@@ -1,4 +1,4 @@
-import type { BlockOutput, ParamType } from '@/blocks/types'
+import type { OutputFieldDefinition, ParamType } from '@/blocks/types'
 import type { Position } from '@/stores/workflows/workflow/types'
 
 export interface SerializedWorkflow {
@@ -25,10 +25,10 @@ export interface SerializedBlock {
   position: Position
   config: {
     tool: string
-    params: Record<string, any>
+    params: Record<string, unknown>
   }
   inputs: Record<string, ParamType>
-  outputs: Record<string, BlockOutput>
+  outputs: Record<string, OutputFieldDefinition>
   metadata?: {
     id: string
     name?: string
@@ -38,14 +38,18 @@ export interface SerializedBlock {
     color?: string
   }
   enabled: boolean
+  /** Canonical mode overrides from block.data (used by agent handler for tool param resolution) */
+  canonicalModes?: Record<string, 'basic' | 'advanced'>
 }
 
 export interface SerializedLoop {
   id: string
   nodes: string[]
   iterations: number
-  loopType?: 'for' | 'forEach' | 'while'
+  loopType?: 'for' | 'forEach' | 'while' | 'doWhile'
   forEachItems?: any[] | Record<string, any> | string // Items to iterate over or expression to evaluate
+  whileCondition?: string // JS expression that evaluates to boolean (for while loops)
+  doWhileCondition?: string // JS expression that evaluates to boolean (for do-while loops)
 }
 
 export interface SerializedParallel {
@@ -54,4 +58,5 @@ export interface SerializedParallel {
   distribution?: any[] | Record<string, any> | string // Items to distribute or expression to evaluate
   count?: number // Number of parallel executions for count-based parallel
   parallelType?: 'count' | 'collection' // Explicit parallel type to avoid inference bugs
+  batchSize?: number // Maximum number of branches to run concurrently per batch
 }

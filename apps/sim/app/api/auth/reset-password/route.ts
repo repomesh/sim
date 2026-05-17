@@ -1,19 +1,31 @@
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
+import { resetPasswordContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
 import { auth } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('PasswordResetAPI')
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
-    const body = await request.json()
-    const { token, newPassword } = body
+    const parsed = await parseRequest(
+      resetPasswordContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          logger.warn('Invalid password reset request data', { errors: error.issues })
+          const message = error.issues.map((e) => e.message).join(' ')
+          return NextResponse.json({ message }, { status: 400 })
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
 
-    if (!token || !newPassword) {
-      return NextResponse.json({ message: 'Token and new password are required' }, { status: 400 })
-    }
+    const { token, newPassword } = parsed.data.body
 
     await auth.api.resetPassword({
       body: {
@@ -37,4 +49,4 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
-}
+})

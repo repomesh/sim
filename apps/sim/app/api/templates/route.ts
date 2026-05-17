@@ -1,88 +1,39 @@
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import { db } from '@sim/db'
-import { templateStars, templates, workflow } from '@sim/db/schema'
+import {
+  templateCreators,
+  templateStars,
+  templates,
+  workflow,
+  workflowDeploymentVersion,
+} from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
+import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { and, desc, eq, ilike, or, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { v4 as uuidv4 } from 'uuid'
-import { z } from 'zod'
+import { createTemplateContract, listTemplatesContract } from '@/lib/api/contracts/templates'
+import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { canAccessTemplate, verifyEffectiveSuperUser } from '@/lib/templates/permissions'
+import {
+  extractRequiredCredentials,
+  sanitizeCredentials,
+} from '@/lib/workflows/credentials/credential-extractor'
+import type { WorkflowState } from '@/stores/workflows/workflow/types'
 
 const logger = createLogger('TemplatesAPI')
 
 export const revalidate = 0
 
-// Function to sanitize sensitive data from workflow state
-function sanitizeWorkflowState(state: any): any {
-  const sanitizedState = JSON.parse(JSON.stringify(state)) // Deep clone
-
-  if (sanitizedState.blocks) {
-    Object.values(sanitizedState.blocks).forEach((block: any) => {
-      if (block.subBlocks) {
-        Object.entries(block.subBlocks).forEach(([key, subBlock]: [string, any]) => {
-          // Clear OAuth credentials and API keys using regex patterns
-          if (
-            /credential|oauth|api[_-]?key|token|secret|auth|password|bearer/i.test(key) ||
-            /credential|oauth|api[_-]?key|token|secret|auth|password|bearer/i.test(
-              subBlock.type || ''
-            ) ||
-            /credential|oauth|api[_-]?key|token|secret|auth|password|bearer/i.test(
-              subBlock.value || ''
-            )
-          ) {
-            subBlock.value = ''
-          }
-        })
-      }
-
-      // Also clear from data field if present
-      if (block.data) {
-        Object.entries(block.data).forEach(([key, value]: [string, any]) => {
-          if (/credential|oauth|api[_-]?key|token|secret|auth|password|bearer/i.test(key)) {
-            block.data[key] = ''
-          }
-        })
-      }
-    })
-  }
-
-  return sanitizedState
+function sanitizeWorkflowState(state: Partial<WorkflowState> | null | undefined): unknown {
+  return sanitizeCredentials(state)
 }
 
-// Schema for creating a template
-const CreateTemplateSchema = z.object({
-  workflowId: z.string().min(1, 'Workflow ID is required'),
-  name: z.string().min(1, 'Name is required').max(100, 'Name must be less than 100 characters'),
-  description: z
-    .string()
-    .min(1, 'Description is required')
-    .max(500, 'Description must be less than 500 characters'),
-  author: z
-    .string()
-    .min(1, 'Author is required')
-    .max(100, 'Author must be less than 100 characters'),
-  category: z.string().min(1, 'Category is required'),
-  icon: z.string().min(1, 'Icon is required'),
-  color: z.string().regex(/^#[0-9A-F]{6}$/i, 'Color must be a valid hex color (e.g., #3972F6)'),
-  state: z.object({
-    blocks: z.record(z.any()),
-    edges: z.array(z.any()),
-    loops: z.record(z.any()),
-    parallels: z.record(z.any()),
-  }),
-})
-
-// Schema for query parameters
-const QueryParamsSchema = z.object({
-  category: z.string().optional(),
-  limit: z.coerce.number().optional().default(50),
-  offset: z.coerce.number().optional().default(0),
-  search: z.string().optional(),
-  workflowId: z.string().optional(),
-})
-
 // GET /api/templates - Retrieve templates
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
@@ -92,30 +43,76 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { searchParams } = new URL(request.url)
-    const params = QueryParamsSchema.parse(Object.fromEntries(searchParams.entries()))
+    const parsed = await parseRequest(listTemplatesContract, request, {})
+    if (!parsed.success) return parsed.response
+    const params = parsed.data.query
 
-    logger.debug(`[${requestId}] Fetching templates with params:`, params)
+    // Check if user is a super user
+    const { effectiveSuperUser } = await verifyEffectiveSuperUser(session.user.id)
+    const isSuperUser = effectiveSuperUser
 
     // Build query conditions
     const conditions = []
 
-    // Apply category filter if provided
-    if (params.category) {
-      conditions.push(eq(templates.category, params.category))
+    // Apply workflow filter if provided (for getting template by workflow)
+    // When fetching by workflowId, we want to get the template regardless of status
+    // This is used by the deploy modal to check if a template exists
+    if (params.workflowId) {
+      const authorization = await authorizeWorkflowByWorkspacePermission({
+        workflowId: params.workflowId,
+        userId: session.user.id,
+        action: 'write',
+      })
+      if (!authorization.allowed) {
+        return NextResponse.json(
+          {
+            data: [],
+            pagination: {
+              total: 0,
+              limit: params.limit,
+              offset: params.offset,
+              page: 1,
+              totalPages: 0,
+            },
+          },
+          { status: 200 }
+        )
+      }
+      conditions.push(eq(templates.workflowId, params.workflowId))
+    } else {
+      // Apply status filter - only approved templates for non-super users
+      if (params.status) {
+        if (!isSuperUser && params.status !== 'approved') {
+          return NextResponse.json(
+            {
+              data: [],
+              pagination: {
+                total: 0,
+                limit: params.limit,
+                offset: params.offset,
+                page: 1,
+                totalPages: 0,
+              },
+            },
+            { status: 200 }
+          )
+        }
+        conditions.push(eq(templates.status, params.status))
+      } else if (!isSuperUser || !params.includeAllStatuses) {
+        // Non-super users and super users without includeAllStatuses flag see only approved templates
+        conditions.push(eq(templates.status, 'approved'))
+      }
     }
 
     // Apply search filter if provided
     if (params.search) {
       const searchTerm = `%${params.search}%`
       conditions.push(
-        or(ilike(templates.name, searchTerm), ilike(templates.description, searchTerm))
+        or(
+          ilike(templates.name, searchTerm),
+          sql`${templates.details}->>'tagline' ILIKE ${searchTerm}`
+        )
       )
-    }
-
-    // Apply workflow filter if provided (for getting template by workflow)
-    if (params.workflowId) {
-      conditions.push(eq(templates.workflowId, params.workflowId))
     }
 
     // Combine conditions
@@ -126,25 +123,27 @@ export async function GET(request: NextRequest) {
       .select({
         id: templates.id,
         workflowId: templates.workflowId,
-        userId: templates.userId,
         name: templates.name,
-        description: templates.description,
-        author: templates.author,
+        details: templates.details,
+        creatorId: templates.creatorId,
+        creator: templateCreators,
         views: templates.views,
         stars: templates.stars,
-        color: templates.color,
-        icon: templates.icon,
-        category: templates.category,
+        status: templates.status,
+        tags: templates.tags,
+        requiredCredentials: templates.requiredCredentials,
         state: templates.state,
         createdAt: templates.createdAt,
         updatedAt: templates.updatedAt,
         isStarred: sql<boolean>`CASE WHEN ${templateStars.id} IS NOT NULL THEN true ELSE false END`,
+        isSuperUser: sql<boolean>`${isSuperUser}`, // Include super user status in response
       })
       .from(templates)
       .leftJoin(
         templateStars,
         and(eq(templateStars.templateId, templates.id), eq(templateStars.userId, session.user.id))
       )
+      .leftJoin(templateCreators, eq(templates.creatorId, templateCreators.id))
       .where(whereCondition)
       .orderBy(desc(templates.views), desc(templates.createdAt))
       .limit(params.limit)
@@ -156,36 +155,45 @@ export async function GET(request: NextRequest) {
       .from(templates)
       .where(whereCondition)
 
-    const total = totalCount[0]?.count || 0
+    const total = Number(totalCount[0]?.count ?? 0)
 
-    logger.info(`[${requestId}] Successfully retrieved ${results.length} templates`)
+    const visibleResults =
+      params.workflowId && !isSuperUser
+        ? (
+            await Promise.all(
+              results.map(async (template) => {
+                if (template.status === 'approved') {
+                  return template
+                }
+                const access = await canAccessTemplate(template.id, session.user.id)
+                return access.allowed ? template : null
+              })
+            )
+          ).filter((template): template is (typeof results)[number] => template !== null)
+        : results
+
+    logger.info(`[${requestId}] Successfully retrieved ${visibleResults.length} templates`)
 
     return NextResponse.json({
-      data: results,
+      data: visibleResults,
       pagination: {
-        total,
+        total: params.workflowId && !isSuperUser ? visibleResults.length : total,
         limit: params.limit,
         offset: params.offset,
         page: Math.floor(params.offset / params.limit) + 1,
-        totalPages: Math.ceil(total / params.limit),
+        totalPages: Math.ceil(
+          (params.workflowId && !isSuperUser ? visibleResults.length : total) / params.limit
+        ),
       },
     })
-  } catch (error: any) {
-    if (error instanceof z.ZodError) {
-      logger.warn(`[${requestId}] Invalid query parameters`, { errors: error.errors })
-      return NextResponse.json(
-        { error: 'Invalid query parameters', details: error.errors },
-        { status: 400 }
-      )
-    }
-
+  } catch (error) {
     logger.error(`[${requestId}] Error fetching templates`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})
 
 // POST /api/templates - Create a new template
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
@@ -195,47 +203,103 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const body = await request.json()
-    const data = CreateTemplateSchema.parse(body)
+    const parsed = await parseRequest(createTemplateContract, request, {})
+    if (!parsed.success) return parsed.response
+    const data = parsed.data.body
 
-    logger.debug(`[${requestId}] Creating template:`, {
-      name: data.name,
-      category: data.category,
+    const workflowAuthorization = await authorizeWorkflowByWorkspacePermission({
       workflowId: data.workflowId,
+      userId: session.user.id,
+      action: 'write',
     })
 
-    // Verify the workflow exists and belongs to the user
-    const workflowExists = await db
-      .select({ id: workflow.id })
-      .from(workflow)
-      .where(eq(workflow.id, data.workflowId))
-      .limit(1)
-
-    if (workflowExists.length === 0) {
+    if (!workflowAuthorization.workflow) {
       logger.warn(`[${requestId}] Workflow not found: ${data.workflowId}`)
       return NextResponse.json({ error: 'Workflow not found' }, { status: 404 })
     }
 
-    // Create the template
-    const templateId = uuidv4()
+    if (!workflowAuthorization.allowed) {
+      logger.warn(`[${requestId}] User denied permission to template workflow ${data.workflowId}`)
+      return NextResponse.json(
+        { error: workflowAuthorization.message || 'Access denied' },
+        { status: workflowAuthorization.status || 403 }
+      )
+    }
+
+    const { verifyCreatorPermission } = await import('@/lib/templates/permissions')
+    const { hasPermission, error: permissionError } = await verifyCreatorPermission(
+      session.user.id,
+      data.creatorId,
+      'member'
+    )
+
+    if (!hasPermission) {
+      logger.warn(`[${requestId}] User cannot use creator profile: ${data.creatorId}`)
+      return NextResponse.json({ error: permissionError || 'Access denied' }, { status: 403 })
+    }
+
+    const templateId = generateId()
     const now = new Date()
 
-    // Sanitize the workflow state to remove sensitive credentials
-    const sanitizedState = sanitizeWorkflowState(data.state)
+    // Get the active deployment version for the workflow to copy its state
+    const activeVersion = await db
+      .select({
+        id: workflowDeploymentVersion.id,
+        state: workflowDeploymentVersion.state,
+      })
+      .from(workflowDeploymentVersion)
+      .where(
+        and(
+          eq(workflowDeploymentVersion.workflowId, data.workflowId),
+          eq(workflowDeploymentVersion.isActive, true)
+        )
+      )
+      .limit(1)
+
+    if (activeVersion.length === 0) {
+      logger.warn(
+        `[${requestId}] No active deployment version found for workflow: ${data.workflowId}`
+      )
+      return NextResponse.json(
+        { error: 'Workflow must be deployed before creating a template' },
+        { status: 400 }
+      )
+    }
+
+    // Ensure the state includes workflow variables (if not already included)
+    let stateWithVariables = activeVersion[0].state as Partial<WorkflowState> | null | undefined
+    if (stateWithVariables && !stateWithVariables.variables) {
+      // Fetch workflow variables if not in deployment version
+      const [workflowRecord] = await db
+        .select({ variables: workflow.variables })
+        .from(workflow)
+        .where(eq(workflow.id, data.workflowId))
+        .limit(1)
+
+      stateWithVariables = {
+        ...stateWithVariables,
+        variables: (workflowRecord?.variables as WorkflowState['variables']) || undefined,
+      }
+    }
+
+    // Extract credential requirements before sanitizing
+    const requiredCredentials = extractRequiredCredentials(stateWithVariables)
+
+    // Sanitize the workflow state to remove all credential values
+    const sanitizedState = sanitizeWorkflowState(stateWithVariables)
 
     const newTemplate = {
       id: templateId,
       workflowId: data.workflowId,
-      userId: session.user.id,
       name: data.name,
-      description: data.description || null,
-      author: data.author,
+      details: data.details || null,
+      creatorId: data.creatorId,
       views: 0,
       stars: 0,
-      color: data.color,
-      icon: data.icon,
-      category: data.category,
-      state: sanitizedState,
+      status: 'pending' as const, // All new templates start as pending
+      tags: data.tags || [],
+      requiredCredentials: requiredCredentials, // Store the extracted credential requirements
+      state: sanitizedState, // Store the sanitized state without credential values
       createdAt: now,
       updatedAt: now,
     }
@@ -244,23 +308,35 @@ export async function POST(request: NextRequest) {
 
     logger.info(`[${requestId}] Successfully created template: ${templateId}`)
 
+    recordAudit({
+      actorId: session.user.id,
+      actorName: session.user.name,
+      actorEmail: session.user.email,
+      action: AuditAction.TEMPLATE_CREATED,
+      resourceType: AuditResourceType.TEMPLATE,
+      resourceId: templateId,
+      resourceName: data.name,
+      description: `Created template "${data.name}"`,
+      metadata: {
+        templateName: data.name,
+        workflowId: data.workflowId,
+        creatorId: data.creatorId,
+        tags: data.tags,
+        tagline: data.details?.tagline || undefined,
+        status: 'pending',
+      },
+      request,
+    })
+
     return NextResponse.json(
       {
         id: templateId,
-        message: 'Template created successfully',
+        message: 'Template submitted for approval successfully',
       },
       { status: 201 }
     )
-  } catch (error: any) {
-    if (error instanceof z.ZodError) {
-      logger.warn(`[${requestId}] Invalid template data`, { errors: error.errors })
-      return NextResponse.json(
-        { error: 'Invalid template data', details: error.errors },
-        { status: 400 }
-      )
-    }
-
+  } catch (error) {
     logger.error(`[${requestId}] Error creating template`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

@@ -1,10 +1,16 @@
 import type { TraceSpan } from '@/lib/logs/types'
+import type { PermissionGroupConfig } from '@/lib/permission-groups/types'
 import type { BlockOutput } from '@/blocks/types'
+import type {
+  ChildWorkflowContext,
+  IterationContext,
+  ParentIteration,
+  SerializableExecutionState,
+} from '@/executor/execution/types'
+import type { RunFromBlockContext } from '@/executor/utils/run-from-block'
 import type { SerializedBlock, SerializedWorkflow } from '@/serializer/types'
+import type { SubflowType } from '@/stores/workflows/workflow/types'
 
-/**
- * User-facing file object with simplified interface
- */
 export interface UserFile {
   id: string
   name: string
@@ -12,143 +18,344 @@ export interface UserFile {
   size: number
   type: string
   key: string
-  uploadedAt: string
-  expiresAt: string
+  context?: string
+  base64?: string
+}
+
+export interface ParallelPauseScope {
+  parallelId: string
+  branchIndex: number
+  branchTotal?: number
+}
+
+export interface LoopPauseScope {
+  loopId: string
+  iteration: number
+}
+
+export type PauseKind = 'human' | 'time'
+
+export interface PauseMetadata {
+  contextId: string
+  blockId: string
+  response: any
+  timestamp: string
+  parallelScope?: ParallelPauseScope
+  loopScope?: LoopPauseScope
+  resumeLinks?: {
+    apiUrl: string
+    uiUrl: string
+    contextId: string
+    executionId: string
+    workflowId: string
+  }
+  pauseKind: PauseKind
+  /** ISO timestamp at which a `pauseKind: 'time'` pause becomes due for automatic resume. */
+  resumeAt?: string
+}
+
+export type ResumeStatus = 'paused' | 'resumed' | 'failed' | 'queued' | 'resuming'
+
+export interface PausePoint {
+  contextId: string
+  blockId?: string
+  response: any
+  registeredAt: string
+  resumeStatus: ResumeStatus
+  snapshotReady: boolean
+  parallelScope?: ParallelPauseScope
+  loopScope?: LoopPauseScope
+  resumeLinks?: {
+    apiUrl: string
+    uiUrl: string
+    contextId: string
+    executionId: string
+    workflowId: string
+  }
+  pauseKind: PauseKind
+  resumeAt?: string
+}
+
+export interface SerializedSnapshot {
+  snapshot: string
+  triggerIds: string[]
 }
 
 /**
- * Standardized block output format that ensures compatibility with the execution engine.
+ * Identifies a tool call emitted by a model iteration. Matches the
+ * `tool_call.id` convention used by OpenAI, Anthropic, and the OTel GenAI
+ * spec so tool segments can be correlated back to the iteration that issued
+ * them.
  */
+export interface IterationToolCall {
+  id: string
+  name: string
+  arguments: Record<string, unknown> | string
+}
+
+/**
+ * A single phase of provider execution (model call or tool invocation).
+ *
+ * Providers emit these per iteration. Model segments carry the assistant's
+ * output for that iteration (text, thinking, tool_calls, tokens, finish
+ * reason) so the trace reveals *why* each tool was invoked — not just that
+ * it was. All content fields are optional; providers fill in what they have.
+ */
+export interface ProviderTimingSegment {
+  type: 'model' | 'tool'
+  name?: string
+  startTime: number
+  endTime: number
+  duration: number
+  assistantContent?: string
+  thinkingContent?: string
+  toolCalls?: IterationToolCall[]
+  toolCallId?: string
+  finishReason?: string
+  tokens?: BlockTokens
+  /** Cost for this segment in USD, derived from tokens + model pricing. */
+  cost?: { input?: number; output?: number; total?: number }
+  /** Time-to-first-token in ms (streaming only; first segment typically). */
+  ttft?: number
+  /** Provider system identifier (anthropic, openai, gemini, etc.) — `gen_ai.system`. */
+  provider?: string
+  /** Structured error class (e.g. `rate_limit`, `context_length`). */
+  errorType?: string
+  /** Human-readable error message when this segment failed. */
+  errorMessage?: string
+}
+
+/** Timing info reported by an LLM provider for a single block execution. */
+interface BlockProviderTiming {
+  startTime: string
+  endTime: string
+  duration: number
+  modelTime?: number
+  toolsTime?: number
+  firstResponseTime?: number
+  iterations?: number
+  timeSegments?: ProviderTimingSegment[]
+}
+
+/** Cost breakdown from provider usage. */
+interface BlockCost {
+  input: number
+  output: number
+  total: number
+  toolCost?: number
+  pricing?: {
+    input: number
+    output: number
+    cachedInput?: number
+    updatedAt: string
+  }
+}
+
+/** Token usage from provider. `prompt`/`completion` are legacy aliases. */
+export interface BlockTokens {
+  input?: number
+  output?: number
+  total?: number
+  prompt?: number
+  completion?: number
+  /** Input tokens served from the provider's prompt cache. */
+  cacheRead?: number
+  /** Input tokens newly written to the provider's prompt cache. */
+  cacheWrite?: number
+  /** Output tokens consumed by reasoning/thinking (o-series, Claude, Gemini). */
+  reasoning?: number
+}
+
+/** A single tool invocation recorded by an agent-type block. */
+export interface BlockToolCall {
+  name: string
+  duration?: number
+  startTime?: string
+  endTime?: string
+  error?: string
+  arguments?: Record<string, unknown>
+  input?: Record<string, unknown>
+  result?: Record<string, unknown>
+  output?: Record<string, unknown>
+}
+
+/** Normalized tool-call container emitted by providers. */
+interface BlockToolCalls {
+  list: BlockToolCall[]
+  count: number
+}
+
 export interface NormalizedBlockOutput {
   [key: string]: any
-  // Content fields
-  content?: string // Text content from LLM responses
-  model?: string // Model identifier used for generation
-  tokens?: {
-    prompt?: number
-    completion?: number
-    total?: number
-  }
-  toolCalls?: {
-    list: any[]
-    count: number
-  }
-  // File fields
-  files?: UserFile[] // Binary files/attachments from this block
-  // Path selection fields
+  content?: string
+  model?: string
+  tokens?: BlockTokens
+  toolCalls?: BlockToolCalls
+  providerTiming?: BlockProviderTiming
+  cost?: BlockCost
+  files?: UserFile[]
   selectedPath?: {
     blockId: string
     blockType?: string
     blockTitle?: string
   }
-  selectedConditionId?: string // ID of selected condition
-  conditionResult?: boolean // Whether condition evaluated to true
-  // Generic result fields
-  result?: any // Generic result value
-  stdout?: string // Standard output from function execution
-  executionTime?: number // Time taken to execute
-  // API response fields
-  data?: any // Response data from API calls
-  status?: number // HTTP status code
-  headers?: Record<string, string> // HTTP headers
-  // Error handling
-  error?: string // Error message if block execution failed
-  // Child workflow introspection (for workflow blocks)
+  selectedOption?: string
+  conditionResult?: boolean
+  result?: any
+  stdout?: string
+  executionTime?: number
+  data?: any
+  status?: number
+  headers?: Record<string, string>
+  error?: string
   childTraceSpans?: TraceSpan[]
   childWorkflowName?: string
+  _pauseMetadata?: PauseMetadata
 }
 
-/**
- * Execution log entry for a single block.
- */
+export const EXECUTION_CONTROL_OUTPUT_FIELD_NAMES = [
+  'error',
+  'selectedOption',
+  'selectedRoute',
+  '_pauseMetadata',
+] as const
+
+export type ExecutionControlOutputFieldName = (typeof EXECUTION_CONTROL_OUTPUT_FIELD_NAMES)[number]
+
 export interface BlockLog {
-  blockId: string // Unique identifier of the executed block
-  blockName?: string // Display name of the block
-  blockType?: string // Type of the block (agent, router, etc.)
-  startedAt: string // ISO timestamp when execution started
-  endedAt: string // ISO timestamp when execution completed
-  durationMs: number // Duration of execution in milliseconds
-  success: boolean // Whether execution completed successfully
-  output?: any // Output data from successful execution
-  input?: any // Input data for the block execution
-  error?: string // Error message if execution failed
+  blockId: string
+  blockName?: string
+  blockType?: string
+  startedAt: string
+  endedAt: string
+  durationMs: number
+  success: boolean
+  output?: NormalizedBlockOutput
+  input?: Record<string, unknown>
+  error?: string
+  /** Whether this error was handled by an error handler path (error port) */
+  errorHandled?: boolean
+  loopId?: string
+  parallelId?: string
+  iterationIndex?: number
+  /** Full ancestor iteration chain for nested subflows (outermost → innermost). */
+  parentIterations?: ParentIteration[]
+  /**
+   * Monotonically increasing integer (1, 2, 3, ...) for accurate block ordering.
+   * Generated via getNextExecutionOrder() to ensure deterministic sorting.
+   */
+  executionOrder: number
+  /**
+   * Child workflow trace spans for nested workflow execution.
+   * Stored separately from output to keep output clean for display
+   * while preserving data for trace-spans processing.
+   */
+  childTraceSpans?: TraceSpan[]
 }
 
-/**
- * Timing metadata for workflow execution.
- */
-export interface ExecutionMetadata {
-  startTime?: string // ISO timestamp when workflow execution started
-  endTime?: string // ISO timestamp when workflow execution completed
-  duration: number // Duration of workflow execution in milliseconds
-  pendingBlocks?: string[] // List of block IDs that are pending execution
-  isDebugSession?: boolean // Whether the workflow is running in debug mode
-  context?: ExecutionContext // Runtime context for the workflow
-  workflowConnections?: Array<{ source: string; target: string }> // Connections between workflow blocks
+interface ExecutionMetadata {
+  requestId?: string
+  workflowId?: string
+  workspaceId?: string
+  startTime?: string
+  endTime?: string
+  duration: number
+  pendingBlocks?: string[]
+  isDebugSession?: boolean
+  context?: ExecutionContext
+  workflowConnections?: Array<{ source: string; target: string }>
+  credentialAccountUserId?: string
+  status?: 'running' | 'paused' | 'completed'
+  pausePoints?: string[]
+  resumeChain?: {
+    parentExecutionId?: string
+    depth: number
+  }
+  userId?: string
+  executionId?: string
+  triggerType?: string
+  triggerBlockId?: string
+  useDraftState?: boolean
+  resumeFromSnapshot?: boolean
+  resumeTerminalNoop?: boolean
 }
 
-/**
- * Current state of a block during workflow execution.
- */
 export interface BlockState {
-  output: NormalizedBlockOutput // Current output data from the block
-  executed: boolean // Whether the block has been executed
-  executionTime: number // Time taken to execute in milliseconds
+  output: NormalizedBlockOutput
+  executed: boolean
+  executionTime: number
 }
 
-/**
- * Runtime context for workflow execution.
- */
 export interface ExecutionContext {
-  workflowId: string // Unique identifier for this workflow execution
-  workspaceId?: string // Workspace ID for file storage scoping
-  executionId?: string // Unique execution ID for file storage scoping
-  // Whether this execution is running against deployed state (API/webhook/schedule/chat)
-  // Manual executions in the builder should leave this undefined/false
+  workflowId: string
+  workspaceId?: string
+  executionId?: string
+  largeValueExecutionIds?: string[]
+  allowLargeValueWorkflowScope?: boolean
+  userId?: string
   isDeployedContext?: boolean
-  blockStates: Map<string, BlockState>
-  blockLogs: BlockLog[] // Chronological log of block executions
-  metadata: ExecutionMetadata // Timing metadata for the execution
-  environmentVariables: Record<string, string> // Environment variables available during execution
-  workflowVariables?: Record<string, any> // Workflow variables available during execution
+  enforceCredentialAccess?: boolean
+  copilotToolExecution?: boolean
 
-  // Routing decisions for path determination
+  permissionConfig?: PermissionGroupConfig | null
+  permissionConfigLoaded?: boolean
+
+  blockStates: ReadonlyMap<string, BlockState>
+  executedBlocks: ReadonlySet<string>
+
+  blockLogs: BlockLog[]
+  metadata: ExecutionMetadata
+  environmentVariables: Record<string, string>
+  workflowVariables?: Record<string, any>
+
   decisions: {
-    router: Map<string, string> // Router block ID -> Target block ID
-    condition: Map<string, string> // Condition block ID -> Selected condition ID
+    router: Map<string, string>
+    condition: Map<string, string>
   }
 
-  loopIterations: Map<string, number> // Tracks current iteration count for each loop
-  loopItems: Map<string, any> // Tracks current item for forEach loops and parallel distribution
-  completedLoops: Set<string> // Tracks which loops have completed all iterations
+  completedLoops: Set<string>
 
-  // Parallel execution tracking
-  parallelExecutions?: Map<
+  /**
+   * Unified parent map for subflow nesting (loop-in-loop, parallel-in-parallel,
+   * loop-in-parallel, parallel-in-loop). Maps any child subflow ID to its parent
+   * subflow ID and type, enabling the iteration context builder to walk the full
+   * ancestor chain regardless of subflow type.
+   */
+  subflowParentMap?: Map<
     string,
-    {
-      parallelCount: number
-      distributionItems: any[] | Record<string, any> | null
-      completedExecutions: number
-      executionResults: Map<string, any>
-      activeIterations: Set<number>
-      currentIteration: number
-      parallelType?: 'count' | 'collection'
-    }
+    { parentId: string; parentType: SubflowType; branchIndex?: number }
   >
 
-  // Loop execution tracking
   loopExecutions?: Map<
     string,
     {
-      maxIterations: number
-      loopType: 'for' | 'forEach'
-      forEachItems?: any[] | Record<string, any> | null
-      executionResults: Map<string, any> // iteration_0, iteration_1, etc.
-      currentIteration: number
+      iteration: number
+      currentIterationOutputs: Map<string, any>
+      allIterationOutputs: any[][]
+      maxIterations?: number
+      item?: any
+      items?: any[]
+      condition?: string
+      skipFirstConditionCheck?: boolean
+      loopType?: 'for' | 'forEach' | 'while' | 'doWhile'
     }
   >
 
-  // Mapping for virtual parallel block IDs to their original blocks
+  parallelExecutions?: Map<
+    string,
+    {
+      parallelId: string
+      totalBranches: number
+      batchSize?: number
+      currentBatchStart?: number
+      currentBatchSize?: number
+      accumulatedOutputs?: Map<number, any[]>
+      branchOutputs: Map<number, any[]>
+      parallelType?: 'count' | 'collection'
+      items?: any[]
+    }
+  >
+
   parallelBlockMapping?: Map<
     string,
     {
@@ -158,62 +365,134 @@ export interface ExecutionContext {
     }
   >
 
-  // Current virtual block being executed (for parallel iterations)
   currentVirtualBlockId?: string
 
-  // Execution tracking
-  executedBlocks: Set<string> // Set of block IDs that have been executed
-  activeExecutionPath: Set<string> // Set of block IDs in the current execution path
+  activeExecutionPath: Set<string>
 
-  workflow?: SerializedWorkflow // Reference to the workflow being executed
+  workflow?: SerializedWorkflow
 
-  // Streaming support and output selection
-  stream?: boolean // Whether to use streaming responses when available
-  selectedOutputs?: string[] // IDs of blocks selected for streaming output
-  edges?: Array<{ source: string; target: string }> // Workflow edge connections
+  stream?: boolean
+  selectedOutputs?: string[]
+  edges?: Array<{ source: string; target: string }>
 
-  // New context extensions
-  onStream?: (streamingExecution: StreamingExecution) => Promise<string>
-  onBlockComplete?: (blockId: string, output: any) => Promise<void>
+  onStream?: (streamingExecution: StreamingExecution) => Promise<void>
+  onBlockStart?: (
+    blockId: string,
+    blockName: string,
+    blockType: string,
+    executionOrder: number,
+    iterationContext?: IterationContext,
+    childWorkflowContext?: ChildWorkflowContext
+  ) => Promise<void>
+  onBlockComplete?: (
+    blockId: string,
+    blockName: string,
+    blockType: string,
+    output: any,
+    iterationContext?: IterationContext,
+    childWorkflowContext?: ChildWorkflowContext
+  ) => Promise<void>
+
+  /** Context identifying this execution as a child of a workflow block */
+  childWorkflowContext?: ChildWorkflowContext
+
+  /** Fires immediately after instanceId is generated, before child execution begins. */
+  onChildWorkflowInstanceReady?: (
+    blockId: string,
+    childWorkflowInstanceId: string,
+    iterationContext?: IterationContext,
+    executionOrder?: number,
+    childWorkflowContext?: ChildWorkflowContext
+  ) => Promise<void>
+
+  /**
+   * AbortSignal for cancellation support.
+   * When the signal is aborted, execution should stop gracefully.
+   * This is triggered when the SSE client disconnects.
+   */
+  abortSignal?: AbortSignal
+
+  // Dynamically added nodes that need to be scheduled (e.g., from parallel expansion)
+  pendingDynamicNodes?: string[]
+
+  /**
+   * When true, UserFile objects in block outputs will be hydrated with base64 content
+   * before being stored in execution state. This ensures base64 is available for
+   * variable resolution in downstream blocks.
+   */
+  includeFileBase64?: boolean
+
+  /**
+   * Maximum file size in bytes for base64 hydration. Files larger than this limit
+   * will not have their base64 content fetched.
+   */
+  base64MaxBytes?: number
+
+  /**
+   * Context for "run from block" mode. When present, only blocks in dirtySet
+   * will be executed; others return cached outputs from the source snapshot.
+   */
+  runFromBlockContext?: RunFromBlockContext
+
+  /**
+   * Stop execution after this block completes. Used for "run until block" feature.
+   */
+  stopAfterBlockId?: string
+
+  /**
+   * Ordered list of workflow IDs in the current call chain, used for cycle detection.
+   * Passed to outgoing HTTP requests via the X-Sim-Via header.
+   */
+  callChain?: string[]
+
+  /**
+   * Counter for generating monotonically increasing execution order values.
+   * Starts at 0 and increments for each block. Use getNextExecutionOrder() to access.
+   */
+  executionOrderCounter?: { value: number }
 }
 
 /**
- * Complete result from executing a workflow.
+ * Gets the next execution order value for a block.
+ * Returns a simple incrementing integer (1, 2, 3, ...) for clear ordering.
  */
+export function getNextExecutionOrder(ctx: ExecutionContext): number {
+  if (!ctx.executionOrderCounter) {
+    ctx.executionOrderCounter = { value: 0 }
+  }
+  return ++ctx.executionOrderCounter.value
+}
+
 export interface ExecutionResult {
-  success: boolean // Whether the workflow executed successfully
-  output: NormalizedBlockOutput // Final output data from the workflow
-  error?: string // Error message if execution failed
-  logs?: BlockLog[] // Execution logs for all blocks
+  success: boolean
+  output: NormalizedBlockOutput
+  error?: string
+  logs?: BlockLog[]
+  executionState?: SerializableExecutionState
   metadata?: ExecutionMetadata
+  status?: 'completed' | 'paused' | 'cancelled'
+  pausePoints?: PausePoint[]
+  snapshotSeed?: SerializedSnapshot
   _streamingMetadata?: {
-    // Internal metadata for streaming execution
     loggingSession: any
     processedInput: any
   }
 }
 
-/**
- * Streaming execution result combining a readable stream with execution metadata.
- * This allows us to stream content to the UI while still capturing all execution logs.
- */
 export interface StreamingExecution {
-  stream: ReadableStream // The streaming response for the UI to consume
-  execution: ExecutionResult & { isStreaming?: boolean } // The complete execution data for logging purposes
+  stream: ReadableStream
+  execution: ExecutionResult & { isStreaming?: boolean }
+  /**
+   * Invoked with the assembled response text after the stream drains. Lets agent
+   * blocks persist the full response without interposing a TransformStream on a
+   * fetch-backed source — that pattern amplifies memory on Bun via #28035.
+   */
+  onFullContent?: (content: string) => void | Promise<void>
 }
 
-/**
- * Interface for a block executor component.
- */
-export interface BlockExecutor {
-  /**
-   * Determines if this executor can process the given block.
-   */
+interface BlockExecutor {
   canExecute(block: SerializedBlock): boolean
 
-  /**
-   * Executes the block with the given inputs and context.
-   */
   execute(
     block: SerializedBlock,
     inputs: Record<string, any>,
@@ -221,65 +500,54 @@ export interface BlockExecutor {
   ): Promise<BlockOutput>
 }
 
-/**
- * Interface for block handlers that execute specific block types.
- * Each handler is responsible for executing a particular type of block.
- */
 export interface BlockHandler {
-  /**
-   * Determines if this handler can process the given block.
-   *
-   * @param block - Block to check
-   * @returns True if this handler can process the block
-   */
   canHandle(block: SerializedBlock): boolean
 
-  /**
-   * Executes the block with the given inputs and context.
-   *
-   * @param block - Block to execute
-   * @param inputs - Resolved input parameters
-   * @param context - Current execution context
-   * @returns Block execution output or StreamingExecution for streaming
-   */
   execute(
+    ctx: ExecutionContext,
+    block: SerializedBlock,
+    inputs: Record<string, any>
+  ): Promise<BlockOutput | StreamingExecution>
+
+  executeWithNode?: (
+    ctx: ExecutionContext,
     block: SerializedBlock,
     inputs: Record<string, any>,
-    context: ExecutionContext
-  ): Promise<BlockOutput | StreamingExecution>
+    nodeMetadata: {
+      nodeId: string
+      loopId?: string
+      parallelId?: string
+      branchIndex?: number
+      branchTotal?: number
+      originalBlockId?: string
+      isLoopNode?: boolean
+      executionOrder?: number
+    }
+  ) => Promise<BlockOutput | StreamingExecution>
 }
 
-/**
- * Definition of a tool that can be invoked by blocks.
- *
- * @template P - Parameter type for the tool
- * @template O - Output type from the tool
- */
-export interface Tool<P = any, O = Record<string, any>> {
-  id: string // Unique identifier for the tool
-  name: string // Display name of the tool
-  description: string // Description of what the tool does
-  version: string // Version string for the tool
+interface Tool<P = any, O = Record<string, any>> {
+  id: string
+  name: string
+  description: string
+  version: string
 
-  // Parameter definitions for the tool
   params: {
     [key: string]: {
-      type: string // Data type of the parameter
-      required?: boolean // Whether the parameter is required
-      description?: string // Description of the parameter
-      default?: any // Default value if not provided
+      type: string
+      required?: boolean
+      description?: string
+      default?: any
     }
   }
 
-  // HTTP request configuration for API tools
   request?: {
-    url?: string | ((params: P) => string) // URL or function to generate URL
-    method?: string // HTTP method to use
-    headers?: (params: P) => Record<string, string> // Function to generate request headers
-    body?: (params: P) => Record<string, any> // Function to generate request body
+    url?: string | ((params: P) => string)
+    method?: string
+    headers?: (params: P) => Record<string, string>
+    body?: (params: P) => Record<string, any>
   }
 
-  // Function to transform API response to tool output
   transformResponse?: (response: any) => Promise<{
     success: boolean
     output: O
@@ -287,16 +555,10 @@ export interface Tool<P = any, O = Record<string, any>> {
   }>
 }
 
-/**
- * Registry of available tools indexed by ID.
- */
-export interface ToolRegistry {
+interface ToolRegistry {
   [key: string]: Tool
 }
 
-/**
- * Interface for a stream processor that can process a stream based on a response format.
- */
 export interface ResponseFormatStreamProcessor {
   processStream(
     originalStream: ReadableStream,

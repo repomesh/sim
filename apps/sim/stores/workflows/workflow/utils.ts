@@ -1,6 +1,69 @@
+import {
+  isWorkflowBlockAncestorLocked,
+  isWorkflowBlockProtected,
+} from '@sim/workflow-types/workflow'
+import type { Edge } from 'reactflow'
 import type { BlockState, Loop, Parallel } from '@/stores/workflows/workflow/types'
 
 const DEFAULT_LOOP_ITERATIONS = 5
+const DEFAULT_PARALLEL_BATCH_SIZE = 20
+const MAX_PARALLEL_BATCH_SIZE = 20
+
+export function clampParallelBatchSize(batchSize: unknown): number {
+  const parsed = typeof batchSize === 'number' ? batchSize : Number.parseInt(String(batchSize), 10)
+  if (Number.isNaN(parsed)) {
+    return DEFAULT_PARALLEL_BATCH_SIZE
+  }
+  return Math.max(1, Math.min(MAX_PARALLEL_BATCH_SIZE, parsed))
+}
+
+/**
+ * Check if adding an edge would create a cycle in the graph.
+ * Uses depth-first search to detect if the source node is reachable from the target node.
+ *
+ * @param edges - Current edges in the graph
+ * @param sourceId - Source node ID of the proposed edge
+ * @param targetId - Target node ID of the proposed edge
+ * @returns true if adding this edge would create a cycle
+ */
+export function wouldCreateCycle(edges: Edge[], sourceId: string, targetId: string): boolean {
+  if (sourceId === targetId) {
+    return true
+  }
+
+  const adjacencyList = new Map<string, string[]>()
+  for (const edge of edges) {
+    if (!adjacencyList.has(edge.source)) {
+      adjacencyList.set(edge.source, [])
+    }
+    adjacencyList.get(edge.source)!.push(edge.target)
+  }
+
+  const visited = new Set<string>()
+
+  function canReachSource(currentNode: string): boolean {
+    if (currentNode === sourceId) {
+      return true
+    }
+
+    if (visited.has(currentNode)) {
+      return false
+    }
+
+    visited.add(currentNode)
+
+    const neighbors = adjacencyList.get(currentNode) || []
+    for (const neighbor of neighbors) {
+      if (canReachSource(neighbor)) {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  return canReachSource(targetId)
+}
 
 /**
  * Convert UI loop block to executor Loop format
@@ -16,27 +79,21 @@ export function convertLoopBlockToLoop(
   const loopBlock = blocks[loopBlockId]
   if (!loopBlock || loopBlock.type !== 'loop') return undefined
 
-  // Parse collection if it's a string representation of an array/object
-  let forEachItems: any = loopBlock.data?.collection || ''
-  if (typeof forEachItems === 'string' && forEachItems.trim()) {
-    const trimmed = forEachItems.trim()
-    // Try to parse if it looks like JSON
-    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
-      try {
-        forEachItems = JSON.parse(trimmed)
-      } catch {
-        // Keep as string if parsing fails - will be evaluated at runtime
-      }
-    }
-  }
+  const loopType = loopBlock.data?.loopType || 'for'
 
-  return {
+  const loop: Loop = {
     id: loopBlockId,
     nodes: findChildNodes(loopBlockId, blocks),
     iterations: loopBlock.data?.count || DEFAULT_LOOP_ITERATIONS,
-    loopType: loopBlock.data?.loopType || 'for',
-    forEachItems,
+    loopType,
+    enabled: loopBlock.enabled,
   }
+
+  loop.forEachItems = loopBlock.data?.collection || ''
+  loop.whileCondition = loopBlock.data?.whileCondition || ''
+  loop.doWhileCondition = loopBlock.data?.doWhileCondition || ''
+
+  return loop
 }
 
 /**
@@ -53,20 +110,18 @@ export function convertParallelBlockToParallel(
   const parallelBlock = blocks[parallelBlockId]
   if (!parallelBlock || parallelBlock.type !== 'parallel') return undefined
 
-  // Get the parallel type from block data, defaulting to 'count' for consistency
   const parallelType = parallelBlock.data?.parallelType || 'count'
 
-  // Validate parallelType against allowed values
   const validParallelTypes = ['collection', 'count'] as const
   const validatedParallelType = validParallelTypes.includes(parallelType as any)
     ? parallelType
     : 'collection'
 
-  // Only set distribution if it's a collection-based parallel
   const distribution =
-    validatedParallelType === 'collection' ? parallelBlock.data?.collection || '' : ''
+    validatedParallelType === 'collection' ? parallelBlock.data?.collection || '' : undefined
 
   const count = parallelBlock.data?.count || 5
+  const batchSize = clampParallelBatchSize(parallelBlock.data?.batchSize)
 
   return {
     id: parallelBlockId,
@@ -74,6 +129,8 @@ export function convertParallelBlockToParallel(
     distribution,
     count,
     parallelType: validatedParallelType,
+    batchSize,
+    enabled: parallelBlock.enabled,
   }
 }
 
@@ -102,19 +159,44 @@ export function findAllDescendantNodes(
   blocks: Record<string, BlockState>
 ): string[] {
   const descendants: string[] = []
-  const findDescendants = (parentId: string) => {
-    const children = Object.values(blocks)
-      .filter((block) => block.data?.parentId === parentId)
-      .map((block) => block.id)
-
-    children.forEach((childId) => {
-      descendants.push(childId)
-      findDescendants(childId)
-    })
+  const visited = new Set<string>()
+  const stack = [containerId]
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (visited.has(current)) continue
+    visited.add(current)
+    for (const block of Object.values(blocks)) {
+      if (block.data?.parentId === current) {
+        descendants.push(block.id)
+        stack.push(block.id)
+      }
+    }
   }
-
-  findDescendants(containerId)
   return descendants
+}
+
+/**
+ * Checks if any ancestor container of a block is locked.
+ * Unlike {@link isBlockProtected}, this ignores the block's own locked state.
+ *
+ * @param blockId - The ID of the block to check
+ * @param blocks - Record of all blocks in the workflow
+ * @returns True if any ancestor is locked
+ */
+export function isAncestorProtected(blockId: string, blocks: Record<string, BlockState>): boolean {
+  return isWorkflowBlockAncestorLocked(blockId, blocks)
+}
+
+/**
+ * Checks if a block is protected from editing/deletion.
+ * A block is protected if it is locked or if any ancestor container is locked.
+ *
+ * @param blockId - The ID of the block to check
+ * @param blocks - Record of all blocks in the workflow
+ * @returns True if the block is protected
+ */
+export function isBlockProtected(blockId: string, blocks: Record<string, BlockState>): boolean {
+  return isWorkflowBlockProtected(blockId, blocks)
 }
 
 /**
@@ -126,7 +208,6 @@ export function findAllDescendantNodes(
 export function generateLoopBlocks(blocks: Record<string, BlockState>): Record<string, Loop> {
   const loops: Record<string, Loop> = {}
 
-  // Find all loop nodes
   Object.entries(blocks)
     .filter(([_, block]) => block.type === 'loop')
     .forEach(([id, block]) => {
@@ -150,7 +231,6 @@ export function generateParallelBlocks(
 ): Record<string, Parallel> {
   const parallels: Record<string, Parallel> = {}
 
-  // Find all parallel nodes
   Object.entries(blocks)
     .filter(([_, block]) => block.type === 'parallel')
     .forEach(([id, block]) => {

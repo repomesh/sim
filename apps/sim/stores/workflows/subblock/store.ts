@@ -1,8 +1,27 @@
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
 import { create } from 'zustand'
 import { devtools } from 'zustand/middleware'
+import { getBlock } from '@/blocks'
 import type { SubBlockConfig } from '@/blocks/types'
+import { populateTriggerFieldsFromConfig } from '@/hooks/use-trigger-config-aggregation'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
-import type { SubBlockStore } from '@/stores/workflows/subblock/types'
+import type { SubBlockStore, SubBlockValue } from '@/stores/workflows/subblock/types'
+import { isTriggerValid } from '@/triggers'
+
+const logger = createLogger('SubBlockStore')
+
+/**
+ * Stable empty fallback for `state.workflowValues[workflowId]` selectors.
+ * Using a module-level constant avoids returning a fresh `{}` on every
+ * selector call, which would defeat Zustand's `Object.is` equality.
+ */
+export const EMPTY_SUBBLOCK_VALUES: Record<string, Record<string, SubBlockValue>> = {}
+
+/**
+ * Stable empty fallback for a single block's sub-block values.
+ */
+export const EMPTY_BLOCK_SUBBLOCK_VALUES: Record<string, SubBlockValue> = {}
 
 /**
  * SubBlockState stores values for all subblocks in workflows
@@ -24,34 +43,29 @@ export const useSubBlockStore = create<SubBlockStore>()(
       const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
       if (!activeWorkflowId) return
 
-      // Validate and fix table data if needed
       let validatedValue = value
       if (Array.isArray(value)) {
-        // Check if this looks like table data (array of objects with cells)
         const isTableData =
           value.length > 0 &&
           value.some((item) => item && typeof item === 'object' && 'cells' in item)
 
         if (isTableData) {
-          console.log('Validating table data for subblock:', { blockId, subBlockId })
+          logger.debug('Validating table data for subblock', { blockId, subBlockId })
           validatedValue = value.map((row: any) => {
-            // Ensure each row has proper structure
             if (!row || typeof row !== 'object') {
-              console.warn('Fixing malformed table row:', row)
+              logger.warn('Fixing malformed table row', { blockId, subBlockId, row })
               return {
-                id: crypto.randomUUID(),
+                id: generateId(),
                 cells: { Key: '', Value: '' },
               }
             }
 
-            // Ensure row has an id
             if (!row.id) {
-              row.id = crypto.randomUUID()
+              row.id = generateId()
             }
 
-            // Ensure row has cells object
             if (!row.cells || typeof row.cells !== 'object') {
-              console.warn('Fixing malformed table row cells:', row)
+              logger.warn('Fixing malformed table row cells', { blockId, subBlockId, row })
               row.cells = { Key: '', Value: '' }
             }
 
@@ -72,9 +86,6 @@ export const useSubBlockStore = create<SubBlockStore>()(
           },
         },
       }))
-
-      // Trigger debounced sync to DB
-      get().syncWithDB()
     },
 
     getValue: (blockId: string, subBlockId: string) => {
@@ -94,13 +105,11 @@ export const useSubBlockStore = create<SubBlockStore>()(
           [activeWorkflowId]: {},
         },
       }))
-
-      // Note: Socket.IO handles real-time sync automatically
     },
 
     initializeFromWorkflow: (workflowId: string, blocks: Record<string, any>) => {
-      // Initialize from blocks
       const values: Record<string, Record<string, any>> = {}
+
       Object.entries(blocks).forEach(([blockId, block]) => {
         values[blockId] = {}
         Object.entries(block.subBlocks || {}).forEach(([subBlockId, subBlock]) => {
@@ -114,11 +123,47 @@ export const useSubBlockStore = create<SubBlockStore>()(
           [workflowId]: values,
         },
       }))
-    },
 
-    // Removed syncWithDB - Socket.IO handles real-time sync automatically
-    syncWithDB: () => {
-      // No-op: Socket.IO handles real-time sync
+      Object.entries(blocks).forEach(([blockId, block]) => {
+        const blockConfig = getBlock(block.type)
+        if (!blockConfig) return
+
+        const isTriggerBlock = blockConfig.category === 'triggers' || block.triggerMode === true
+        if (!isTriggerBlock) return
+
+        let triggerId: string | undefined
+        if (blockConfig.category === 'triggers') {
+          triggerId = block.type
+        } else if (block.triggerMode === true && blockConfig.triggers?.enabled) {
+          const selectedTriggerIdValue = block.subBlocks?.selectedTriggerId?.value
+          const triggerIdValue = block.subBlocks?.triggerId?.value
+          triggerId =
+            (typeof selectedTriggerIdValue === 'string' && isTriggerValid(selectedTriggerIdValue)
+              ? selectedTriggerIdValue
+              : undefined) ||
+            (typeof triggerIdValue === 'string' && isTriggerValid(triggerIdValue)
+              ? triggerIdValue
+              : undefined) ||
+            blockConfig.triggers?.available?.[0]
+        }
+
+        if (!triggerId || !isTriggerValid(triggerId)) {
+          return
+        }
+
+        const triggerConfigSubBlock = block.subBlocks?.triggerConfig
+        if (triggerConfigSubBlock?.value && typeof triggerConfigSubBlock.value === 'object') {
+          populateTriggerFieldsFromConfig(blockId, triggerConfigSubBlock.value, triggerId)
+        }
+      })
+    },
+    setWorkflowValues: (workflowId: string, values: Record<string, Record<string, any>>) => {
+      set((state) => ({
+        workflowValues: {
+          ...state.workflowValues,
+          [workflowId]: values,
+        },
+      }))
     },
   }))
 )

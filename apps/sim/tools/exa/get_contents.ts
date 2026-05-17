@@ -28,11 +28,56 @@ export const getContentsTool: ToolConfig<ExaGetContentsParams, ExaGetContentsRes
       visibility: 'user-or-llm',
       description: 'Query to guide the summary generation',
     },
+    subpages: {
+      type: 'number',
+      required: false,
+      visibility: 'user-only',
+      description: 'Number of subpages to crawl from the provided URLs',
+    },
+    subpageTarget: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Comma-separated keywords to target specific subpages (e.g., "docs,tutorial,about")',
+    },
+    highlights: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Include highlighted snippets in results (default: false)',
+    },
+    livecrawl: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Live crawling mode: never (default), fallback, always, or preferred (always try livecrawl, fall back to cache if fails)',
+    },
     apiKey: {
       type: 'string',
       required: true,
       visibility: 'user-only',
       description: 'Exa AI API Key',
+    },
+  },
+  hosting: {
+    envKeyPrefix: 'EXA_API_KEY',
+    apiKeyParam: 'apiKey',
+    byokProviderId: 'exa',
+    pricing: {
+      type: 'custom',
+      getCost: (_params, output) => {
+        const costDollars = output.__costDollars as { total?: number } | undefined
+        if (costDollars?.total == null) {
+          throw new Error('Exa get_contents response missing costDollars field')
+        }
+        return { cost: costDollars.total, metadata: { costDollars } }
+      },
+    },
+    rateLimit: {
+      mode: 'per_request',
+      requestsPerMinute: 10,
     },
   },
 
@@ -67,6 +112,28 @@ export const getContentsTool: ToolConfig<ExaGetContentsParams, ExaGetContentsRes
         }
       }
 
+      // Subpages crawling
+      if (params.subpages !== undefined) {
+        body.subpages = Number(params.subpages)
+      }
+
+      if (params.subpageTarget) {
+        body.subpageTarget = params.subpageTarget
+          .split(',')
+          .map((target: string) => target.trim())
+          .filter((target: string) => target.length > 0)
+      }
+
+      // Content options
+      if (params.highlights !== undefined) {
+        body.highlights = params.highlights
+      }
+
+      // Live crawl mode
+      if (params.livecrawl) {
+        body.livecrawl = params.livecrawl
+      }
+
       return body
     },
   },
@@ -82,7 +149,9 @@ export const getContentsTool: ToolConfig<ExaGetContentsParams, ExaGetContentsRes
           title: result.title || '',
           text: result.text || '',
           summary: result.summary || '',
+          highlights: result.highlights,
         })),
+        __costDollars: data.costDollars,
       },
     }
   },

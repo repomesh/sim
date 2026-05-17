@@ -1,4 +1,6 @@
+import { validateDatabaseIdentifier } from '@/lib/core/security/input-validation'
 import type { SupabaseDeleteParams, SupabaseDeleteResponse } from '@/tools/supabase/types'
+import { supabaseBaseUrl } from '@/tools/supabase/utils'
 import type { ToolConfig } from '@/tools/types'
 
 export const deleteTool: ToolConfig<SupabaseDeleteParams, SupabaseDeleteResponse> = {
@@ -20,6 +22,13 @@ export const deleteTool: ToolConfig<SupabaseDeleteParams, SupabaseDeleteResponse
       visibility: 'user-or-llm',
       description: 'The name of the Supabase table to delete from',
     },
+    schema: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Database schema to delete from (default: public). Use this to access tables in other schemas.',
+    },
     filter: {
       type: 'string',
       required: true,
@@ -36,10 +45,11 @@ export const deleteTool: ToolConfig<SupabaseDeleteParams, SupabaseDeleteResponse
 
   request: {
     url: (params) => {
-      // Construct the URL for the Supabase REST API with select to return deleted data
-      let url = `https://${params.projectId}.supabase.co/rest/v1/${params.table}?select=*`
+      const tableValidation = validateDatabaseIdentifier(params.table, 'table')
+      if (!tableValidation.isValid) throw new Error(tableValidation.error)
 
-      // Add filters (required for delete) - using PostgREST syntax
+      let url = `${supabaseBaseUrl(params.projectId)}/rest/v1/${encodeURIComponent(params.table)}?select=*`
+
       if (params.filter?.trim()) {
         url += `&${params.filter.trim()}`
       } else {
@@ -51,11 +61,17 @@ export const deleteTool: ToolConfig<SupabaseDeleteParams, SupabaseDeleteResponse
       return url
     },
     method: 'DELETE',
-    headers: (params) => ({
-      apikey: params.apiKey,
-      Authorization: `Bearer ${params.apiKey}`,
-      Prefer: 'return=representation',
-    }),
+    headers: (params) => {
+      const headers: Record<string, string> = {
+        apikey: params.apiKey,
+        Authorization: `Bearer ${params.apiKey}`,
+        Prefer: 'return=representation',
+      }
+      if (params.schema) {
+        headers['Content-Profile'] = params.schema
+      }
+      return headers
+    },
   },
 
   transformResponse: async (response: Response) => {

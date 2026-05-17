@@ -8,22 +8,6 @@ import { BlockInfoCard } from "@/components/ui/block-info-card"
 <BlockInfoCard 
   type="google_docs"
   color="#E0E0E0"
-  icon={true}
-  iconSvg={`<svg className="block-icon"
-      
-      xmlns='http://www.w3.org/2000/svg'
-      viewBox='0 0 48 48'
-      
-      
-    >
-      <path
-        fill='#2196f3'
-        d='M37,45H11c-1.657,0-3-1.343-3-3V6c0-1.657,1.343-3,3-3h19l10,10v29C40,43.657,38.657,45,37,45z'
-      />
-      <path fill='#bbdefb' d='M40 13L30 13 30 3z' />
-      <path fill='#1565c0' d='M30 13L40 23 40 13z' />
-      <path fill='#e3f2fd' d='M15 23H33V25H15zM15 27H33V29H15zM15 31H33V33H15zM15 35H25V37H15z' />
-    </svg>`}
 />
 
 {/* MANUAL-CONTENT-START:intro */}
@@ -118,27 +102,3 @@ import { BlockInfoCard } from "@/components/ui/block-info-card"
 | --------- | ---- | ----------- |
 | `updatedContent` | boolean | 表示文档内容是否成功更新 |
 | `metadata` | json | 更新后的文档元数据，包括 ID、标题和 URL |
-
-### `google_docs_create`
-
-创建一个新的 Google Docs 文档
-
-#### 输入
-
-| 参数 | 类型 | 必需 | 描述 |
-| --------- | ---- | -------- | ----------- |
-| `title` | string | 是 | 要创建的文档标题 |
-| `content` | string | 否 | 要创建的文档内容 |
-| `folderSelector` | string | 否 | 选择创建文档的文件夹 |
-| `folderId` | string | 否 | 创建文档的文件夹 ID（内部使用） |
-
-#### 输出
-
-| 参数 | 类型 | 描述 |
-| --------- | ---- | ----------- |
-| `metadata` | json | 创建的文档元数据，包括 ID、标题和 URL |
-
-## 注意事项
-
-- 类别：`tools`
-- 类型：`google_docs`

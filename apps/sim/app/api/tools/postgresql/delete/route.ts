@@ -1,34 +1,34 @@
-import { randomUUID } from 'crypto'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
+import { generateId } from '@sim/utils/id'
 import { type NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
-import { createLogger } from '@/lib/logs/console/logger'
+import { postgresqlDeleteContract } from '@/lib/api/contracts/tools/databases/postgresql'
+import { parseToolRequest } from '@/lib/api/server'
+import { checkInternalAuth } from '@/lib/auth/hybrid'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { createPostgresConnection, executeDelete } from '@/app/api/tools/postgresql/utils'
 
 const logger = createLogger('PostgreSQLDeleteAPI')
 
-const DeleteSchema = z.object({
-  host: z.string().min(1, 'Host is required'),
-  port: z.coerce.number().int().positive('Port must be a positive integer'),
-  database: z.string().min(1, 'Database name is required'),
-  username: z.string().min(1, 'Username is required'),
-  password: z.string().min(1, 'Password is required'),
-  ssl: z.enum(['disabled', 'required', 'preferred']).default('preferred'),
-  table: z.string().min(1, 'Table name is required'),
-  where: z.string().min(1, 'WHERE clause is required'),
-})
-
-export async function POST(request: NextRequest) {
-  const requestId = randomUUID().slice(0, 8)
+export const POST = withRouteHandler(async (request: NextRequest) => {
+  const requestId = generateId().slice(0, 8)
 
   try {
-    const body = await request.json()
-    const params = DeleteSchema.parse(body)
+    const auth = await checkInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      logger.warn(`[${requestId}] Unauthorized PostgreSQL delete attempt`)
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseToolRequest(postgresqlDeleteContract, request, { logger })
+    if (!parsed.success) return parsed.response
+    const params = parsed.data.body
 
     logger.info(
       `[${requestId}] Deleting data from ${params.table} on ${params.host}:${params.port}/${params.database}`
     )
 
-    const sql = createPostgresConnection({
+    const sql = await createPostgresConnection({
       host: params.host,
       port: params.port,
       database: params.database,
@@ -51,15 +51,7 @@ export async function POST(request: NextRequest) {
       await sql.end()
     }
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      logger.warn(`[${requestId}] Invalid request data`, { errors: error.errors })
-      return NextResponse.json(
-        { error: 'Invalid request data', details: error.errors },
-        { status: 400 }
-      )
-    }
-
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+    const errorMessage = getErrorMessage(error, 'Unknown error occurred')
     logger.error(`[${requestId}] PostgreSQL delete failed:`, error)
 
     return NextResponse.json(
@@ -67,4 +59,4 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
-}
+})

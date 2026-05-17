@@ -3,157 +3,113 @@
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest } from '@/app/api/__test-utils__/utils'
+import {
+  auditMock,
+  authMockFns,
+  createMockRequest,
+  dbChainMock,
+  dbChainMockFns,
+  resetDbChainMock,
+} from '@sim/testing'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { mockSyncAllWebhooksForCredentialSet } = vi.hoisted(() => ({
+  mockSyncAllWebhooksForCredentialSet: vi.fn().mockResolvedValue({}),
+}))
+
+vi.mock('@sim/db', () => dbChainMock)
+
+vi.mock('@/lib/webhooks/utils.server', () => ({
+  syncAllWebhooksForCredentialSet: mockSyncAllWebhooksForCredentialSet,
+}))
+
+vi.mock('@sim/audit', () => auditMock)
+
+import { POST } from '@/app/api/auth/oauth/disconnect/route'
 
 describe('OAuth Disconnect API Route', () => {
-  const mockGetSession = vi.fn()
-  const mockDb = {
-    delete: vi.fn().mockReturnThis(),
-    where: vi.fn(),
-  }
-  const mockLogger = {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }
-
-  const mockUUID = 'mock-uuid-12345678-90ab-cdef-1234-567890abcdef'
-
   beforeEach(() => {
-    vi.resetModules()
-
-    vi.stubGlobal('crypto', {
-      randomUUID: vi.fn().mockReturnValue(mockUUID),
-    })
-
-    vi.doMock('@/lib/auth', () => ({
-      getSession: mockGetSession,
-    }))
-
-    vi.doMock('@sim/db', () => ({
-      db: mockDb,
-    }))
-
-    vi.doMock('@sim/db/schema', () => ({
-      account: { userId: 'userId', providerId: 'providerId' },
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      and: vi.fn((...conditions) => ({ conditions, type: 'and' })),
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-      like: vi.fn((field, value) => ({ field, value, type: 'like' })),
-      or: vi.fn((...conditions) => ({ conditions, type: 'or' })),
-    }))
-
-    vi.doMock('@/lib/logs/console/logger', () => ({
-      createLogger: vi.fn().mockReturnValue(mockLogger),
-    }))
-  })
-
-  afterEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    dbChainMockFns.where.mockResolvedValue([])
   })
 
   it('should disconnect provider successfully', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
-
-    mockDb.delete.mockReturnValueOnce(mockDb)
-    mockDb.where.mockResolvedValueOnce(undefined)
 
     const req = createMockRequest('POST', {
       provider: 'google',
     })
-
-    const { POST } = await import('@/app/api/auth/oauth/disconnect/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(200)
     expect(data.success).toBe(true)
-    expect(mockLogger.info).toHaveBeenCalled()
   })
 
   it('should disconnect specific provider ID successfully', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
-
-    mockDb.delete.mockReturnValueOnce(mockDb)
-    mockDb.where.mockResolvedValueOnce(undefined)
 
     const req = createMockRequest('POST', {
       provider: 'google',
       providerId: 'google-email',
     })
 
-    const { POST } = await import('@/app/api/auth/oauth/disconnect/route')
-
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(200)
     expect(data.success).toBe(true)
-    expect(mockLogger.info).toHaveBeenCalled()
   })
 
   it('should handle unauthenticated user', async () => {
-    mockGetSession.mockResolvedValueOnce(null)
+    authMockFns.mockGetSession.mockResolvedValueOnce(null)
 
     const req = createMockRequest('POST', {
       provider: 'google',
     })
-
-    const { POST } = await import('@/app/api/auth/oauth/disconnect/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(401)
     expect(data.error).toBe('User not authenticated')
-    expect(mockLogger.warn).toHaveBeenCalled()
   })
 
   it('should handle missing provider', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
     const req = createMockRequest('POST', {})
-
-    const { POST } = await import('@/app/api/auth/oauth/disconnect/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(400)
     expect(data.error).toBe('Provider is required')
-    expect(mockLogger.warn).toHaveBeenCalled()
   })
 
   it('should handle database error', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
-    mockDb.delete.mockReturnValueOnce(mockDb)
-    mockDb.where.mockRejectedValueOnce(new Error('Database error'))
+    dbChainMockFns.where.mockRejectedValueOnce(new Error('Database error'))
 
     const req = createMockRequest('POST', {
       provider: 'google',
     })
-
-    const { POST } = await import('@/app/api/auth/oauth/disconnect/route')
 
     const response = await POST(req)
     const data = await response.json()
 
     expect(response.status).toBe(500)
     expect(data.error).toBe('Internal server error')
-    expect(mockLogger.error).toHaveBeenCalled()
   })
 })

@@ -6,6 +6,8 @@
     "includes": [
       "**",
       "!**/.next",
+      "!**/.next",
+      "!**/next-env.d.ts",
       "!**/out",
       "!**/dist",
       "!**/build",
@@ -24,9 +26,11 @@
       "!**/public/workbox-*.js",
       "!**/public/worker-*.js",
       "!**/public/fallback-*.js",
-      "!**/apps/docs/.source/**",
-      "!**/venv/**",
-      "!**/.venv/**"
+      "!**/apps/docs/.source",
+      "!**/venv",
+      "!**/.venv",
+      "!**/uploads",
+      "!**/apps/sim/lib/execution/sandbox/bundles/*.cjs"
     ]
   },
   "formatter": {
@@ -38,32 +42,7 @@
     "lineEnding": "lf",
     "lineWidth": 100,
     "attributePosition": "auto",
-    "bracketSpacing": true,
-    "includes": [
-      "**",
-      "!**/.next",
-      "!**/out",
-      "!**/dist",
-      "!**/build",
-      "!**/node_modules",
-      "!**/.bun",
-      "!**/.cache",
-      "!**/.turbo",
-      "!**/.DS_Store",
-      "!**/*.pem",
-      "!**/bun-debug.log*",
-      "!**/.env*.local",
-      "!**/.env",
-      "!**/.vercel",
-      "!**/coverage",
-      "!**/public/sw.js",
-      "!**/public/workbox-*.js",
-      "!**/public/worker-*.js",
-      "!**/public/fallback-*.js",
-      "!**/apps/docs/.source/**",
-      "!**/venv/**",
-      "!**/.venv/**"
-    ]
+    "bracketSpacing": true
   },
   "assist": {
     "actions": {
@@ -90,8 +69,7 @@
     "rules": {
       "recommended": true,
       "nursery": {
-        "useSortedClasses": "warn",
-        "noNestedComponentDefinitions": "off"
+        "useSortedClasses": "warn"
       },
       "a11y": {
         "noSvgWithoutTitle": "off",
@@ -123,6 +101,7 @@
         "noDangerouslySetInnerHtml": "off"
       },
       "style": {
+        "noDescendingSpecificity": "off",
         "noNonNullAssertion": "off",
         "noParameterAssign": "off",
         "useNodejsImportProtocol": "off",
@@ -134,7 +113,16 @@
         "noUnusedTemplateLiteral": "off",
         "useNumberNamespace": "error",
         "noInferrableTypes": "error",
-        "noUselessElse": "error"
+        "noUselessElse": "error",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "nanoid": "Use generateId() or generateShortId() from @sim/utils/id instead",
+              "uuid": "Use generateId() from @sim/utils/id instead"
+            }
+          }
+        }
       },
       "complexity": {
         "noForEach": "off",

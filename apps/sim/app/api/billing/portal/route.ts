@@ -1,15 +1,19 @@
 import { db } from '@sim/db'
 import { subscription as subscriptionTable, user } from '@sim/db/schema'
-import { and, eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { and, eq, inArray, or } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { billingPortalBodySchema } from '@/lib/api/contracts/subscription'
 import { getSession } from '@/lib/auth'
+import { isOrganizationOwnerOrAdmin } from '@/lib/billing/core/organization'
 import { requireStripeClient } from '@/lib/billing/stripe-client'
-import { env } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
+import { ENTITLED_SUBSCRIPTION_STATUSES } from '@/lib/billing/subscriptions/utils'
+import { getBaseUrl } from '@/lib/core/utils/urls'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 const logger = createLogger('BillingPortal')
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   const session = await getSession()
 
   try {
@@ -18,11 +22,13 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json().catch(() => ({}))
-    const context: 'user' | 'organization' =
-      body?.context === 'organization' ? 'organization' : 'user'
-    const organizationId: string | undefined = body?.organizationId || undefined
-    const returnUrl: string =
-      body?.returnUrl || `${env.NEXT_PUBLIC_APP_URL}/workspace?billing=updated`
+    const parsedBody = billingPortalBodySchema.safeParse(body)
+    if (!parsedBody.success) {
+      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+    }
+    const context = parsedBody.data.context
+    const organizationId = parsedBody.data.organizationId
+    const returnUrl = parsedBody.data.returnUrl || `${getBaseUrl()}/workspace?billing=updated`
 
     const stripe = requireStripeClient()
 
@@ -33,13 +39,21 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'organizationId is required' }, { status: 400 })
       }
 
+      const hasPermission = await isOrganizationOwnerOrAdmin(session.user.id, organizationId)
+      if (!hasPermission) {
+        return NextResponse.json({ error: 'Permission denied' }, { status: 403 })
+      }
+
       const rows = await db
         .select({ customer: subscriptionTable.stripeCustomerId })
         .from(subscriptionTable)
         .where(
           and(
             eq(subscriptionTable.referenceId, organizationId),
-            eq(subscriptionTable.status, 'active')
+            or(
+              inArray(subscriptionTable.status, ENTITLED_SUBSCRIPTION_STATUSES),
+              eq(subscriptionTable.cancelAtPeriodEnd, true)
+            )
           )
         )
         .limit(1)
@@ -74,4 +88,4 @@ export async function POST(request: NextRequest) {
     logger.error('Failed to create billing portal session', { error })
     return NextResponse.json({ error: 'Failed to create billing portal session' }, { status: 500 })
   }
-}
+})

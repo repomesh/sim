@@ -1,10 +1,12 @@
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
-import { NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
+import { type NextRequest, NextResponse } from 'next/server'
+import { outlookFoldersSelectorContract } from '@/lib/api/contracts/selectors/microsoft'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validateAlphanumericId } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 
 export const dynamic = 'force-dynamic'
@@ -18,42 +20,42 @@ interface OutlookFolder {
   unreadItemCount?: number
 }
 
-export async function GET(request: Request) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   try {
-    const session = await getSession()
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
+    const parsed = await parseRequest(outlookFoldersSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credentialId } = parsed.data.query
 
-    if (!credentialId) {
-      logger.error('Missing credentialId in request')
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+    const credentialIdValidation = validateAlphanumericId(credentialId, 'credentialId')
+    if (!credentialIdValidation.isValid) {
+      logger.warn('Invalid credentialId format', { error: credentialIdValidation.error })
+      return NextResponse.json({ error: credentialIdValidation.error }, { status: 400 })
     }
 
     try {
-      // Ensure we have a session for permission checks
-      const sessionUserId = session?.user?.id || ''
-
-      if (!sessionUserId) {
-        logger.error('No user ID found in session')
-        return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+      const credAccess = await authorizeCredentialUse(request, {
+        credentialId,
+        requireWorkflowIdForInternal: false,
+      })
+      if (!credAccess.ok || !credAccess.credentialOwnerUserId) {
+        logger.warn('Credential access denied', { error: credAccess.error })
+        return NextResponse.json(
+          { error: credAccess.error || 'Authentication required' },
+          { status: 401 }
+        )
       }
-
-      // Resolve the credential owner to support collaborator-owned credentials
-      const creds = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-      if (!creds.length) {
-        logger.warn('Credential not found', { credentialId })
-        return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
-      }
-      const credentialOwnerUserId = creds[0].userId
 
       const accessToken = await refreshAccessTokenIfNeeded(
         credentialId,
-        credentialOwnerUserId,
+        credAccess.credentialOwnerUserId,
         generateRequestId()
       )
 
       if (!accessToken) {
-        logger.error('Failed to get access token', { credentialId, userId: credentialOwnerUserId })
+        logger.error('Failed to get access token', {
+          credentialId,
+          userId: credAccess.credentialOwnerUserId,
+        })
         return NextResponse.json(
           {
             error: 'Could not retrieve access token',
@@ -79,7 +81,6 @@ export async function GET(request: Request) {
           endpoint: 'https://graph.microsoft.com/v1.0/me/mailFolders',
         })
 
-        // Check for auth errors specifically
         if (response.status === 401) {
           return NextResponse.json(
             {
@@ -96,7 +97,6 @@ export async function GET(request: Request) {
       const data = await response.json()
       const folders = data.value || []
 
-      // Transform folders to match the expected format
       const transformedFolders = folders.map((folder: OutlookFolder) => ({
         id: folder.id,
         name: folder.displayName,
@@ -111,8 +111,7 @@ export async function GET(request: Request) {
     } catch (innerError) {
       logger.error('Error during API requests:', innerError)
 
-      // Check if it's an authentication error
-      const errorMessage = innerError instanceof Error ? innerError.message : String(innerError)
+      const errorMessage = toError(innerError).message
       if (
         errorMessage.includes('auth') ||
         errorMessage.includes('token') ||
@@ -141,4 +140,4 @@ export async function GET(request: Request) {
       { status: 500 }
     )
   }
-}
+})

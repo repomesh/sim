@@ -1,325 +1,405 @@
+/**
+ * @vitest-environment node
+ */
+import {
+  auditMock,
+  authMock,
+  authMockFns,
+  createMockRequest,
+  permissionsMock,
+  permissionsMockFns,
+  posthogServerMock,
+  schemaMock,
+} from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest, mockAuth, mockConsoleLogger } from '@/app/api/__test-utils__/utils'
 
-describe('Workspace Invitations API Route', () => {
-  const mockWorkspace = { id: 'workspace-1', name: 'Test Workspace' }
-  const mockUser = { id: 'user-1', email: 'test@example.com' }
-  const mockInvitation = { id: 'invitation-1', status: 'pending' }
+const {
+  mockGetWorkspaceInvitePolicy,
+  mockValidateInvitationsAllowed,
+  mockValidateSeatAvailability,
+  mockGetUserOrganization,
+  mockCreatePendingInvitation,
+  mockSendInvitationEmail,
+  mockCancelPendingInvitation,
+  mockFindPendingGrantForWorkspaceEmail,
+  mockDbResults,
+} = vi.hoisted(() => ({
+  mockGetWorkspaceInvitePolicy: vi.fn(),
+  mockValidateInvitationsAllowed: vi.fn().mockResolvedValue(undefined),
+  mockValidateSeatAvailability: vi.fn(),
+  mockGetUserOrganization: vi.fn(),
+  mockCreatePendingInvitation: vi.fn(),
+  mockSendInvitationEmail: vi.fn(),
+  mockCancelPendingInvitation: vi.fn(),
+  mockFindPendingGrantForWorkspaceEmail: vi.fn(),
+  mockDbResults: { value: [] as any[] },
+}))
 
-  let mockDbResults: any[] = []
-  let mockGetSession: any
-  let mockResendSend: any
-  let mockInsertValues: any
+vi.mock('@sim/db', () => ({
+  db: {
+    select: vi.fn().mockImplementation(() => {
+      const chain: any = {}
+      chain.from = vi.fn().mockReturnValue(chain)
+      chain.innerJoin = vi.fn().mockReturnValue(chain)
+      chain.where = vi.fn().mockReturnValue(chain)
+      chain.limit = vi
+        .fn()
+        .mockImplementation(() => Promise.resolve(mockDbResults.value.shift() || []))
+      chain.then = vi.fn().mockImplementation((callback: (rows: any[]) => unknown) => {
+        const result = mockDbResults.value.shift() || []
+        return Promise.resolve(callback ? callback(result) : result)
+      })
+      return chain
+    }),
+  },
+}))
 
+vi.mock('@sim/db/schema', () => schemaMock)
+
+vi.mock('@/lib/auth', () => authMock)
+
+vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
+
+vi.mock('@/lib/workspaces/policy', () => ({
+  getWorkspaceInvitePolicy: mockGetWorkspaceInvitePolicy,
+  isOrganizationWorkspace: (ws: {
+    workspaceMode?: string | null
+    organizationId?: string | null
+  }) => ws.workspaceMode === 'organization' && !!ws.organizationId,
+}))
+
+vi.mock('@/lib/billing/validation/seat-management', () => ({
+  validateSeatAvailability: mockValidateSeatAvailability,
+}))
+
+vi.mock('@/lib/billing/organizations/membership', () => ({
+  getUserOrganization: mockGetUserOrganization,
+}))
+
+vi.mock('@/lib/invitations/send', () => ({
+  createPendingInvitation: mockCreatePendingInvitation,
+  sendInvitationEmail: mockSendInvitationEmail,
+  cancelPendingInvitation: mockCancelPendingInvitation,
+  findPendingGrantForWorkspaceEmail: mockFindPendingGrantForWorkspaceEmail,
+}))
+
+vi.mock('@/lib/invitations/core', () => ({
+  normalizeEmail: (email: string) => email.trim().toLowerCase(),
+  listInvitationsForWorkspaces: vi.fn().mockResolvedValue([]),
+}))
+
+vi.mock('@/ee/access-control/utils/permission-check', () => ({
+  validateInvitationsAllowed: mockValidateInvitationsAllowed,
+  InvitationsNotAllowedError: class InvitationsNotAllowedError extends Error {},
+}))
+
+vi.mock('@sim/audit', () => auditMock)
+
+vi.mock('@/lib/posthog/server', () => posthogServerMock)
+
+vi.mock('@/lib/core/telemetry', () => ({
+  PlatformEvents: {
+    workspaceMemberInvited: vi.fn(),
+  },
+}))
+
+const mockGetSession = authMockFns.mockGetSession
+const mockGetWorkspaceWithOwner = permissionsMockFns.mockGetWorkspaceWithOwner
+
+import { UPGRADE_TO_INVITE_REASON } from '@/lib/workspaces/policy-constants'
+import { POST } from '@/app/api/workspaces/invitations/batch/route'
+
+describe('POST /api/workspaces/invitations/batch', () => {
   beforeEach(() => {
-    vi.resetModules()
-    vi.resetAllMocks()
-
-    mockDbResults = []
-    mockConsoleLogger()
-    mockAuth(mockUser)
-
-    vi.doMock('crypto', () => ({
-      randomUUID: vi.fn().mockReturnValue('mock-uuid-1234'),
-    }))
-
-    mockGetSession = vi.fn()
-    vi.doMock('@/lib/auth', () => ({
-      getSession: mockGetSession,
-    }))
-
-    mockInsertValues = vi.fn().mockResolvedValue(undefined)
-    const mockDbChain = {
-      select: vi.fn().mockReturnThis(),
-      from: vi.fn().mockReturnThis(),
-      where: vi.fn().mockReturnThis(),
-      innerJoin: vi.fn().mockReturnThis(),
-      limit: vi.fn().mockReturnThis(),
-      then: vi.fn().mockImplementation((callback: any) => {
-        const result = mockDbResults.shift() || []
-        return callback ? callback(result) : Promise.resolve(result)
-      }),
-      insert: vi.fn().mockReturnThis(),
-      values: mockInsertValues,
-    }
-
-    vi.doMock('@sim/db', () => ({
-      db: mockDbChain,
-    }))
-
-    vi.doMock('@sim/db/schema', () => ({
-      user: { id: 'user_id', email: 'user_email', name: 'user_name', image: 'user_image' },
-      workspace: { id: 'workspace_id', name: 'workspace_name', ownerId: 'owner_id' },
-      permissions: {
-        userId: 'user_id',
-        entityId: 'entity_id',
-        entityType: 'entity_type',
-        permissionType: 'permission_type',
-      },
-      workspaceInvitation: {
-        id: 'invitation_id',
-        workspaceId: 'workspace_id',
-        email: 'invitation_email',
-        status: 'invitation_status',
-        token: 'invitation_token',
-        inviterId: 'inviter_id',
-        role: 'invitation_role',
-        permissions: 'invitation_permissions',
-        expiresAt: 'expires_at',
-        createdAt: 'created_at',
-        updatedAt: 'updated_at',
-      },
-      permissionTypeEnum: { enumValues: ['admin', 'write', 'read'] as const },
-    }))
-
-    mockResendSend = vi.fn().mockResolvedValue({ id: 'email-id' })
-    vi.doMock('resend', () => ({
-      Resend: vi.fn().mockImplementation(() => ({
-        emails: { send: mockResendSend },
-      })),
-    }))
-
-    vi.doMock('@react-email/render', () => ({
-      render: vi.fn().mockResolvedValue('<html>email content</html>'),
-    }))
-
-    vi.doMock('@/components/emails/workspace-invitation', () => ({
-      WorkspaceInvitationEmail: vi.fn(),
-    }))
-
-    vi.doMock('@/lib/env', () => ({
-      env: {
-        RESEND_API_KEY: 'test-resend-key',
-        NEXT_PUBLIC_APP_URL: 'https://test.sim.ai',
-        FROM_EMAIL_ADDRESS: 'Sim <noreply@test.sim.ai>',
-        EMAIL_DOMAIN: 'test.sim.ai',
-      },
-    }))
-
-    vi.doMock('@/lib/urls/utils', () => ({
-      getEmailDomain: vi.fn().mockReturnValue('sim.ai'),
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      and: vi.fn().mockImplementation((...args) => ({ type: 'and', conditions: args })),
-      eq: vi.fn().mockImplementation((field, value) => ({ type: 'eq', field, value })),
-      inArray: vi.fn().mockImplementation((field, values) => ({ type: 'inArray', field, values })),
-    }))
+    vi.clearAllMocks()
+    mockDbResults.value = []
+    mockGetSession.mockResolvedValue({
+      user: { id: 'user-1', email: 'owner@test.com', name: 'Owner User' },
+    })
+    mockGetWorkspaceWithOwner.mockResolvedValue({
+      id: 'workspace-1',
+      name: 'Workspace',
+      ownerId: 'user-1',
+      organizationId: null,
+      workspaceMode: 'grandfathered_shared',
+      billedAccountUserId: 'user-1',
+    })
+    mockValidateInvitationsAllowed.mockResolvedValue(undefined)
+    mockGetWorkspaceInvitePolicy.mockResolvedValue({
+      allowed: true,
+      reason: null,
+      requiresSeat: false,
+      organizationId: null,
+      upgradeRequired: false,
+    })
+    mockValidateSeatAvailability.mockResolvedValue({
+      canInvite: true,
+      currentSeats: 1,
+      maxSeats: 5,
+      availableSeats: 4,
+    })
+    mockGetUserOrganization.mockResolvedValue(null)
+    mockCreatePendingInvitation.mockResolvedValue({
+      invitationId: 'inv-1',
+      token: 'tok-1',
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    })
+    mockSendInvitationEmail.mockResolvedValue({ success: true })
+    mockFindPendingGrantForWorkspaceEmail.mockResolvedValue(null)
   })
 
-  describe('GET /api/workspaces/invitations', () => {
-    it('should return 401 when user is not authenticated', async () => {
-      mockGetSession.mockResolvedValue(null)
+  it('blocks invites for personal workspaces with an upgrade prompt', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Personal Workspace',
+      ownerId: 'user-1',
+      organizationId: null,
+      workspaceMode: 'personal',
+      billedAccountUserId: 'user-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValueOnce({
+      allowed: false,
+      reason: UPGRADE_TO_INVITE_REASON,
+      requiresSeat: false,
+      organizationId: null,
+      upgradeRequired: true,
+    })
+    mockDbResults.value = [[{ permissionType: 'admin' }]]
 
-      const { GET } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('GET')
-      const response = await GET(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(401)
-      expect(data).toEqual({ error: 'Unauthorized' })
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'read' }],
     })
 
-    it('should return empty invitations when user has no workspaces', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      mockDbResults = [[], []] // No workspaces, no invitations
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { GET } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('GET')
-      const response = await GET(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(200)
-      expect(data).toEqual({ invitations: [] })
-    })
-
-    it('should return invitations for user workspaces', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      const mockWorkspaces = [{ id: 'workspace-1' }, { id: 'workspace-2' }]
-      const mockInvitations = [
-        { id: 'invitation-1', workspaceId: 'workspace-1', email: 'test@example.com' },
-        { id: 'invitation-2', workspaceId: 'workspace-2', email: 'test2@example.com' },
-      ]
-      mockDbResults = [mockWorkspaces, mockInvitations]
-
-      const { GET } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('GET')
-      const response = await GET(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(200)
-      expect(data).toEqual({ invitations: mockInvitations })
-    })
+    expect(response.status).toBe(403)
+    expect(data.error).toBe(UPGRADE_TO_INVITE_REASON)
+    expect(data.upgradeRequired).toBe(true)
   })
 
-  describe('POST /api/workspaces/invitations', () => {
-    it('should return 401 when user is not authenticated', async () => {
-      mockGetSession.mockResolvedValue(null)
+  it('blocks invites for grandfathered workspaces without a team plan', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Grandfathered Workspace',
+      ownerId: 'user-1',
+      organizationId: null,
+      workspaceMode: 'grandfathered_shared',
+      billedAccountUserId: 'user-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValueOnce({
+      allowed: false,
+      reason: UPGRADE_TO_INVITE_REASON,
+      requiresSeat: false,
+      organizationId: null,
+      upgradeRequired: true,
+    })
+    mockDbResults.value = [[{ permissionType: 'admin' }]]
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
-      })
-      const response = await POST(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(401)
-      expect(data).toEqual({ error: 'Unauthorized' })
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'read' }],
     })
 
-    it('should return 400 when workspaceId is missing', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', { email: 'test@example.com' })
-      const response = await POST(req)
-      const data = await response.json()
+    expect(response.status).toBe(403)
+    expect(data.upgradeRequired).toBe(true)
+    expect(mockCreatePendingInvitation).not.toHaveBeenCalled()
+  })
 
-      expect(response.status).toBe(400)
-      expect(data).toEqual({ error: 'Workspace ID and email are required' })
+  it('reports org-owned invites as failed when the organization has no available seats', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Org Workspace',
+      ownerId: 'user-1',
+      organizationId: 'org-1',
+      workspaceMode: 'organization',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValueOnce({
+      allowed: true,
+      reason: null,
+      requiresSeat: true,
+      organizationId: 'org-1',
+      upgradeRequired: false,
+    })
+    mockValidateSeatAvailability.mockResolvedValueOnce({
+      canInvite: false,
+      reason: 'No available seats. Currently using 5 of 5 seats.',
+      currentSeats: 5,
+      maxSeats: 5,
+      availableSeats: 0,
+    })
+    mockDbResults.value = [[{ permissionType: 'admin' }], []]
+
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'read' }],
     })
 
-    it('should return 400 when email is missing', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', { workspaceId: 'workspace-1' })
-      const response = await POST(req)
-      const data = await response.json()
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(false)
+    expect(data.failed).toEqual([
+      {
+        email: 'new@example.com',
+        error: 'No available seats. Currently using 5 of 5 seats.',
+      },
+    ])
+    expect(mockValidateSeatAvailability).toHaveBeenCalledWith('org-1', 1)
+    expect(mockCreatePendingInvitation).not.toHaveBeenCalled()
+  })
 
-      expect(response.status).toBe(400)
-      expect(data).toEqual({ error: 'Workspace ID and email are required' })
+  it('creates an external workspace invitation for users already in another organization', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Org Workspace',
+      ownerId: 'user-1',
+      organizationId: 'org-1',
+      workspaceMode: 'organization',
+      billedAccountUserId: 'owner-1',
+    })
+    mockGetWorkspaceInvitePolicy.mockResolvedValueOnce({
+      allowed: true,
+      reason: null,
+      requiresSeat: true,
+      organizationId: 'org-1',
+      upgradeRequired: false,
+    })
+    mockGetUserOrganization.mockResolvedValueOnce({
+      organizationId: 'org-2',
+      role: 'member',
+      memberId: 'member-1',
+    })
+    mockDbResults.value = [
+      [{ permissionType: 'admin' }],
+      [{ id: 'existing-user', email: 'new@example.com' }],
+    ]
+
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'read' }],
     })
 
-    it('should return 400 when permission type is invalid', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
-        permission: 'invalid-permission',
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(data.invitations[0].membershipIntent).toBe('external')
+    expect(mockValidateSeatAvailability).not.toHaveBeenCalled()
+    expect(mockCreatePendingInvitation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'workspace',
+        email: 'new@example.com',
+        organizationId: 'org-1',
+        membershipIntent: 'external',
+        grants: [{ workspaceId: 'workspace-1', permission: 'read' }],
       })
-      const response = await POST(req)
-      const data = await response.json()
+    )
+  })
 
-      expect(response.status).toBe(400)
-      expect(data).toEqual({
-        error: 'Invalid permission: must be one of admin, write, read',
-      })
+  it('creates a unified workspace invitation for a grandfathered workspace', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Grandfathered Workspace',
+      ownerId: 'user-1',
+      organizationId: null,
+      workspaceMode: 'grandfathered_shared',
+      billedAccountUserId: 'user-1',
+    })
+    mockDbResults.value = [[{ permissionType: 'admin' }], []]
+
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'write' }],
     })
 
-    it('should return 403 when user does not have admin permissions', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      mockDbResults = [[]] // No admin permissions found
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(mockCreatePendingInvitation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'workspace',
+        email: 'new@example.com',
+        organizationId: null,
+        grants: [{ workspaceId: 'workspace-1', permission: 'write' }],
       })
-      const response = await POST(req)
-      const data = await response.json()
+    )
+    expect(mockSendInvitationEmail).toHaveBeenCalled()
+    expect(mockValidateSeatAvailability).not.toHaveBeenCalled()
+  })
 
-      expect(response.status).toBe(403)
-      expect(data).toEqual({ error: 'You need admin permissions to invite users' })
+  it('creates multiple workspace invitations in one batch request', async () => {
+    mockDbResults.value = [[{ permissionType: 'admin' }], [], []]
+    mockCreatePendingInvitation
+      .mockResolvedValueOnce({
+        invitationId: 'inv-1',
+        token: 'tok-1',
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      })
+      .mockResolvedValueOnce({
+        invitationId: 'inv-2',
+        token: 'tok-2',
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      })
+
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [
+        { email: 'first@example.com', permission: 'read' },
+        { email: 'second@example.com', permission: 'write' },
+      ],
     })
 
-    it('should return 404 when workspace is not found', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      mockDbResults = [
-        [{ permissionType: 'admin' }], // User has admin permissions
-        [], // Workspace not found
-      ]
+    const response = await POST(request)
+    const data = await response.json()
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
-      })
-      const response = await POST(req)
-      const data = await response.json()
+    expect(response.status).toBe(200)
+    expect(data.success).toBe(true)
+    expect(data.successful).toEqual(['first@example.com', 'second@example.com'])
+    expect(data.failed).toEqual([])
+    expect(data.invitations).toHaveLength(2)
+    expect(mockCreatePendingInvitation).toHaveBeenCalledTimes(2)
+    expect(mockSendInvitationEmail).toHaveBeenCalledTimes(2)
+  })
 
-      expect(response.status).toBe(404)
-      expect(data).toEqual({ error: 'Workspace not found' })
+  it('rolls back the unified invitation when email delivery fails', async () => {
+    mockGetWorkspaceWithOwner.mockResolvedValueOnce({
+      id: 'workspace-1',
+      name: 'Org Workspace',
+      ownerId: 'user-1',
+      organizationId: 'org-1',
+      workspaceMode: 'organization',
+      billedAccountUserId: 'owner-1',
+    })
+    mockSendInvitationEmail.mockResolvedValueOnce({
+      success: false,
+      error: 'mailer unavailable',
+    })
+    mockDbResults.value = [[{ permissionType: 'admin' }], []]
+
+    const request = createMockRequest('POST', {
+      workspaceId: 'workspace-1',
+      invitations: [{ email: 'new@example.com', permission: 'read' }],
     })
 
-    it('should return 400 when user already has workspace access', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      mockDbResults = [
-        [{ permissionType: 'admin' }], // User has admin permissions
-        [mockWorkspace], // Workspace exists
-        [mockUser], // User exists
-        [{ permissionType: 'read' }], // User already has access
-      ]
+    const response = await POST(request)
 
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual(
+      expect.objectContaining({
+        success: false,
+        failed: [{ email: 'new@example.com', error: 'mailer unavailable' }],
       })
-      const response = await POST(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(400)
-      expect(data).toEqual({
-        error: 'test@example.com already has access to this workspace',
-        email: 'test@example.com',
-      })
-    })
-
-    it('should return 400 when invitation already exists', async () => {
-      mockGetSession.mockResolvedValue({ user: { id: 'user-123' } })
-      mockDbResults = [
-        [{ permissionType: 'admin' }], // User has admin permissions
-        [mockWorkspace], // Workspace exists
-        [], // User doesn't exist
-        [mockInvitation], // Invitation exists
-      ]
-
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
-      })
-      const response = await POST(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(400)
-      expect(data).toEqual({
-        error: 'test@example.com has already been invited to this workspace',
-        email: 'test@example.com',
-      })
-    })
-
-    it('should successfully create invitation and send email', async () => {
-      mockGetSession.mockResolvedValue({
-        user: { id: 'user-123', name: 'Test User', email: 'sender@example.com' },
-      })
-      mockDbResults = [
-        [{ permissionType: 'admin' }], // User has admin permissions
-        [mockWorkspace], // Workspace exists
-        [], // User doesn't exist
-        [], // No existing invitation
-      ]
-
-      const { POST } = await import('@/app/api/workspaces/invitations/route')
-      const req = createMockRequest('POST', {
-        workspaceId: 'workspace-1',
-        email: 'test@example.com',
-        permission: 'read',
-      })
-      const response = await POST(req)
-      const data = await response.json()
-
-      expect(response.status).toBe(200)
-      expect(data.success).toBe(true)
-      expect(data.invitation).toBeDefined()
-      expect(data.invitation.email).toBe('test@example.com')
-      expect(data.invitation.permissions).toBe('read')
-      expect(data.invitation.token).toBe('mock-uuid-1234')
-      expect(mockInsertValues).toHaveBeenCalled()
-    })
+    )
+    expect(mockCancelPendingInvitation).toHaveBeenCalledWith('inv-1')
   })
 })

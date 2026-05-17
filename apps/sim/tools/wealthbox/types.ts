@@ -1,6 +1,6 @@
 import type { ToolResponse } from '@/tools/types'
 
-export interface WealthboxNote {
+interface WealthboxNote {
   id: number
   creator: number
   created_at: string
@@ -18,7 +18,7 @@ export interface WealthboxNote {
   }>
 }
 
-export interface WealthboxContact {
+interface WealthboxContact {
   id: number
   first_name: string
   last_name: string
@@ -37,7 +37,7 @@ export interface WealthboxContact {
   }>
 }
 
-export interface WealthboxTask {
+interface WealthboxTask {
   id: number
   name: string
   due_date: string
@@ -54,16 +54,11 @@ export interface WealthboxTask {
 }
 
 // Unified metadata structure
-export interface WealthboxMetadata {
-  operation:
-    | 'read_note'
-    | 'write_note'
-    | 'read_contact'
-    | 'write_contact'
-    | 'read_task'
-    | 'write_task'
+interface WealthboxMetadata {
   itemId?: string
+  noteId?: string
   contactId?: string
+  taskId?: string
   itemType: 'note' | 'contact' | 'task'
   totalItems?: number
 }

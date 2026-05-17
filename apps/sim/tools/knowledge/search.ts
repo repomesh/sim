@@ -1,4 +1,7 @@
+import { DEFAULT_RERANKER_MODEL } from '@/lib/knowledge/reranker-models'
 import type { KnowledgeSearchResponse } from '@/tools/knowledge/types'
+import { enrichKBTagFiltersSchema } from '@/tools/schema-enrichers'
+import { parseTagFilters } from '@/tools/shared/tags'
 import type { ToolConfig } from '@/tools/types'
 
 export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
@@ -11,22 +14,66 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
     knowledgeBaseId: {
       type: 'string',
       required: true,
+      visibility: 'user-or-llm',
       description: 'ID of the knowledge base to search in',
     },
     query: {
       type: 'string',
       required: false,
+      visibility: 'user-or-llm',
       description: 'Search query text (optional when using tag filters)',
     },
     topK: {
       type: 'number',
       required: false,
+      visibility: 'user-or-llm',
       description: 'Number of most similar results to return (1-100)',
     },
     tagFilters: {
-      type: 'any',
+      type: 'array',
       required: false,
+      visibility: 'user-or-llm',
       description: 'Array of tag filters with tagName and tagValue properties',
+      items: {
+        type: 'object',
+        properties: {
+          tagName: { type: 'string' },
+          tagValue: { type: 'string' },
+        },
+      },
+    },
+    rerankerEnabled: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Whether to apply Cohere reranking to vector search results',
+    },
+    rerankerModel: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Cohere rerank model to use (one of: rerank-v4.0-pro, rerank-v4.0-fast, rerank-v3.5)',
+    },
+    rerankerInputCount: {
+      type: 'number',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Number of vector results sent to the Cohere reranker (1–100). Defaults to topK × 4 capped at 100.',
+    },
+    apiKey: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Cohere API key for reranker (self-hosted deployments only)',
+    },
+  },
+
+  schemaEnrichment: {
+    tagFilters: {
+      dependsOn: 'knowledgeBaseId',
+      enrichSchema: enrichKBTagFiltersSchema,
     },
   },
 
@@ -42,46 +89,37 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
       // Use single knowledge base ID
       const knowledgeBaseIds = [params.knowledgeBaseId]
 
-      // Parse dynamic tag filters and send display names to API
-      const filters: Record<string, string> = {}
-      if (params.tagFilters) {
-        let tagFilters = params.tagFilters
+      // Parse tag filters from various formats (array, JSON string)
+      const structuredFilters = parseTagFilters(params.tagFilters)
 
-        // Handle both string (JSON) and array formats
-        if (typeof tagFilters === 'string') {
-          try {
-            tagFilters = JSON.parse(tagFilters)
-          } catch (error) {
-            tagFilters = []
-          }
-        }
-
-        if (Array.isArray(tagFilters)) {
-          // Group filters by tag name for OR logic within same tag
-          const groupedFilters: Record<string, string[]> = {}
-          tagFilters.forEach((filter: any) => {
-            if (filter.tagName && filter.tagValue && filter.tagValue.trim().length > 0) {
-              if (!groupedFilters[filter.tagName]) {
-                groupedFilters[filter.tagName] = []
-              }
-              groupedFilters[filter.tagName].push(filter.tagValue)
-            }
-          })
-
-          // Convert to filters format - for now, join multiple values with OR separator
-          Object.entries(groupedFilters).forEach(([tagName, values]) => {
-            filters[tagName] = values.join('|OR|') // Use special separator for OR logic
-          })
-        }
-      }
+      const rerankerEnabled = params.rerankerEnabled === true || params.rerankerEnabled === 'true'
+      const rerankerModel =
+        typeof params.rerankerModel === 'string' && params.rerankerModel.length > 0
+          ? params.rerankerModel
+          : DEFAULT_RERANKER_MODEL
+      const rerankerApiKey =
+        typeof params.apiKey === 'string' && params.apiKey.length > 0 ? params.apiKey : undefined
+      const rawInputCount =
+        params.rerankerInputCount !== undefined &&
+        params.rerankerInputCount !== null &&
+        params.rerankerInputCount !== ''
+          ? Number(params.rerankerInputCount)
+          : Number.NaN
+      const rerankerInputCount = Number.isFinite(rawInputCount)
+        ? Math.max(1, Math.min(100, Math.floor(rawInputCount)))
+        : undefined
 
       const requestBody = {
         knowledgeBaseIds,
         query: params.query,
-        topK: params.topK
-          ? Math.max(1, Math.min(100, Number.parseInt(params.topK.toString()) || 10))
-          : 10,
-        ...(Object.keys(filters).length > 0 && { filters }),
+        topK: params.topK ? Math.max(1, Math.min(100, Number(params.topK))) : 10,
+        ...(structuredFilters.length > 0 && { tagFilters: structuredFilters }),
+        ...(rerankerEnabled && {
+          rerankerEnabled: true,
+          rerankerModel,
+          ...(rerankerInputCount !== undefined && { rerankerInputCount }),
+          ...(rerankerApiKey && { rerankerApiKey }),
+        }),
         ...(workflowId && { workflowId }),
       }
 
@@ -92,13 +130,40 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
     const result = await response.json()
     const data = result.data || result
 
+    // Restructure cost: extract tokens/model to top level for logging
+    let costFields: Record<string, unknown> = {}
+    if (data.cost && typeof data.cost === 'object') {
+      const {
+        tokens,
+        model,
+        input,
+        output: outputCost,
+        total,
+        rerankerCost,
+        rerankerModel,
+        rerankerSearchUnits,
+      } = data.cost
+      costFields = {
+        cost: {
+          input,
+          output: outputCost,
+          total,
+          ...(typeof rerankerCost === 'number' && { rerankerCost }),
+          ...(typeof rerankerModel === 'string' && { rerankerModel }),
+          ...(typeof rerankerSearchUnits === 'number' && { rerankerSearchUnits }),
+        },
+        ...(tokens && { tokens }),
+        ...(model && { model }),
+      }
+    }
+
     return {
       success: true,
       output: {
         results: data.results || [],
         query: data.query,
         totalResults: data.totalResults || 0,
-        cost: data.cost,
+        ...costFields,
       },
     }
   },
@@ -112,6 +177,12 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
         properties: {
           documentId: { type: 'string', description: 'Document ID' },
           documentName: { type: 'string', description: 'Document name' },
+          sourceUrl: {
+            type: 'string',
+            nullable: true,
+            description:
+              'URL to the original source document (e.g., Confluence page, Google Doc, Notion page). Null for documents without an external source.',
+          },
           content: { type: 'string', description: 'Content of the result' },
           chunkIndex: { type: 'number', description: 'Index of the chunk within the document' },
           similarity: { type: 'number', description: 'Similarity score of the result' },

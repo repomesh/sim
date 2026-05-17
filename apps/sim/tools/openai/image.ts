@@ -1,5 +1,5 @@
-import { createLogger } from '@/lib/logs/console/logger'
-import { getBaseUrl } from '@/lib/urls/utils'
+import { createLogger } from '@sim/logger'
+import { getInternalApiBaseUrl } from '@/lib/core/utils/urls'
 import type { BaseImageRequestBody } from '@/tools/openai/types'
 import type { ToolConfig } from '@/tools/types'
 
@@ -16,7 +16,7 @@ export const imageTool: ToolConfig = {
       type: 'string',
       required: true,
       visibility: 'user-only',
-      description: 'The model to use (gpt-image-1 or dall-e-3)',
+      description: 'The model to use (dall-e-3, gpt-image-1, or gpt-image-2)',
     },
     prompt: {
       type: 'string',
@@ -28,25 +28,39 @@ export const imageTool: ToolConfig = {
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'The size of the generated images (1024x1024, 1024x1792, or 1792x1024)',
+      description:
+        'Image size. dall-e-3: 1024x1024, 1024x1792, or 1792x1024. gpt-image-1: auto, 1024x1024, 1536x1024, or 1024x1536. gpt-image-2: auto or any size with edges ≤3840px and multiples of 16 (e.g. 1024x1024, 1536x1024, 1024x1536, 2560x1440, 3840x2160).',
     },
     quality: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'The quality of the image (standard or hd)',
+      description: 'Quality. dall-e-3: standard|hd. gpt-image-1/gpt-image-2: auto|low|medium|high',
     },
     style: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'The style of the image (vivid or natural)',
+      description: 'The style of the image (vivid or natural), only for dall-e-3',
     },
     background: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'The background color, only for gpt-image-1',
+      description:
+        'Background. gpt-image-1: auto|transparent|opaque. gpt-image-2: auto|opaque (transparent not supported)',
+    },
+    outputFormat: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Output image format (png, jpeg, webp), only for gpt-image-1 and gpt-image-2',
+    },
+    moderation: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Moderation level (auto or low), only for gpt-image-1 and gpt-image-2',
     },
     n: {
       type: 'number',
@@ -73,16 +87,18 @@ export const imageTool: ToolConfig = {
       const body: BaseImageRequestBody = {
         model: params.model,
         prompt: params.prompt,
-        size: params.size || '1024x1024',
-        n: params.n || 1,
+        size: params.size || (params.model === 'dall-e-3' ? '1024x1024' : 'auto'),
+        n: params.n ? Number(params.n) : 1,
       }
 
-      // Add model-specific parameters
       if (params.model === 'dall-e-3') {
         if (params.quality) body.quality = params.quality
         if (params.style) body.style = params.style
-      } else if (params.model === 'gpt-image-1') {
+      } else if (params.model === 'gpt-image-1' || params.model === 'gpt-image-2') {
+        if (params.quality) body.quality = params.quality
         if (params.background) body.background = params.background
+        if (params.outputFormat) body.output_format = params.outputFormat
+        if (params.moderation) body.moderation = params.moderation
       }
 
       return body
@@ -93,7 +109,7 @@ export const imageTool: ToolConfig = {
     try {
       const data = await response.json()
 
-      const sanitizedData = JSON.parse(JSON.stringify(data))
+      const sanitizedData = structuredClone(data)
       if (sanitizedData.data && Array.isArray(sanitizedData.data)) {
         sanitizedData.data.forEach((item: { b64_json?: string }) => {
           if (item.b64_json) {
@@ -112,7 +128,7 @@ export const imageTool: ToolConfig = {
       } else if (data.data?.[0]?.b64_json) {
         base64Image = data.data[0].b64_json
         logger.info(
-          'Found base64 encoded image in response for GPT-Image-1',
+          `Found base64 encoded image in response for ${modelName}`,
           `length: ${base64Image.length}`
         )
       } else {
@@ -123,14 +139,27 @@ export const imageTool: ToolConfig = {
       if (imageUrl && !base64Image) {
         try {
           logger.info('Fetching image from URL via proxy...')
-          const baseUrl = getBaseUrl()
-          const proxyUrl = new URL('/api/proxy/image', baseUrl)
+          const baseUrl = getInternalApiBaseUrl()
+          const proxyUrl = new URL('/api/tools/image', baseUrl)
           proxyUrl.searchParams.append('url', imageUrl)
 
+          const headers: Record<string, string> = {
+            Accept: 'image/*, */*',
+          }
+
+          if (typeof window === 'undefined') {
+            const { generateInternalToken } = await import('@/lib/auth/internal')
+            try {
+              const token = await generateInternalToken()
+              headers.Authorization = `Bearer ${token}`
+              logger.info('Added internal auth token for image proxy request')
+            } catch (error) {
+              logger.error('Failed to generate internal token for image proxy:', error)
+            }
+          }
+
           const imageResponse = await fetch(proxyUrl.toString(), {
-            headers: {
-              Accept: 'image/*, */*',
-            },
+            headers,
             cache: 'no-store',
           })
 
@@ -151,37 +180,6 @@ export const imageTool: ToolConfig = {
           base64Image = buffer.toString('base64')
         } catch (error) {
           logger.error('Error fetching or processing image:', error)
-
-          try {
-            logger.info('Attempting fallback with direct browser fetch...')
-            const directImageResponse = await fetch(imageUrl, {
-              cache: 'no-store',
-              headers: {
-                Accept: 'image/*, */*',
-                'User-Agent': 'Mozilla/5.0 (compatible DalleProxy/1.0)',
-              },
-            })
-
-            if (!directImageResponse.ok) {
-              throw new Error(`Direct fetch failed: ${directImageResponse.status}`)
-            }
-
-            const imageBlob = await directImageResponse.blob()
-            if (imageBlob.size === 0) {
-              throw new Error('Empty blob received from direct fetch')
-            }
-
-            const arrayBuffer = await imageBlob.arrayBuffer()
-            const buffer = Buffer.from(arrayBuffer)
-            base64Image = buffer.toString('base64')
-
-            logger.info(
-              'Successfully converted image to base64 via direct fetch, length:',
-              base64Image.length
-            )
-          } catch (fallbackError) {
-            logger.error('Fallback fetch also failed:', fallbackError)
-          }
         }
       }
 

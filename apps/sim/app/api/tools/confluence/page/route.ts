@@ -1,29 +1,32 @@
-import { NextResponse } from 'next/server'
-import { validateAlphanumericId, validateJiraCloudId } from '@/lib/security/input-validation'
+import { createLogger } from '@sim/logger'
+import { type NextRequest, NextResponse } from 'next/server'
+import {
+  confluenceDeletePageContract,
+  confluencePageSelectorContract,
+  confluenceUpdatePageContract,
+} from '@/lib/api/contracts/selectors/confluence'
+import { parseRequest } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { validateJiraCloudId } from '@/lib/core/security/input-validation'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { getConfluenceCloudId } from '@/tools/confluence/utils'
+import { parseAtlassianErrorMessage } from '@/tools/jira/utils'
+
+const logger = createLogger('ConfluencePageAPI')
 
 export const dynamic = 'force-dynamic'
 
-export async function POST(request: Request) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
-    const { domain, accessToken, pageId, cloudId: providedCloudId } = await request.json()
-
-    if (!domain) {
-      return NextResponse.json({ error: 'Domain is required' }, { status: 400 })
+    const auth = await checkSessionOrInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
     }
 
-    if (!accessToken) {
-      return NextResponse.json({ error: 'Access token is required' }, { status: 400 })
-    }
+    const parsed = await parseRequest(confluencePageSelectorContract, request, {})
+    if (!parsed.success) return parsed.response
 
-    if (!pageId) {
-      return NextResponse.json({ error: 'Page ID is required' }, { status: 400 })
-    }
-
-    const pageIdValidation = validateAlphanumericId(pageId, 'pageId', 255)
-    if (!pageIdValidation.isValid) {
-      return NextResponse.json({ error: pageIdValidation.error }, { status: 400 })
-    }
+    const { domain, accessToken, cloudId: providedCloudId, pageId } = parsed.data.body
 
     const cloudId = providedCloudId || (await getConfluenceCloudId(domain, accessToken))
 
@@ -32,7 +35,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: cloudIdValidation.error }, { status: 400 })
     }
 
-    const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/pages/${pageId}?expand=body.storage,body.view,body.atlas_doc_format`
+    const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/pages/${pageId}?body-format=storage`
 
     const response = await fetch(url, {
       method: 'GET',
@@ -43,19 +46,16 @@ export async function POST(request: Request) {
     })
 
     if (!response.ok) {
-      console.error(`Confluence API error: ${response.status} ${response.statusText}`)
-      let errorMessage
-
-      try {
-        const errorData = await response.json()
-        console.error('Error details:', JSON.stringify(errorData, null, 2))
-        errorMessage = errorData.message || `Failed to fetch Confluence page (${response.status})`
-      } catch (e) {
-        console.error('Could not parse error response as JSON:', e)
-        errorMessage = `Failed to fetch Confluence page: ${response.status} ${response.statusText}`
-      }
-
-      return NextResponse.json({ error: errorMessage }, { status: response.status })
+      const errorText = await response.text()
+      logger.error('Confluence API error response:', {
+        status: response.status,
+        statusText: response.statusText,
+        error: errorText,
+      })
+      return NextResponse.json(
+        { error: parseAtlassianErrorMessage(response.status, response.statusText, errorText) },
+        { status: response.status }
+      )
     }
 
     const data = await response.json()
@@ -64,29 +64,37 @@ export async function POST(request: Request) {
       id: data.id,
       title: data.title,
       body: {
-        view: {
-          value:
-            data.body?.storage?.value ||
-            data.body?.view?.value ||
-            data.body?.atlas_doc_format?.value ||
-            data.content || // try alternative fields
-            data.description ||
-            `Content for page ${data.title}`, // fallback content
+        storage: {
+          value: data.body?.storage?.value ?? null,
+          representation: 'storage',
         },
       },
+      status: data.status ?? null,
+      spaceId: data.spaceId ?? null,
+      parentId: data.parentId ?? null,
+      authorId: data.authorId ?? null,
+      createdAt: data.createdAt ?? null,
+      version: data.version ?? null,
+      _links: data._links ?? null,
     })
   } catch (error) {
-    console.error('Error fetching Confluence page:', error)
+    logger.error('Error fetching Confluence page:', error)
     return NextResponse.json(
       { error: (error as Error).message || 'Internal server error' },
       { status: 500 }
     )
   }
-}
+})
 
-export async function PUT(request: Request) {
+export const PUT = withRouteHandler(async (request: NextRequest) => {
   try {
-    const body = await request.json()
+    const auth = await checkSessionOrInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseRequest(confluenceUpdatePageContract, request, {})
+    if (!parsed.success) return parsed.response
 
     const {
       domain,
@@ -96,24 +104,7 @@ export async function PUT(request: Request) {
       title,
       body: pageBody,
       version,
-    } = body
-
-    if (!domain) {
-      return NextResponse.json({ error: 'Domain is required' }, { status: 400 })
-    }
-
-    if (!accessToken) {
-      return NextResponse.json({ error: 'Access token is required' }, { status: 400 })
-    }
-
-    if (!pageId) {
-      return NextResponse.json({ error: 'Page ID is required' }, { status: 400 })
-    }
-
-    const pageIdValidation = validateAlphanumericId(pageId, 'pageId', 255)
-    if (!pageIdValidation.isValid) {
-      return NextResponse.json({ error: pageIdValidation.error }, { status: 400 })
-    }
+    } = parsed.data.body
 
     const cloudId = providedCloudId || (await getConfluenceCloudId(domain, accessToken))
 
@@ -122,7 +113,7 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: cloudIdValidation.error }, { status: 400 })
     }
 
-    const currentPageUrl = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/pages/${pageId}`
+    const currentPageUrl = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/pages/${pageId}?body-format=storage`
     const currentPageResponse = await fetch(currentPageUrl, {
       headers: {
         Accept: 'application/json',
@@ -131,7 +122,14 @@ export async function PUT(request: Request) {
     })
 
     if (!currentPageResponse.ok) {
-      throw new Error(`Failed to fetch current page: ${currentPageResponse.status}`)
+      const errorText = await currentPageResponse.text()
+      throw new Error(
+        parseAtlassianErrorMessage(
+          currentPageResponse.status,
+          currentPageResponse.statusText,
+          errorText
+        )
+      )
     }
 
     const currentPage = await currentPageResponse.json()
@@ -143,12 +141,25 @@ export async function PUT(request: Request) {
         number: currentVersion + 1,
         message: version?.message || 'Updated via API',
       },
-      title: title,
-      body: {
-        representation: 'storage',
-        value: pageBody?.value || '',
-      },
       status: 'current',
+    }
+
+    if (title !== undefined && title !== null && title !== '') {
+      updateBody.title = title
+    } else {
+      updateBody.title = currentPage.title
+    }
+
+    if (pageBody?.value !== undefined && pageBody?.value !== null && pageBody?.value !== '') {
+      updateBody.body = {
+        representation: 'storage',
+        value: pageBody.value,
+      }
+    } else {
+      updateBody.body = {
+        representation: 'storage',
+        value: currentPage.body?.storage?.value || '',
+      }
     }
 
     const response = await fetch(currentPageUrl, {
@@ -162,26 +173,82 @@ export async function PUT(request: Request) {
     })
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => null)
-      console.error('Confluence API error response:', {
+      const errorText = await response.text()
+      logger.error('Confluence API error response:', {
         status: response.status,
         statusText: response.statusText,
-        error: JSON.stringify(errorData, null, 2),
+        error: errorText,
       })
-      const errorMessage =
-        errorData?.message ||
-        (errorData?.errors && JSON.stringify(errorData.errors)) ||
-        `Failed to update Confluence page (${response.status})`
-      return NextResponse.json({ error: errorMessage }, { status: response.status })
+      return NextResponse.json(
+        { error: parseAtlassianErrorMessage(response.status, response.statusText, errorText) },
+        { status: response.status }
+      )
     }
 
     const data = await response.json()
     return NextResponse.json(data)
   } catch (error) {
-    console.error('Error updating Confluence page:', error)
+    logger.error('Error updating Confluence page:', error)
     return NextResponse.json(
       { error: (error as Error).message || 'Internal server error' },
       { status: 500 }
     )
   }
-}
+})
+
+export const DELETE = withRouteHandler(async (request: NextRequest) => {
+  try {
+    const auth = await checkSessionOrInternalAuth(request)
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: auth.error || 'Unauthorized' }, { status: 401 })
+    }
+
+    const parsed = await parseRequest(confluenceDeletePageContract, request, {})
+    if (!parsed.success) return parsed.response
+
+    const { domain, accessToken, cloudId: providedCloudId, pageId, purge } = parsed.data.body
+
+    const cloudId = providedCloudId || (await getConfluenceCloudId(domain, accessToken))
+
+    const cloudIdValidation = validateJiraCloudId(cloudId, 'cloudId')
+    if (!cloudIdValidation.isValid) {
+      return NextResponse.json({ error: cloudIdValidation.error }, { status: 400 })
+    }
+
+    const queryParams = new URLSearchParams()
+    if (purge) {
+      queryParams.append('purge', 'true')
+    }
+    const queryString = queryParams.toString()
+    const url = `https://api.atlassian.com/ex/confluence/${cloudId}/wiki/api/v2/pages/${pageId}${queryString ? `?${queryString}` : ''}`
+
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      logger.error('Confluence API error response:', {
+        status: response.status,
+        statusText: response.statusText,
+        error: errorText,
+      })
+      return NextResponse.json(
+        { error: parseAtlassianErrorMessage(response.status, response.statusText, errorText) },
+        { status: response.status }
+      )
+    }
+
+    return NextResponse.json({ pageId, deleted: true })
+  } catch (error) {
+    logger.error('Error deleting Confluence page:', error)
+    return NextResponse.json(
+      { error: (error as Error).message || 'Internal server error' },
+      { status: 500 }
+    )
+  }
+})

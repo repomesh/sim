@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from 'crypto'
 import { db } from '@sim/db'
-import { document, embedding } from '@sim/db/schema'
-import { and, asc, eq, ilike, inArray, sql } from 'drizzle-orm'
-import { generateEmbeddings } from '@/lib/embeddings/utils'
+import { document, embedding, knowledgeBase } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { sha256Hex } from '@sim/security/hash'
+import { generateId } from '@sim/utils/id'
+import { and, asc, desc, eq, ilike, inArray, isNull, sql } from 'drizzle-orm'
 import type {
   BatchOperationResult,
   ChunkData,
@@ -10,7 +11,8 @@ import type {
   ChunkQueryResult,
   CreateChunkData,
 } from '@/lib/knowledge/chunks/types'
-import { createLogger } from '@/lib/logs/console/logger'
+import { getEmbeddingModelInfo } from '@/lib/knowledge/embedding-models'
+import { generateEmbeddings } from '@/lib/knowledge/embeddings'
 import { estimateTokenCount } from '@/lib/tokenization/estimators'
 
 const logger = createLogger('ChunksService')
@@ -23,24 +25,27 @@ export async function queryChunks(
   filters: ChunkFilters,
   requestId: string
 ): Promise<ChunkQueryResult> {
-  const { search, enabled = 'all', limit = 50, offset = 0 } = filters
+  const {
+    search,
+    enabled = 'all',
+    limit = 50,
+    offset = 0,
+    sortBy = 'chunkIndex',
+    sortOrder = 'asc',
+  } = filters
 
-  // Build query conditions
   const conditions = [eq(embedding.documentId, documentId)]
 
-  // Add enabled filter
   if (enabled === 'true') {
     conditions.push(eq(embedding.enabled, true))
   } else if (enabled === 'false') {
     conditions.push(eq(embedding.enabled, false))
   }
 
-  // Add search filter
   if (search) {
     conditions.push(ilike(embedding.content, `%${search}%`))
   }
 
-  // Fetch chunks
   const chunks = await db
     .select({
       id: embedding.id,
@@ -63,11 +68,20 @@ export async function queryChunks(
     })
     .from(embedding)
     .where(and(...conditions))
-    .orderBy(asc(embedding.chunkIndex))
+    .orderBy(
+      (() => {
+        const col =
+          sortBy === 'tokenCount'
+            ? embedding.tokenCount
+            : sortBy === 'enabled'
+              ? embedding.enabled
+              : embedding.chunkIndex
+        return sortOrder === 'desc' ? desc(col) : asc(col)
+      })()
+    )
     .limit(limit)
     .offset(offset)
 
-  // Get total count for pagination
   const totalCount = await db
     .select({ count: sql`count(*)` })
     .from(embedding)
@@ -92,22 +106,56 @@ export async function queryChunks(
 export async function createChunk(
   knowledgeBaseId: string,
   documentId: string,
-  docTags: Record<string, string | null>,
+  docTags: Record<string, string | number | boolean | Date | null>,
   chunkData: CreateChunkData,
-  requestId: string
+  requestId: string,
+  workspaceId?: string | null
 ): Promise<ChunkData> {
-  // Generate embedding for the content first (outside transaction for performance)
   logger.info(`[${requestId}] Generating embedding for manual chunk`)
-  const embeddings = await generateEmbeddings([chunkData.content])
+  const kbRow = await db
+    .select({ embeddingModel: knowledgeBase.embeddingModel })
+    .from(knowledgeBase)
+    .where(and(eq(knowledgeBase.id, knowledgeBaseId), isNull(knowledgeBase.deletedAt)))
+    .limit(1)
+  if (kbRow.length === 0) {
+    throw new Error('Knowledge base not found')
+  }
+  const kbEmbeddingModel = kbRow[0].embeddingModel
+  const { embeddings } = await generateEmbeddings(
+    [chunkData.content],
+    kbEmbeddingModel,
+    workspaceId
+  )
 
-  // Calculate accurate token count
-  const tokenCount = estimateTokenCount(chunkData.content, 'openai')
+  const tokenCount = estimateTokenCount(
+    chunkData.content,
+    getEmbeddingModelInfo(kbEmbeddingModel).tokenizerProvider
+  )
 
-  const chunkId = randomUUID()
+  const chunkId = generateId()
   const now = new Date()
 
   // Use transaction to atomically get next index and insert chunk
   const newChunk = await db.transaction(async (tx) => {
+    const activeDocument = await tx
+      .select({ id: document.id })
+      .from(document)
+      .innerJoin(knowledgeBase, eq(document.knowledgeBaseId, knowledgeBase.id))
+      .where(
+        and(
+          eq(document.id, documentId),
+          eq(document.knowledgeBaseId, knowledgeBaseId),
+          isNull(document.archivedAt),
+          isNull(document.deletedAt),
+          isNull(knowledgeBase.deletedAt)
+        )
+      )
+      .limit(1)
+
+    if (activeDocument.length === 0) {
+      throw new Error('Document not found')
+    }
+
     // Get the next chunk index atomically within the transaction
     const lastChunk = await tx
       .select({ chunkIndex: embedding.chunkIndex })
@@ -123,22 +171,35 @@ export async function createChunk(
       knowledgeBaseId,
       documentId,
       chunkIndex: nextChunkIndex,
-      chunkHash: createHash('sha256').update(chunkData.content).digest('hex'),
+      chunkHash: sha256Hex(chunkData.content),
       content: chunkData.content,
       contentLength: chunkData.content.length,
       tokenCount: tokenCount.count,
       embedding: embeddings[0],
-      embeddingModel: 'text-embedding-3-small',
+      embeddingModel: kbEmbeddingModel,
       startOffset: 0, // Manual chunks don't have document offsets
       endOffset: chunkData.content.length,
-      // Inherit tags from parent document
-      tag1: docTags.tag1,
-      tag2: docTags.tag2,
-      tag3: docTags.tag3,
-      tag4: docTags.tag4,
-      tag5: docTags.tag5,
-      tag6: docTags.tag6,
-      tag7: docTags.tag7,
+      // Inherit text tags from parent document
+      tag1: docTags.tag1 as string | null,
+      tag2: docTags.tag2 as string | null,
+      tag3: docTags.tag3 as string | null,
+      tag4: docTags.tag4 as string | null,
+      tag5: docTags.tag5 as string | null,
+      tag6: docTags.tag6 as string | null,
+      tag7: docTags.tag7 as string | null,
+      // Inherit number tags from parent document (5 slots)
+      number1: docTags.number1 as number | null,
+      number2: docTags.number2 as number | null,
+      number3: docTags.number3 as number | null,
+      number4: docTags.number4 as number | null,
+      number5: docTags.number5 as number | null,
+      // Inherit date tags from parent document (2 slots)
+      date1: docTags.date1 as Date | null,
+      date2: docTags.date2 as Date | null,
+      // Inherit boolean tags from parent document (3 slots)
+      boolean1: docTags.boolean1 as boolean | null,
+      boolean2: docTags.boolean2 as boolean | null,
+      boolean3: docTags.boolean3 as boolean | null,
       enabled: chunkData.enabled ?? true,
       createdAt: now,
       updatedAt: now,
@@ -272,7 +333,8 @@ export async function updateChunk(
     content?: string
     enabled?: boolean
   },
-  requestId: string
+  requestId: string,
+  workspaceId?: string | null
 ): Promise<ChunkData> {
   const dbUpdateData: {
     updatedAt: Date
@@ -314,16 +376,27 @@ export async function updateChunk(
       if (content !== currentChunk[0].content) {
         logger.info(`[${requestId}] Content changed, regenerating embedding for chunk ${chunkId}`)
 
-        // Generate new embedding for the updated content
-        const embeddings = await generateEmbeddings([content])
+        const kbRow = await tx
+          .select({ embeddingModel: knowledgeBase.embeddingModel })
+          .from(knowledgeBase)
+          .innerJoin(document, eq(document.knowledgeBaseId, knowledgeBase.id))
+          .where(eq(document.id, currentChunk[0].documentId))
+          .limit(1)
+        const chunkEmbeddingModel = kbRow[0]?.embeddingModel
+        if (!chunkEmbeddingModel) {
+          throw new Error('Knowledge base for chunk not found')
+        }
+        const { embeddings } = await generateEmbeddings([content], chunkEmbeddingModel, workspaceId)
 
-        // Calculate accurate token count
-        const tokenCount = estimateTokenCount(content, 'openai')
+        const tokenCount = estimateTokenCount(
+          content,
+          getEmbeddingModelInfo(chunkEmbeddingModel).tokenizerProvider
+        )
 
         dbUpdateData.content = content
         dbUpdateData.contentLength = newContentLength
         dbUpdateData.tokenCount = tokenCount.count
-        dbUpdateData.chunkHash = createHash('sha256').update(content).digest('hex')
+        dbUpdateData.chunkHash = sha256Hex(content)
         // Add the embedding field to the update data
         dbUpdateData.embedding = embeddings[0]
       } else {
@@ -331,7 +404,7 @@ export async function updateChunk(
         dbUpdateData.content = content
         dbUpdateData.contentLength = newContentLength
         dbUpdateData.tokenCount = oldTokenCount // Keep the same token count if content is identical
-        dbUpdateData.chunkHash = createHash('sha256').update(content).digest('hex')
+        dbUpdateData.chunkHash = sha256Hex(content)
       }
 
       if (updateData.enabled !== undefined) {

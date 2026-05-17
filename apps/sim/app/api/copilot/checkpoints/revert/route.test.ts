@@ -3,54 +3,91 @@
  *
  * @vitest-environment node
  */
+import { authMockFns, workflowAuthzMockFns, workflowsUtilsMock } from '@sim/testing'
 import { NextRequest } from 'next/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  createMockRequest,
-  mockAuth,
-  mockCryptoUuid,
-  setupCommonApiMocks,
-} from '@/app/api/__test-utils__/utils'
+
+const {
+  mockSelect,
+  mockFrom,
+  mockWhere,
+  mockThen,
+  mockDelete,
+  mockDeleteWhere,
+  mockGetAccessibleCopilotChat,
+} = vi.hoisted(() => ({
+  mockSelect: vi.fn(),
+  mockFrom: vi.fn(),
+  mockWhere: vi.fn(),
+  mockThen: vi.fn(),
+  mockDelete: vi.fn(),
+  mockDeleteWhere: vi.fn(),
+  mockGetAccessibleCopilotChat: vi.fn(),
+}))
+
+vi.mock('@/lib/core/utils/urls', () => ({
+  getBaseUrl: vi.fn(() => 'http://localhost:3000'),
+  getInternalApiBaseUrl: vi.fn(() => 'http://localhost:3000'),
+  getBaseDomain: vi.fn(() => 'localhost:3000'),
+  getEmailDomain: vi.fn(() => 'localhost:3000'),
+}))
+
+vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
+
+vi.mock('@/lib/copilot/chat/lifecycle', () => ({
+  getAccessibleCopilotChat: mockGetAccessibleCopilotChat,
+  getAccessibleCopilotChatAuth: mockGetAccessibleCopilotChat,
+}))
+
+vi.mock('@sim/db', () => ({
+  db: {
+    select: mockSelect,
+    delete: mockDelete,
+  },
+}))
+
+vi.mock('drizzle-orm', () => ({
+  and: vi.fn((...conditions: unknown[]) => ({ conditions, type: 'and' })),
+  eq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
+}))
+
+import { POST } from '@/app/api/copilot/checkpoints/revert/route'
 
 describe('Copilot Checkpoints Revert API Route', () => {
-  const mockSelect = vi.fn()
-  const mockFrom = vi.fn()
-  const mockWhere = vi.fn()
-  const mockThen = vi.fn()
+  /** Queued results for successive `.then()` calls in the db select chain */
+  let thenResults: unknown[]
 
   beforeEach(() => {
-    vi.resetModules()
-    setupCommonApiMocks()
-    mockCryptoUuid()
+    vi.clearAllMocks()
+
+    thenResults = []
+
+    authMockFns.mockGetSession.mockResolvedValue(null)
+
+    workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValue({
+      allowed: true,
+      status: 200,
+    })
 
     mockSelect.mockReturnValue({ from: mockFrom })
     mockFrom.mockReturnValue({ where: mockWhere })
     mockWhere.mockReturnValue({ then: mockThen })
-    mockThen.mockResolvedValue(null) // Default: no data found
 
-    vi.doMock('@sim/db', () => ({
-      db: {
-        select: mockSelect,
-      },
-    }))
+    // Drizzle's .then() is a thenable: it receives a callback like (rows) => rows[0].
+    // We invoke the callback with our mock rows array so the route gets the expected value.
+    mockThen.mockImplementation((callback: (rows: unknown[]) => unknown) => {
+      const result = thenResults.shift()
+      if (result instanceof Error) {
+        return Promise.reject(result)
+      }
+      const rows = result === undefined ? [] : [result]
+      return Promise.resolve(callback(rows))
+    })
 
-    vi.doMock('@sim/db/schema', () => ({
-      workflowCheckpoints: {
-        id: 'id',
-        userId: 'userId',
-        workflowId: 'workflowId',
-        workflowState: 'workflowState',
-      },
-      workflow: {
-        id: 'id',
-        userId: 'userId',
-      },
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      and: vi.fn((...conditions) => ({ conditions, type: 'and' })),
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-    }))
+    // Mock delete chain
+    mockDelete.mockReturnValue({ where: mockDeleteWhere })
+    mockDeleteWhere.mockResolvedValue(undefined)
+    mockGetAccessibleCopilotChat.mockResolvedValue({ id: 'chat-123', userId: 'user-123' })
 
     global.fetch = vi.fn()
 
@@ -74,16 +111,26 @@ describe('Copilot Checkpoints Revert API Route', () => {
     vi.restoreAllMocks()
   })
 
+  /** Helper to set authenticated state */
+  function setAuthenticated(user = { id: 'user-123', email: 'test@example.com' }) {
+    authMockFns.mockGetSession.mockResolvedValue({ user })
+  }
+
+  /** Helper to set unauthenticated state */
+  function setUnauthenticated() {
+    authMockFns.mockGetSession.mockResolvedValue(null)
+  }
+
   describe('POST', () => {
     it('should return 401 when user is not authenticated', async () => {
-      const authMocks = mockAuth()
-      authMocks.setUnauthenticated()
+      setUnauthenticated()
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(401)
@@ -91,50 +138,50 @@ describe('Copilot Checkpoints Revert API Route', () => {
       expect(responseData).toEqual({ error: 'Unauthorized' })
     })
 
-    it('should return 500 for invalid request body - missing checkpointId', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+    it('should return 400 for invalid request body - missing checkpointId', async () => {
+      setAuthenticated()
 
-      const req = createMockRequest('POST', {
-        // Missing checkpointId
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to revert to checkpoint')
+      expect(typeof responseData.error).toBe('string')
     })
 
-    it('should return 500 for empty checkpointId', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+    it('should return 400 for empty checkpointId', async () => {
+      setAuthenticated()
 
-      const req = createMockRequest('POST', {
-        checkpointId: '',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: '' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
-      expect(response.status).toBe(500)
+      expect(response.status).toBe(400)
       const responseData = await response.json()
-      expect(responseData.error).toBe('Failed to revert to checkpoint')
+      expect(typeof responseData.error).toBe('string')
     })
 
     it('should return 404 when checkpoint is not found', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       // Mock checkpoint not found
-      mockThen.mockResolvedValueOnce(undefined)
+      thenResults.push(undefined)
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'non-existent-checkpoint',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'non-existent-checkpoint' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(404)
@@ -143,17 +190,17 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should return 404 when checkpoint belongs to different user', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       // Mock checkpoint not found (due to user mismatch in query)
-      mockThen.mockResolvedValueOnce(undefined)
+      thenResults.push(undefined)
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'other-user-checkpoint',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'other-user-checkpoint' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(404)
@@ -162,10 +209,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should return 404 when workflow is not found', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
-      // Mock checkpoint found but workflow not found
       const mockCheckpoint = {
         id: 'checkpoint-123',
         workflowId: 'a1b2c3d4-e5f6-4a78-b9c0-d1e2f3a4b5c6',
@@ -173,15 +218,15 @@ describe('Copilot Checkpoints Revert API Route', () => {
         workflowState: { blocks: {}, edges: [] },
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint) // Checkpoint found
-        .mockResolvedValueOnce(undefined) // Workflow not found
+      thenResults.push(mockCheckpoint) // Checkpoint found
+      thenResults.push(undefined) // Workflow not found
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(404)
@@ -190,10 +235,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should return 401 when workflow belongs to different user', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
-      // Mock checkpoint found but workflow belongs to different user
       const mockCheckpoint = {
         id: 'checkpoint-123',
         workflowId: 'b2c3d4e5-f6a7-4b89-a0d1-e2f3a4b5c6d7',
@@ -206,15 +249,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'different-user',
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint) // Checkpoint found
-        .mockResolvedValueOnce(mockWorkflow) // Workflow found but different user
+      thenResults.push(mockCheckpoint) // Checkpoint found
+      thenResults.push(mockWorkflow) // Workflow found but different user
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: false,
+        status: 403,
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
+      })
+
       const response = await POST(req)
 
       expect(response.status).toBe(401)
@@ -223,8 +271,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should successfully revert checkpoint with basic workflow state', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -236,7 +283,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
           loops: {},
           parallels: {},
           isDeployed: true,
-          deploymentStatuses: { production: 'deployed' },
         },
       }
 
@@ -245,11 +291,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint) // Checkpoint found
-        .mockResolvedValueOnce(mockWorkflow) // Workflow found
-
-      // Mock successful state API call
+      thenResults.push(mockCheckpoint) // Checkpoint found
+      thenResults.push(mockWorkflow) // Workflow found
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -267,7 +310,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
         }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -285,7 +327,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
             loops: {},
             parallels: {},
             isDeployed: true,
-            deploymentStatuses: { production: 'deployed' },
             lastSaved: 1640995200000,
           },
         },
@@ -306,7 +347,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
             loops: {},
             parallels: {},
             isDeployed: true,
-            deploymentStatuses: { production: 'deployed' },
             lastSaved: 1640995200000,
           }),
         }
@@ -314,8 +354,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle checkpoint state with valid deployedAt date', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-with-date',
@@ -334,18 +373,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true }),
       })
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-with-date',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-with-date' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -355,8 +396,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle checkpoint state with invalid deployedAt date', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-invalid-date',
@@ -375,18 +415,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true }),
       })
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-invalid-date',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-invalid-date' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -396,8 +438,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle checkpoint state with null/undefined values', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-null-values',
@@ -408,7 +449,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
           edges: undefined,
           loops: null,
           parallels: undefined,
-          deploymentStatuses: null,
         },
       }
 
@@ -417,18 +457,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true }),
       })
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-null-values',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-null-values' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -441,14 +483,12 @@ describe('Copilot Checkpoints Revert API Route', () => {
         loops: {},
         parallels: {},
         isDeployed: false,
-        deploymentStatuses: {},
         lastSaved: 1640995200000,
       })
     })
 
     it('should return 500 when state API call fails', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -462,22 +502,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint)
-        .mockResolvedValueOnce(mockWorkflow)
-
-      // Mock failed state API call
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: false,
         text: () => Promise.resolve('State validation failed'),
       })
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -486,17 +524,17 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle database errors during checkpoint lookup', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       // Mock database error
-      mockThen.mockRejectedValueOnce(new Error('Database connection failed'))
+      thenResults.push(new Error('Database connection failed'))
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -505,8 +543,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle database errors during workflow lookup', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -515,15 +552,15 @@ describe('Copilot Checkpoints Revert API Route', () => {
         workflowState: { blocks: {}, edges: [] },
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint) // Checkpoint found
-        .mockRejectedValueOnce(new Error('Database error during workflow lookup')) // Workflow lookup fails
+      thenResults.push(mockCheckpoint) // Checkpoint found
+      thenResults.push(new Error('Database error during workflow lookup')) // Workflow lookup fails
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -532,8 +569,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle fetch network errors', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -547,19 +583,17 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen
-        .mockResolvedValueOnce(mockCheckpoint)
-        .mockResolvedValueOnce(mockWorkflow)
-
-      // Mock fetch network error
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockRejectedValue(new Error('Network error'))
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-123',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-123' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -568,10 +602,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle JSON parsing errors in request body', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
-      // Create a request with invalid JSON
       const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
         method: 'POST',
         body: '{invalid-json',
@@ -580,7 +612,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
         },
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(500)
@@ -589,8 +620,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should forward cookies to state API call', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -604,7 +634,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -622,7 +653,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
         }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       await POST(req)
 
       expect(global.fetch).toHaveBeenCalledWith(
@@ -639,8 +669,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle missing cookies gracefully', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-123',
@@ -654,7 +683,8 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
@@ -672,7 +702,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
         }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -690,8 +719,7 @@ describe('Copilot Checkpoints Revert API Route', () => {
     })
 
     it('should handle complex checkpoint state with all fields', async () => {
-      const authMocks = mockAuth()
-      authMocks.setAuthenticated()
+      setAuthenticated()
 
       const mockCheckpoint = {
         id: 'checkpoint-complex',
@@ -714,10 +742,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
             parallel1: { branches: ['branch1', 'branch2'] },
           },
           isDeployed: true,
-          deploymentStatuses: {
-            production: 'deployed',
-            staging: 'pending',
-          },
           deployedAt: '2024-01-01T10:00:00.000Z',
         },
       }
@@ -727,18 +751,20 @@ describe('Copilot Checkpoints Revert API Route', () => {
         userId: 'user-123',
       }
 
-      mockThen.mockResolvedValueOnce(mockCheckpoint).mockResolvedValueOnce(mockWorkflow)
+      thenResults.push(mockCheckpoint)
+      thenResults.push(mockWorkflow)
 
       ;(global.fetch as any).mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true }),
       })
 
-      const req = createMockRequest('POST', {
-        checkpointId: 'checkpoint-complex',
+      const req = new NextRequest('http://localhost:3000/api/copilot/checkpoints/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpointId: 'checkpoint-complex' }),
       })
 
-      const { POST } = await import('@/app/api/copilot/checkpoints/revert/route')
       const response = await POST(req)
 
       expect(response.status).toBe(200)
@@ -760,10 +786,6 @@ describe('Copilot Checkpoints Revert API Route', () => {
           parallel1: { branches: ['branch1', 'branch2'] },
         },
         isDeployed: true,
-        deploymentStatuses: {
-          production: 'deployed',
-          staging: 'pending',
-        },
         deployedAt: '2024-01-01T10:00:00.000Z',
         lastSaved: 1640995200000,
       })

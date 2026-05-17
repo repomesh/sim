@@ -1,86 +1,74 @@
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { wealthboxOAuthItemsContract } from '@/lib/api/contracts/selectors/wealthbox'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validatePathSegment } from '@/lib/core/security/input-validation'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('WealthboxItemsAPI')
 
+interface WealthboxItem {
+  id: string
+  name: string
+  type: string
+  content: string
+  createdAt: string
+  updatedAt: string
+}
+
 /**
  * Get items (notes, contacts, tasks) from Wealthbox
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
 
   try {
-    // Get the session
-    const session = await getSession()
+    const parsed = await parseRequest(wealthboxOAuthItemsContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { credentialId, type } = parsed.data.query
+    const query = parsed.data.query.query ?? ''
 
-    // Check if the user is authenticated
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthenticated request rejected`)
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
+    const credentialIdValidation = validatePathSegment(credentialId, {
+      paramName: 'credentialId',
+      maxLength: 100,
+      allowHyphens: true,
+      allowUnderscores: true,
+      allowDots: false,
+    })
+    if (!credentialIdValidation.isValid) {
+      logger.warn(`[${requestId}] Invalid credentialId format: ${credentialId}`)
+      return NextResponse.json({ error: credentialIdValidation.error }, { status: 400 })
     }
 
-    // Get parameters from query
-    const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const type = searchParams.get('type') || 'contact'
-    const query = searchParams.get('query') || ''
-
-    if (!credentialId) {
-      logger.warn(`[${requestId}] Missing credential ID`)
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+    const authz = await authorizeCredentialUse(request, {
+      credentialId,
+      requireWorkflowIdForInternal: false,
+    })
+    if (!authz.ok || !authz.credentialOwnerUserId) {
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    // Validate item type - only handle contacts now
-    if (type !== 'contact') {
-      logger.warn(`[${requestId}] Invalid item type: ${type}`)
-      return NextResponse.json(
-        { error: 'Invalid item type. Only contact is supported.' },
-        { status: 400 }
-      )
-    }
-
-    // Get the credential from the database
-    const credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-
-    if (!credentials.length) {
-      logger.warn(`[${requestId}] Credential not found`, { credentialId })
-      return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
-    }
-
-    const credential = credentials[0]
-
-    // Check if the credential belongs to the user
-    if (credential.userId !== session.user.id) {
-      logger.warn(`[${requestId}] Unauthorized credential access attempt`, {
-        credentialUserId: credential.userId,
-        requestUserId: session.user.id,
-      })
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    // Refresh access token if needed
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, session.user.id, requestId)
+    const accessToken = await refreshAccessTokenIfNeeded(
+      credentialId,
+      authz.credentialOwnerUserId,
+      requestId
+    )
 
     if (!accessToken) {
       logger.error(`[${requestId}] Failed to obtain valid access token`)
       return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
     }
 
-    // Use correct endpoints based on documentation - only for contacts
     const endpoints = {
       contact: 'contacts',
     }
     const endpoint = endpoints[type as keyof typeof endpoints]
 
-    // Build URL - using correct API base URL
     const url = new URL(`https://api.crmworkspace.com/v1/${endpoint}`)
 
     logger.info(`[${requestId}] Fetching ${type}s from Wealthbox`, {
@@ -89,7 +77,6 @@ export async function GET(request: NextRequest) {
       hasQuery: !!query.trim(),
     })
 
-    // Make request to Wealthbox API
     const response = await fetch(url.toString(), {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -113,7 +100,10 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    const data = await response.json()
+    const data = (await response.json()) as { contacts?: Array<Record<string, unknown>> } & Record<
+      string,
+      unknown
+    >
 
     logger.info(`[${requestId}] Wealthbox API response structure`, {
       type,
@@ -123,8 +113,7 @@ export async function GET(request: NextRequest) {
       dataStructure: typeof data === 'object' ? Object.keys(data) : 'not an object',
     })
 
-    // Transform the response based on type and correct response format
-    let items: any[] = []
+    let items: WealthboxItem[] = []
 
     if (type === 'contact') {
       const contacts = data.contacts || []
@@ -136,17 +125,21 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ items: [] }, { status: 200 })
       }
 
-      items = contacts.map((item: any) => ({
-        id: item.id?.toString() || '',
-        name: `${item.first_name || ''} ${item.last_name || ''}`.trim() || `Contact ${item.id}`,
-        type: 'contact',
-        content: item.background_information || '',
-        createdAt: item.created_at,
-        updatedAt: item.updated_at,
-      }))
+      items = contacts.map((item) => {
+        const firstName = typeof item.first_name === 'string' ? item.first_name : ''
+        const lastName = typeof item.last_name === 'string' ? item.last_name : ''
+        return {
+          id: item.id?.toString() || '',
+          name: `${firstName} ${lastName}`.trim() || `Contact ${item.id ?? ''}`,
+          type: 'contact',
+          content:
+            typeof item.background_information === 'string' ? item.background_information : '',
+          createdAt: typeof item.created_at === 'string' ? item.created_at : '',
+          updatedAt: typeof item.updated_at === 'string' ? item.updated_at : '',
+        }
+      })
     }
 
-    // Apply client-side filtering if query is provided
     if (query.trim()) {
       const searchTerm = query.trim().toLowerCase()
       items = items.filter(
@@ -166,4 +159,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Error fetching Wealthbox items`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

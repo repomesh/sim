@@ -1,19 +1,37 @@
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
+import { db } from '@sim/db'
+import { user } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { forgetPasswordContract } from '@/lib/api/contracts'
+import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
 import { auth } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('ForgetPasswordAPI')
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
-    const body = await request.json()
-    const { email, redirectTo } = body
+    const parsed = await parseRequest(
+      forgetPasswordContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          logger.warn('Invalid forget password request data', { errors: error.issues })
+          return NextResponse.json(
+            { message: getValidationErrorMessage(error, 'Invalid request data') },
+            { status: 400 }
+          )
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
 
-    if (!email) {
-      return NextResponse.json({ message: 'Email is required' }, { status: 400 })
-    }
+    const { email, redirectTo } = parsed.data.body
 
     await auth.api.forgetPassword({
       body: {
@@ -22,6 +40,26 @@ export async function POST(request: NextRequest) {
       },
       method: 'POST',
     })
+
+    const [existingUser] = await db
+      .select({ id: user.id, name: user.name, email: user.email })
+      .from(user)
+      .where(eq(user.email, email))
+      .limit(1)
+
+    if (existingUser) {
+      recordAudit({
+        actorId: existingUser.id,
+        actorName: existingUser.name,
+        actorEmail: existingUser.email,
+        action: AuditAction.PASSWORD_RESET_REQUESTED,
+        resourceType: AuditResourceType.PASSWORD,
+        resourceId: existingUser.id,
+        resourceName: existingUser.email ?? undefined,
+        description: `Password reset requested for ${existingUser.email}`,
+        request,
+      })
+    }
 
     return NextResponse.json({ success: true })
   } catch (error) {
@@ -37,4 +75,4 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
-}
+})

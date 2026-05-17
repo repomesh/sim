@@ -1,8 +1,10 @@
+import { getErrorMessage } from '@sim/utils/errors'
 import { MongoDBIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import type { MongoDBResponse } from '@/tools/mongodb/types'
+import { IntegrationType } from '@/blocks/types'
+import type { MongoDBIntrospectResponse, MongoDBResponse } from '@/tools/mongodb/types'
 
-export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
+export const MongoDBBlock: BlockConfig<MongoDBResponse | MongoDBIntrospectResponse> = {
   type: 'mongodb',
   name: 'MongoDB',
   description: 'Connect to MongoDB database',
@@ -10,6 +12,8 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
     'Integrate MongoDB into the workflow. Can find, insert, update, delete, and aggregate data.',
   docsLink: 'https://docs.sim.ai/tools/mongodb',
   category: 'tools',
+  integrationType: IntegrationType.Databases,
+  tags: ['data-warehouse', 'cloud'],
   bgColor: '#E0E0E0',
   icon: MongoDBIcon,
   subBlocks: [
@@ -17,13 +21,13 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Find Documents', id: 'query' },
         { label: 'Insert Documents', id: 'insert' },
         { label: 'Update Documents', id: 'update' },
         { label: 'Delete Documents', id: 'delete' },
         { label: 'Aggregate Pipeline', id: 'execute' },
+        { label: 'Introspect Database', id: 'introspect' },
       ],
       value: () => 'query',
     },
@@ -31,7 +35,6 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'host',
       title: 'Host',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'localhost or your.mongodb.host',
       required: true,
     },
@@ -39,7 +42,6 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'port',
       title: 'Port',
       type: 'short-input',
-      layout: 'full',
       placeholder: '27017',
       value: () => '27017',
       required: true,
@@ -48,7 +50,6 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'database',
       title: 'Database Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'your_database',
       required: true,
     },
@@ -56,7 +57,6 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'username',
       title: 'Username',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'mongodb_user',
       required: true,
     },
@@ -64,7 +64,6 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'password',
       title: 'Password',
       type: 'short-input',
-      layout: 'full',
       password: true,
       placeholder: 'Your database password',
       required: true,
@@ -73,34 +72,33 @@ export const MongoDBBlock: BlockConfig<MongoDBResponse> = {
       id: 'authSource',
       title: 'Auth Source',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'admin',
+      mode: 'advanced',
     },
     {
       id: 'ssl',
       title: 'SSL Mode',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Disabled', id: 'disabled' },
         { label: 'Required', id: 'required' },
         { label: 'Preferred', id: 'preferred' },
       ],
       value: () => 'preferred',
+      mode: 'advanced',
     },
     {
       id: 'collection',
       title: 'Collection Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'users',
       required: true,
+      condition: { field: 'operation', value: 'introspect', not: true },
     },
     {
       id: 'query',
       title: 'Query Filter (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{"status": "active"}',
       condition: { field: 'operation', value: 'query' },
       wandConfig: {
@@ -223,7 +221,6 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
       id: 'pipeline',
       title: 'Aggregation Pipeline (JSON Array)',
       type: 'code',
-      layout: 'full',
       placeholder: '[{"$group": {"_id": "$status", "count": {"$sum": 1}}}]',
       condition: { field: 'operation', value: 'execute' },
       required: true,
@@ -458,17 +455,17 @@ Return ONLY the JSON array pipeline - no explanations, no markdown, no extra tex
       id: 'limit',
       title: 'Limit',
       type: 'short-input',
-      layout: 'full',
       placeholder: '100',
       condition: { field: 'operation', value: 'query' },
+      mode: 'advanced',
     },
     {
       id: 'sort',
       title: 'Sort (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{"createdAt": -1}',
       condition: { field: 'operation', value: 'query' },
+      mode: 'advanced',
       wandConfig: {
         enabled: true,
         maintainHistory: true,
@@ -491,7 +488,6 @@ Use 1 for ascending, -1 for descending. Return ONLY valid JSON.`,
       id: 'documents',
       title: 'Documents (JSON Array)',
       type: 'code',
-      layout: 'full',
       placeholder: '[{"name": "John Doe", "email": "john@example.com", "status": "active"}]',
       condition: { field: 'operation', value: 'insert' },
       required: true,
@@ -517,7 +513,6 @@ Return ONLY valid JSON array - no explanations.`,
       id: 'filter',
       title: 'Filter (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{"name": "Alice Test"}',
       condition: { field: 'operation', value: 'update' },
       required: true,
@@ -602,7 +597,6 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
       id: 'update',
       title: 'Update (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{"$set": {"name": "Jane Doe", "email": "jane@example.com"}}',
       condition: { field: 'operation', value: 'update' },
       required: true,
@@ -688,31 +682,30 @@ Generate the MongoDB update operation that safely and accurately fulfills the us
       id: 'upsert',
       title: 'Upsert',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'False', id: 'false' },
         { label: 'True', id: 'true' },
       ],
       value: () => 'false',
       condition: { field: 'operation', value: 'update' },
+      mode: 'advanced',
     },
     {
       id: 'multi',
       title: 'Update Multiple',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'False', id: 'false' },
         { label: 'True', id: 'true' },
       ],
       value: () => 'false',
       condition: { field: 'operation', value: 'update' },
+      mode: 'advanced',
     },
     {
       id: 'filter',
       title: 'Filter (JSON)',
       type: 'code',
-      layout: 'full',
       placeholder: '{"status": "inactive"}',
       condition: { field: 'operation', value: 'delete' },
       required: true,
@@ -807,13 +800,13 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
       id: 'multi',
       title: 'Delete Multiple',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'False', id: 'false' },
         { label: 'True', id: 'true' },
       ],
       value: () => 'false',
       condition: { field: 'operation', value: 'delete' },
+      mode: 'advanced',
     },
   ],
   tools: {
@@ -823,6 +816,7 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
       'mongodb_update',
       'mongodb_delete',
       'mongodb_execute',
+      'mongodb_introspect',
     ],
     config: {
       tool: (params) => {
@@ -837,6 +831,8 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
             return 'mongodb_delete'
           case 'execute':
             return 'mongodb_execute'
+          case 'introspect':
+            return 'mongodb_introspect'
           default:
             throw new Error(`Invalid MongoDB operation: ${params.operation}`)
         }
@@ -849,7 +845,7 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
           try {
             parsedDocuments = JSON.parse(documents)
           } catch (parseError) {
-            const errorMsg = parseError instanceof Error ? parseError.message : 'Unknown JSON error'
+            const errorMsg = getErrorMessage(parseError, 'Unknown JSON error')
             throw new Error(
               `Invalid JSON documents format: ${errorMsg}. Please check your JSON syntax.`
             )
@@ -955,6 +951,15 @@ Return ONLY the MongoDB query filter as valid JSON - no explanations, no markdow
     matchedCount: {
       type: 'number',
       description: 'Number of documents matched (update operations)',
+    },
+    databases: {
+      type: 'array',
+      description: 'Array of database names (introspect operation)',
+    },
+    collections: {
+      type: 'array',
+      description:
+        'Array of collection info with name, type, document count, and indexes (introspect operation)',
     },
   },
 }

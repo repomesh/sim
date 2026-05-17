@@ -4,15 +4,6 @@ import {
   streamingResponseFormatProcessor,
 } from '@/executor/utils'
 
-vi.mock('@/lib/logs/console/logger', () => ({
-  createLogger: vi.fn().mockReturnValue({
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }),
-}))
-
 describe('StreamingResponseFormatProcessor', () => {
   let processor: StreamingResponseFormatProcessor
 

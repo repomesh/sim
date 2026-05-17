@@ -1,54 +1,65 @@
-import { randomUUID } from 'crypto'
-import { db } from '@sim/db'
-import { account } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
 import { type NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { onedriveFoldersQuerySchema } from '@/lib/api/contracts/selectors/microsoft'
+import { getValidationErrorMessage } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { validateMicrosoftGraphId } from '@/lib/core/security/input-validation'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { refreshAccessTokenIfNeeded } from '@/app/api/auth/oauth/utils'
+import type { MicrosoftGraphDriveItem } from '@/tools/onedrive/types'
 
 export const dynamic = 'force-dynamic'
 
 const logger = createLogger('OneDriveFoldersAPI')
 
-import type { MicrosoftGraphDriveItem } from '@/tools/onedrive/types'
-
 /**
  * Get folders from Microsoft OneDrive
  */
-export async function GET(request: NextRequest) {
-  const requestId = randomUUID().slice(0, 8)
+export const GET = withRouteHandler(async (request: NextRequest) => {
+  const requestId = generateId().slice(0, 8)
 
   try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'User not authenticated' }, { status: 401 })
-    }
-
     const { searchParams } = new URL(request.url)
-    const credentialId = searchParams.get('credentialId')
-    const query = searchParams.get('query') || ''
+    const validation = onedriveFoldersQuerySchema.safeParse({
+      credentialId: searchParams.get('credentialId') ?? '',
+      query: searchParams.get('query') ?? undefined,
+    })
+    if (!validation.success) {
+      logger.warn(`[${requestId}] Invalid folders request data`, {
+        errors: validation.error.issues,
+      })
+      return NextResponse.json(
+        { error: getValidationErrorMessage(validation.error, 'Invalid request') },
+        { status: 400 }
+      )
+    }
+    const { credentialId } = validation.data
+    const query = validation.data.query ?? ''
 
-    if (!credentialId) {
-      return NextResponse.json({ error: 'Credential ID is required' }, { status: 400 })
+    const credentialIdValidation = validateMicrosoftGraphId(credentialId, 'credentialId')
+    if (!credentialIdValidation.isValid) {
+      logger.warn(`[${requestId}] Invalid credential ID`, { error: credentialIdValidation.error })
+      return NextResponse.json({ error: credentialIdValidation.error }, { status: 400 })
     }
 
-    const credentials = await db.select().from(account).where(eq(account.id, credentialId)).limit(1)
-    if (!credentials.length) {
-      return NextResponse.json({ error: 'Credential not found' }, { status: 404 })
+    const authz = await authorizeCredentialUse(request, {
+      credentialId,
+      requireWorkflowIdForInternal: false,
+    })
+    if (!authz.ok || !authz.credentialOwnerUserId || !authz.resolvedCredentialId) {
+      return NextResponse.json({ error: authz.error || 'Unauthorized' }, { status: 403 })
     }
 
-    const credential = credentials[0]
-    if (credential.userId !== session.user.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    const accessToken = await refreshAccessTokenIfNeeded(credentialId, session.user.id, requestId)
+    const accessToken = await refreshAccessTokenIfNeeded(
+      credentialId,
+      authz.credentialOwnerUserId,
+      requestId
+    )
     if (!accessToken) {
       return NextResponse.json({ error: 'Failed to obtain valid access token' }, { status: 401 })
     }
 
-    // Build URL for OneDrive folders
     let url = `https://graph.microsoft.com/v1.0/me/drive/root/children?$filter=folder ne null&$select=id,name,folder,webUrl,createdDateTime,lastModifiedDateTime&$top=50`
 
     if (query) {
@@ -71,7 +82,7 @@ export async function GET(request: NextRequest) {
 
     const data = await response.json()
     const folders = (data.value || [])
-      .filter((item: MicrosoftGraphDriveItem) => item.folder) // Only folders
+      .filter((item: MicrosoftGraphDriveItem) => item.folder)
       .map((folder: MicrosoftGraphDriveItem) => ({
         id: folder.id,
         name: folder.name,
@@ -86,4 +97,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Error fetching folders from OneDrive`, error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

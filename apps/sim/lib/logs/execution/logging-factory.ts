@@ -1,6 +1,16 @@
+import { db, workflow } from '@sim/db'
+import { eq } from 'drizzle-orm'
 import { BASE_EXECUTION_CHARGE } from '@/lib/billing/constants'
-import type { ExecutionEnvironment, ExecutionTrigger, WorkflowState } from '@/lib/logs/types'
-import { loadWorkflowFromNormalizedTables } from '@/lib/workflows/db-helpers'
+import type {
+  ExecutionEnvironment,
+  ExecutionTrigger,
+  TraceSpan,
+  WorkflowState,
+} from '@/lib/logs/types'
+import {
+  loadDeployedWorkflowState,
+  loadWorkflowFromNormalizedTables,
+} from '@/lib/workflows/persistence/utils'
 
 export function createTriggerObject(
   type: ExecutionTrigger['type'],
@@ -31,7 +41,15 @@ export function createEnvironmentObject(
 }
 
 export async function loadWorkflowStateForExecution(workflowId: string): Promise<WorkflowState> {
-  const normalizedData = await loadWorkflowFromNormalizedTables(workflowId)
+  const [normalizedData, workflowRecord] = await Promise.all([
+    loadWorkflowFromNormalizedTables(workflowId),
+    db
+      .select({ variables: workflow.variables })
+      .from(workflow)
+      .where(eq(workflow.id, workflowId))
+      .limit(1)
+      .then((rows) => rows[0]),
+  ])
 
   if (!normalizedData) {
     throw new Error(
@@ -44,10 +62,45 @@ export async function loadWorkflowStateForExecution(workflowId: string): Promise
     edges: normalizedData.edges || [],
     loops: normalizedData.loops || {},
     parallels: normalizedData.parallels || {},
+    variables: (workflowRecord?.variables as WorkflowState['variables']) || undefined,
   }
 }
 
-export function calculateCostSummary(traceSpans: any[]): {
+/**
+ * Load deployed workflow state for logging purposes.
+ * This fetches the active deployment state, ensuring logs capture
+ * the exact state that was executed (not the live editor state).
+ */
+export async function loadDeployedWorkflowStateForLogging(
+  workflowId: string
+): Promise<WorkflowState> {
+  const deployedData = await loadDeployedWorkflowState(workflowId)
+
+  return {
+    blocks: deployedData.blocks || {},
+    edges: deployedData.edges || [],
+    loops: deployedData.loops || {},
+    parallels: deployedData.parallels || {},
+    variables: deployedData.variables as WorkflowState['variables'],
+  }
+}
+
+type CostTraceSpan = Pick<TraceSpan, 'cost' | 'model' | 'tokens'> & {
+  type?: TraceSpan['type']
+  children?: CostTraceSpan[]
+}
+
+type BillableTraceSpan = CostTraceSpan & { cost: NonNullable<TraceSpan['cost']> }
+
+function hasBillableCost(span: CostTraceSpan): span is BillableTraceSpan {
+  return span.cost !== undefined
+}
+
+function isModelBreakdownSpan(span: CostTraceSpan): boolean {
+  return span.type === 'model'
+}
+
+export function calculateCostSummary(traceSpans: CostTraceSpan[] | undefined): {
   totalCost: number
   totalInputCost: number
   totalOutputCost: number
@@ -62,7 +115,8 @@ export function calculateCostSummary(traceSpans: any[]): {
       input: number
       output: number
       total: number
-      tokens: { prompt: number; completion: number; total: number }
+      toolCost?: number
+      tokens: { input: number; output: number; total: number }
     }
   >
 } {
@@ -80,17 +134,39 @@ export function calculateCostSummary(traceSpans: any[]): {
     }
   }
 
-  // Recursively collect all spans with cost information from the trace span tree
-  const collectCostSpans = (spans: any[]): any[] => {
-    const costSpans: any[] = []
+  /**
+   * Collects spans that contribute to the execution's billable cost.
+   *
+   * Rule: when a span has its own `cost` AND has child model segments, the
+   * parent's block-level cost is authoritative — skip the model children to
+   * avoid double-counting. The parent cost is set by the provider response
+   * (and is correctly zeroed by `executeProviderRequest` for BYOK calls);
+   * model children only carry per-segment cost from the trace enrichers,
+   * which is unaware of BYOK status. Non-model children are still visited
+   * so standalone nested costs remain billable.
+   *
+   * Spans without their own `cost` (e.g. parent workflow spans for
+   * subworkflow blocks) still recurse so nested billable spans are counted.
+   */
+  const collectCostSpans = (spans: CostTraceSpan[]): BillableTraceSpan[] => {
+    const costSpans: BillableTraceSpan[] = []
 
     for (const span of spans) {
-      if (span.cost) {
+      const hasOwnCost = hasBillableCost(span)
+      if (hasOwnCost) {
         costSpans.push(span)
       }
 
       if (span.children && Array.isArray(span.children)) {
-        costSpans.push(...collectCostSpans(span.children))
+        if (hasOwnCost) {
+          // Parent already accounts for its model segments; only recurse into
+          // non-model children (e.g. nested workflow spans) to find further
+          // billable units.
+          const nonModelChildren = span.children.filter((child) => !isModelBreakdownSpan(child))
+          costSpans.push(...collectCostSpans(nonModelChildren))
+        } else {
+          costSpans.push(...collectCostSpans(span.children))
+        }
       }
     }
 
@@ -111,7 +187,8 @@ export function calculateCostSummary(traceSpans: any[]): {
       input: number
       output: number
       total: number
-      tokens: { prompt: number; completion: number; total: number }
+      toolCost?: number
+      tokens: { input: number; output: number; total: number }
     }
   > = {}
 
@@ -119,12 +196,10 @@ export function calculateCostSummary(traceSpans: any[]): {
     totalCost += span.cost.total || 0
     totalInputCost += span.cost.input || 0
     totalOutputCost += span.cost.output || 0
-    // Tokens are at span.tokens, not span.cost.tokens
     totalTokens += span.tokens?.total || 0
-    totalPromptTokens += span.tokens?.prompt || 0
-    totalCompletionTokens += span.tokens?.completion || 0
+    totalPromptTokens += span.tokens?.input ?? span.tokens?.prompt ?? 0
+    totalCompletionTokens += span.tokens?.output ?? span.tokens?.completion ?? 0
 
-    // Aggregate model-specific costs - model is at span.model, not span.cost.model
     if (span.model) {
       const model = span.model
       if (!models[model]) {
@@ -132,15 +207,19 @@ export function calculateCostSummary(traceSpans: any[]): {
           input: 0,
           output: 0,
           total: 0,
-          tokens: { prompt: 0, completion: 0, total: 0 },
+          tokens: { input: 0, output: 0, total: 0 },
         }
       }
       models[model].input += span.cost.input || 0
       models[model].output += span.cost.output || 0
       models[model].total += span.cost.total || 0
-      models[model].tokens.prompt += span.tokens?.prompt || 0
-      models[model].tokens.completion += span.tokens?.completion || 0
+      models[model].tokens.input += span.tokens?.input ?? span.tokens?.prompt ?? 0
+      models[model].tokens.output += span.tokens?.output ?? span.tokens?.completion ?? 0
       models[model].tokens.total += span.tokens?.total || 0
+
+      if (span.cost.toolCost) {
+        models[model].toolCost = (models[model].toolCost || 0) + span.cost.toolCost
+      }
     }
   }
 

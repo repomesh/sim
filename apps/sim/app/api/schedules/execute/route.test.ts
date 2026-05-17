@@ -3,280 +3,285 @@
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  mockExecutionDependencies,
-  mockScheduleExecuteDb,
-  sampleWorkflowState,
-} from '@/app/api/__test-utils__/utils'
+  dbChainMock,
+  dbChainMockFns,
+  requestUtilsMockFns,
+  resetDbChainMock,
+  workflowsUtilsMock,
+  workflowsUtilsMockFns,
+} from '@sim/testing'
+import type { NextRequest } from 'next/server'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const {
+  mockVerifyCronAuth,
+  mockExecuteScheduleJob,
+  mockExecuteJobInline,
+  mockFeatureFlags,
+  mockEnqueue,
+  mockGetJob,
+  mockStartJob,
+  mockCompleteJob,
+  mockMarkJobFailed,
+} = vi.hoisted(() => ({
+  mockVerifyCronAuth: vi.fn().mockReturnValue(null),
+  mockExecuteScheduleJob: vi.fn().mockResolvedValue(undefined),
+  mockExecuteJobInline: vi.fn().mockResolvedValue(undefined),
+  mockFeatureFlags: {
+    isTriggerDevEnabled: false,
+    isHosted: false,
+    isProd: false,
+    isDev: true,
+  },
+  mockEnqueue: vi.fn().mockResolvedValue('job-id-1'),
+  mockGetJob: vi.fn().mockResolvedValue(null),
+  mockStartJob: vi.fn().mockResolvedValue(undefined),
+  mockCompleteJob: vi.fn().mockResolvedValue(undefined),
+  mockMarkJobFailed: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/auth/internal', () => ({
+  verifyCronAuth: mockVerifyCronAuth,
+}))
+
+vi.mock('@/background/schedule-execution', () => ({
+  executeScheduleJob: mockExecuteScheduleJob,
+  executeJobInline: mockExecuteJobInline,
+  releaseScheduleLock: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/core/config/feature-flags', () => mockFeatureFlags)
+
+vi.mock('@/lib/core/async-jobs', () => ({
+  getJobQueue: vi.fn().mockResolvedValue({
+    enqueue: mockEnqueue,
+    getJob: mockGetJob,
+    startJob: mockStartJob,
+    completeJob: mockCompleteJob,
+    markJobFailed: mockMarkJobFailed,
+  }),
+  shouldExecuteInline: vi.fn().mockReturnValue(false),
+}))
+
+vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
+
+vi.mock('drizzle-orm', () => ({
+  and: vi.fn((...conditions: unknown[]) => ({ type: 'and', conditions })),
+  eq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
+  ne: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'ne' })),
+  lte: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'lte' })),
+  lt: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'lt' })),
+  inArray: vi.fn((field: unknown, values: unknown[]) => ({ field, values, type: 'inArray' })),
+  not: vi.fn((condition: unknown) => ({ type: 'not', condition })),
+  isNull: vi.fn((field: unknown) => ({ type: 'isNull', field })),
+  or: vi.fn((...conditions: unknown[]) => ({ type: 'or', conditions })),
+  sql: vi.fn((strings: unknown, ...values: unknown[]) => ({ type: 'sql', strings, values })),
+}))
+
+vi.mock('@sim/db', () => ({
+  ...dbChainMock,
+  workflowSchedule: {
+    id: 'id',
+    workflowId: 'workflowId',
+    blockId: 'blockId',
+    cronExpression: 'cronExpression',
+    lastRanAt: 'lastRanAt',
+    failedCount: 'failedCount',
+    status: 'status',
+    nextRunAt: 'nextRunAt',
+    lastQueuedAt: 'lastQueuedAt',
+    deploymentVersionId: 'deploymentVersionId',
+    sourceType: 'sourceType',
+  },
+  workflowDeploymentVersion: {
+    id: 'id',
+    workflowId: 'workflowId',
+    isActive: 'isActive',
+  },
+  workflow: {
+    id: 'id',
+    userId: 'userId',
+    workspaceId: 'workspaceId',
+  },
+}))
+
+vi.mock('@sim/utils/id', () => ({
+  generateId: vi.fn(() => 'schedule-execution-1'),
+  generateShortId: vi.fn(() => 'mock-short-id'),
+  isValidUuid: vi.fn((v: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+  ),
+}))
+
+import { GET } from './route'
+
+const SINGLE_SCHEDULE = [
+  {
+    id: 'schedule-1',
+    workflowId: 'workflow-1',
+    blockId: null,
+    cronExpression: null,
+    lastRanAt: null,
+    failedCount: 0,
+    nextRunAt: new Date('2025-01-01T00:00:00.000Z'),
+    lastQueuedAt: undefined,
+  },
+]
+
+const MULTIPLE_SCHEDULES = [
+  ...SINGLE_SCHEDULE,
+  {
+    id: 'schedule-2',
+    workflowId: 'workflow-2',
+    blockId: null,
+    cronExpression: null,
+    lastRanAt: null,
+    failedCount: 0,
+    nextRunAt: new Date('2025-01-01T01:00:00.000Z'),
+    lastQueuedAt: undefined,
+  },
+]
+
+const SINGLE_JOB = [
+  {
+    id: 'job-1',
+    cronExpression: '0 * * * *',
+    failedCount: 0,
+    lastQueuedAt: undefined,
+    sourceType: 'job',
+  },
+]
+
+function createMockRequest(): NextRequest {
+  const mockHeaders = new Map([
+    ['authorization', 'Bearer test-cron-secret'],
+    ['content-type', 'application/json'],
+  ])
+
+  return {
+    headers: {
+      get: (key: string) => mockHeaders.get(key.toLowerCase()) || null,
+    },
+    url: 'http://localhost:3000/api/schedules/execute',
+  } as NextRequest
+}
 
 describe('Scheduled Workflow Execution API Route', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-
-    mockExecutionDependencies()
-
-    // Mock all dependencies
-    vi.doMock('@/services/queue', () => ({
-      RateLimiter: vi.fn().mockImplementation(() => ({
-        checkRateLimitWithSubscription: vi.fn().mockResolvedValue({
-          allowed: true,
-          remaining: 100,
-          resetAt: new Date(Date.now() + 60000),
-        }),
-      })),
-    }))
-
-    vi.doMock('@/lib/billing', () => ({
-      checkServerSideUsageLimits: vi.fn().mockResolvedValue({ isExceeded: false }),
-    }))
-
-    vi.doMock('@/lib/billing/core/subscription', () => ({
-      getHighestPrioritySubscription: vi.fn().mockResolvedValue({
-        plan: 'pro',
-        status: 'active',
-      }),
-    }))
-
-    vi.doMock('@/lib/environment/utils', () => ({
-      getPersonalAndWorkspaceEnv: vi.fn().mockResolvedValue({
-        personalEncrypted: {},
-        workspaceEncrypted: {},
-      }),
-    }))
-
-    vi.doMock('@/lib/logs/execution/logging-session', () => ({
-      LoggingSession: vi.fn().mockImplementation(() => ({
-        safeStart: vi.fn().mockResolvedValue(undefined),
-        safeComplete: vi.fn().mockResolvedValue(undefined),
-        safeCompleteWithError: vi.fn().mockResolvedValue(undefined),
-        setupExecutor: vi.fn(),
-      })),
-    }))
-
-    vi.doMock('@/lib/workflows/db-helpers', () => ({
-      loadDeployedWorkflowState: vi.fn().mockResolvedValue({
-        blocks: sampleWorkflowState.blocks,
-        edges: sampleWorkflowState.edges || [],
-        loops: sampleWorkflowState.loops || {},
-        parallels: sampleWorkflowState.parallels || {},
-      }),
-      loadWorkflowFromNormalizedTables: vi.fn().mockResolvedValue({
-        blocks: sampleWorkflowState.blocks,
-        edges: sampleWorkflowState.edges || [],
-        loops: sampleWorkflowState.loops || {},
-        parallels: {},
-        isFromNormalizedTables: true,
-      }),
-    }))
-
-    vi.doMock('@/stores/workflows/server-utils', () => ({
-      mergeSubblockState: vi.fn().mockReturnValue(sampleWorkflowState.blocks),
-    }))
-
-    vi.doMock('@/lib/schedules/utils', () => ({
-      calculateNextRunTime: vi.fn().mockReturnValue(new Date(Date.now() + 60000)),
-      getScheduleTimeValues: vi.fn().mockReturnValue({}),
-      getSubBlockValue: vi.fn().mockReturnValue('manual'),
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      and: vi.fn((...conditions) => ({ type: 'and', conditions })),
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-      lte: vi.fn((field, value) => ({ field, value, type: 'lte' })),
-      not: vi.fn((condition) => ({ type: 'not', condition })),
-      sql: vi.fn((strings, ...values) => ({ strings, values, type: 'sql' })),
-    }))
-
-    vi.doMock('croner', () => ({
-      Cron: vi.fn().mockImplementation(() => ({
-        nextRun: vi.fn().mockReturnValue(new Date(Date.now() + 60000)), // Next run in 1 minute
-      })),
-    }))
-
-    vi.doMock('@sim/db', () => {
-      const mockDb = {
-        select: vi.fn().mockImplementation(() => ({
-          from: vi.fn().mockImplementation((_table: any) => ({
-            where: vi.fn().mockImplementation((_cond: any) => ({
-              limit: vi.fn().mockImplementation((n?: number) => {
-                // Always return empty array - no due schedules
-                return []
-              }),
-            })),
-          })),
-        })),
-        update: vi.fn().mockImplementation(() => ({
-          set: vi.fn().mockImplementation(() => ({
-            where: vi.fn().mockResolvedValue([]),
-          })),
-        })),
-      }
-
-      return {
-        db: mockDb,
-        userStats: {
-          userId: 'userId',
-          totalScheduledExecutions: 'totalScheduledExecutions',
-          lastActive: 'lastActive',
-        },
-        workflow: { id: 'id', userId: 'userId', state: 'state' },
-        workflowSchedule: {
-          id: 'id',
-          workflowId: 'workflowId',
-          nextRunAt: 'nextRunAt',
-          status: 'status',
-        },
-      }
+    dbChainMockFns.limit.mockReset()
+    dbChainMockFns.returning.mockReset()
+    resetDbChainMock()
+    requestUtilsMockFns.mockGenerateRequestId.mockReturnValue('test-request-id')
+    workflowsUtilsMockFns.mockGetWorkflowById.mockResolvedValue({
+      id: 'workflow-1',
+      workspaceId: 'workspace-1',
     })
+    mockFeatureFlags.isTriggerDevEnabled = false
+    mockFeatureFlags.isHosted = false
+    mockFeatureFlags.isProd = false
+    mockFeatureFlags.isDev = true
+    dbChainMockFns.returning.mockReturnValue([])
   })
 
-  afterEach(() => {
-    vi.clearAllMocks()
-  })
+  it('should execute scheduled workflows with Trigger.dev disabled', async () => {
+    dbChainMockFns.limit.mockResolvedValueOnce([{ id: 'schedule-1' }]).mockResolvedValueOnce([])
+    dbChainMockFns.returning.mockReturnValueOnce(SINGLE_SCHEDULE).mockReturnValueOnce([])
 
-  it('should execute scheduled workflows successfully', async () => {
-    const executeMock = vi.fn().mockResolvedValue({
-      success: true,
-      output: { response: 'Scheduled execution completed' },
-      logs: [],
-      metadata: {
-        duration: 100,
-        startTime: new Date().toISOString(),
-        endTime: new Date().toISOString(),
-      },
-    })
-
-    vi.doMock('@/executor', () => ({
-      Executor: vi.fn().mockImplementation(() => ({
-        execute: executeMock,
-      })),
-    }))
-
-    const { GET } = await import('@/app/api/schedules/execute/route')
-    const response = await GET()
-    expect(response).toBeDefined()
-
-    const data = await response.json()
-    expect(data).toHaveProperty('message')
-    expect(data).toHaveProperty('executedCount')
-  })
-
-  it('should handle errors during scheduled execution gracefully', async () => {
-    vi.doMock('@/executor', () => ({
-      Executor: vi.fn().mockImplementation(() => ({
-        execute: vi.fn().mockRejectedValue(new Error('Execution failed')),
-      })),
-    }))
-
-    const { GET } = await import('@/app/api/schedules/execute/route')
-    const response = await GET()
+    const response = await GET(createMockRequest())
 
     expect(response).toBeDefined()
-
+    expect(response.status).toBe(200)
     const data = await response.json()
     expect(data).toHaveProperty('message')
+    expect(data).toHaveProperty('executedCount', 1)
+  })
+
+  it('should queue schedules to Trigger.dev when enabled', async () => {
+    mockFeatureFlags.isTriggerDevEnabled = true
+    dbChainMockFns.limit.mockResolvedValueOnce([{ id: 'schedule-1' }]).mockResolvedValueOnce([])
+    dbChainMockFns.returning.mockReturnValueOnce(SINGLE_SCHEDULE).mockReturnValueOnce([])
+
+    const response = await GET(createMockRequest())
+
+    expect(response).toBeDefined()
+    expect(response.status).toBe(200)
+    const data = await response.json()
+    expect(data).toHaveProperty('executedCount', 1)
   })
 
   it('should handle case with no due schedules', async () => {
-    vi.doMock('@sim/db', () => {
-      const mockDb = {
-        select: vi.fn().mockImplementation(() => ({
-          from: vi.fn().mockImplementation(() => ({
-            where: vi.fn().mockImplementation(() => ({
-              limit: vi.fn().mockImplementation(() => []),
-            })),
-          })),
-        })),
-        update: vi.fn().mockImplementation(() => ({
-          set: vi.fn().mockImplementation(() => ({
-            where: vi.fn().mockResolvedValue([]),
-          })),
-        })),
-      }
+    dbChainMockFns.returning.mockReturnValueOnce([]).mockReturnValueOnce([])
 
-      return { db: mockDb }
-    })
-
-    const { GET } = await import('@/app/api/schedules/execute/route')
-    const response = await GET()
-    expect(response.status).toBe(200)
-    const data = await response.json()
-    expect(data).toHaveProperty('executedCount', 0)
-
-    const executeMock = vi.fn()
-    vi.doMock('@/executor', () => ({
-      Executor: vi.fn().mockImplementation(() => ({
-        execute: executeMock,
-      })),
-    }))
-
-    expect(executeMock).not.toHaveBeenCalled()
-  })
-
-  // Removed: Test isolation issues with mocks make this unreliable
-
-  it('should execute schedules that are explicitly marked as active', async () => {
-    const executeMock = vi.fn().mockResolvedValue({ success: true, metadata: {} })
-
-    vi.doMock('@/executor', () => ({
-      Executor: vi.fn().mockImplementation(() => ({
-        execute: executeMock,
-      })),
-    }))
-
-    mockScheduleExecuteDb({
-      schedules: [
-        {
-          id: 'schedule-active',
-          workflowId: 'workflow-id',
-          userId: 'user-id',
-          status: 'active',
-          nextRunAt: new Date(Date.now() - 60_000),
-          lastRanAt: null,
-          cronExpression: null,
-          failedCount: 0,
-        },
-      ],
-    })
-
-    const { GET } = await import('@/app/api/schedules/execute/route')
-    const response = await GET()
-
-    expect(response.status).toBe(200)
-  })
-
-  it('should not execute schedules that are disabled', async () => {
-    const executeMock = vi.fn()
-
-    vi.doMock('@/executor', () => ({
-      Executor: vi.fn().mockImplementation(() => ({
-        execute: executeMock,
-      })),
-    }))
-
-    mockScheduleExecuteDb({
-      schedules: [
-        {
-          id: 'schedule-disabled',
-          workflowId: 'workflow-id',
-          userId: 'user-id',
-          status: 'disabled',
-          nextRunAt: new Date(Date.now() - 60_000),
-          lastRanAt: null,
-          cronExpression: null,
-          failedCount: 0,
-        },
-      ],
-    })
-
-    const { GET } = await import('@/app/api/schedules/execute/route')
-    const response = await GET()
+    const response = await GET(createMockRequest())
 
     expect(response.status).toBe(200)
     const data = await response.json()
+    expect(data).toHaveProperty('message')
     expect(data).toHaveProperty('executedCount', 0)
+  })
 
-    expect(executeMock).not.toHaveBeenCalled()
+  it('should execute multiple schedules in parallel', async () => {
+    dbChainMockFns.limit
+      .mockResolvedValueOnce([{ id: 'schedule-1' }, { id: 'schedule-2' }])
+      .mockResolvedValueOnce([])
+    dbChainMockFns.returning.mockReturnValueOnce(MULTIPLE_SCHEDULES).mockReturnValueOnce([])
+
+    const response = await GET(createMockRequest())
+
+    expect(response.status).toBe(200)
+    const data = await response.json()
+    expect(data).toHaveProperty('executedCount', 2)
+  })
+
+  it('should execute mothership jobs inline', async () => {
+    dbChainMockFns.limit.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 'job-1' }])
+    dbChainMockFns.returning.mockReturnValueOnce(SINGLE_JOB)
+
+    const response = await GET(createMockRequest())
+
+    expect(response.status).toBe(200)
+    expect(mockExecuteJobInline).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scheduleId: 'job-1',
+        cronExpression: '0 * * * *',
+        failedCount: 0,
+        now: expect.any(String),
+      })
+    )
+  })
+
+  it('should enqueue schedule with correlation metadata via job queue', async () => {
+    dbChainMockFns.limit.mockResolvedValueOnce([{ id: 'schedule-1' }]).mockResolvedValueOnce([])
+    dbChainMockFns.returning.mockReturnValueOnce(SINGLE_SCHEDULE).mockReturnValueOnce([])
+
+    const response = await GET(createMockRequest())
+
+    expect(response.status).toBe(200)
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      'schedule-execution',
+      expect.objectContaining({
+        scheduleId: 'schedule-1',
+        workflowId: 'workflow-1',
+        executionId: 'schedule-execution-1',
+        requestId: 'test-request-id',
+      }),
+      expect.objectContaining({
+        jobId: expect.stringMatching(/^schedule_[0-9a-f]{32}$/),
+        concurrencyKey: expect.stringMatching(/^schedule_[0-9a-f]{32}$/),
+        metadata: expect.objectContaining({
+          workflowId: 'workflow-1',
+          workspaceId: 'workspace-1',
+          correlation: expect.objectContaining({
+            executionId: 'schedule-execution-1',
+            requestId: 'test-request-id',
+            source: 'schedule',
+            workflowId: 'workflow-1',
+            scheduleId: 'schedule-1',
+          }),
+        }),
+      })
+    )
   })
 })

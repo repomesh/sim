@@ -1,81 +1,70 @@
-import type React from 'react'
-import { memo, useMemo, useRef } from 'react'
-import { Trash2 } from 'lucide-react'
+import { memo, useMemo } from 'react'
+import { RepeatIcon, SplitIcon } from 'lucide-react'
 import { Handle, type NodeProps, Position, useReactFlow } from 'reactflow'
-import { StartIcon } from '@/components/icons'
-import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
-import { cn } from '@/lib/utils'
+import { Badge } from '@/components/emcn'
+import { cn } from '@/lib/core/utils/cn'
+import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
+import { HANDLE_POSITIONS } from '@/lib/workflows/blocks/block-dimensions'
 import { type DiffStatus, hasDiffStatus } from '@/lib/workflows/diff/types'
-import { IterationBadges } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/subflows/components/iteration-badges/iteration-badges'
+import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
+import { ActionBar } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/action-bar/action-bar'
 import { useCurrentWorkflow } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks'
-import { useCollaborativeWorkflow } from '@/hooks/use-collaborative-workflow'
+import { useLastRunPath } from '@/stores/execution'
+import { usePanelEditorStore } from '@/stores/panel'
 
-const SubflowNodeStyles: React.FC = () => {
-  return (
-    <style jsx global>{`
-      @keyframes loop-node-pulse {
-        0% { box-shadow: 0 0 0 0 rgba(47, 179, 255, 0.3); }
-        70% { box-shadow: 0 0 0 6px rgba(47, 179, 255, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(47, 179, 255, 0); }
-      }
-
-      @keyframes parallel-node-pulse {
-        0% { box-shadow: 0 0 0 0 rgba(139, 195, 74, 0.3); }
-        70% { box-shadow: 0 0 0 6px rgba(139, 195, 74, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(139, 195, 74, 0); }
-      }
-
-      .loop-node-drag-over {
-        animation: loop-node-pulse 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        border-style: solid !important;
-        background-color: rgba(47, 179, 255, 0.08) !important;
-        box-shadow: 0 0 0 8px rgba(47, 179, 255, 0.1);
-      }
-
-      .parallel-node-drag-over {
-        animation: parallel-node-pulse 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        border-style: solid !important;
-        background-color: rgba(139, 195, 74, 0.08) !important;
-        box-shadow: 0 0 0 8px rgba(139, 195, 74, 0.1);
-      }
-
-      .react-flow__node-group:hover,
-      .hover-highlight {
-        border-color: #1e293b !important;
-      }
-
-      .group-node-container:hover .react-flow__resize-control.bottom-right {
-        opacity: 1 !important;
-        visibility: visible !important;
-      }
-
-      .react-flow__node[data-parent-node-id] .react-flow__handle {
-        z-index: 30;
-      }
-
-      .react-flow__node-group.dragging-over {
-        background-color: rgba(34,197,94,0.05);
-        transition: all 0.2s ease-in-out;
-      }
-    `}</style>
-  )
-}
-
+/**
+ * Data structure for subflow nodes (loop and parallel containers)
+ */
 export interface SubflowNodeData {
   width?: number
   height?: number
   parentId?: string
   extent?: 'parent'
-  hasNestedError?: boolean
   isPreview?: boolean
+  /** Whether this subflow is selected in preview mode */
+  isPreviewSelected?: boolean
   kind: 'loop' | 'parallel'
+  name?: string
+  /** Execution status passed by preview/snapshot views */
+  executionStatus?: 'success' | 'error' | 'not-executed'
+  /** Whether the parent workflow is locked and should render as read-only */
+  isWorkflowLocked?: boolean
 }
 
-export const SubflowNodeComponent = memo(({ data, id }: NodeProps<SubflowNodeData>) => {
+const HANDLE_STYLE = {
+  top: `${HANDLE_POSITIONS.DEFAULT_Y_OFFSET}px`,
+  transform: 'translateY(-50%)',
+} as const
+
+/**
+ * Reusable class names for Handle components.
+ * Matches the styling pattern from workflow-block.tsx.
+ */
+const getHandleClasses = (position: 'left' | 'right') => {
+  const baseClasses = '!z-[10] !cursor-crosshair !border-none !transition-[colors] !duration-150'
+  const colorClasses = '!bg-[var(--workflow-edge)]'
+
+  const positionClasses = {
+    left: '!left-[-8px] !h-5 !w-[7px] !rounded-l-[2px] !rounded-r-none hover-hover:!left-[-11px] hover-hover:!w-[10px] hover-hover:!rounded-l-full',
+    right:
+      '!right-[-8px] !h-5 !w-[7px] !rounded-r-[2px] !rounded-l-none hover-hover:!right-[-11px] hover-hover:!w-[10px] hover-hover:!rounded-r-full',
+  }
+
+  return cn(baseClasses, colorClasses, positionClasses[position])
+}
+
+/**
+ * Subflow node component for loop and parallel execution containers.
+ * Renders a resizable container with a header displaying the block name and icon,
+ * handles for connections, and supports nested execution contexts.
+ *
+ * @param props - Node properties containing data and id
+ * @returns Rendered subflow node component
+ */
+export const SubflowNodeComponent = memo(({ data, id, selected }: NodeProps<SubflowNodeData>) => {
   const { getNodes } = useReactFlow()
-  const { collaborativeRemoveBlock } = useCollaborativeWorkflow()
-  const blockRef = useRef<HTMLDivElement>(null)
+  const userPermissions = useUserPermissionsContext()
+  const canEditWorkflow = userPermissions.canEdit && !data.isWorkflowLocked
 
   const currentWorkflow = useCurrentWorkflow()
   const currentBlock = currentWorkflow.getBlockById(id)
@@ -84,8 +73,29 @@ export const SubflowNodeComponent = memo(({ data, id }: NodeProps<SubflowNodeDat
       ? currentBlock.is_diff
       : undefined
 
+  const isEnabled = currentBlock?.enabled ?? true
+  const isLocked = currentBlock?.locked ?? false
   const isPreview = data?.isPreview || false
 
+  const setCurrentBlockId = usePanelEditorStore((state) => state.setCurrentBlockId)
+  const currentBlockId = usePanelEditorStore((state) => state.currentBlockId)
+  const isFocused = currentBlockId === id
+
+  const isPreviewSelected = data?.isPreviewSelected || false
+
+  const lastRunPath = useLastRunPath()
+  const executionStatus = data.executionStatus
+  const runPathStatus: 'success' | 'error' | undefined =
+    executionStatus === 'success' || executionStatus === 'error'
+      ? executionStatus
+      : isPreview
+        ? undefined
+        : lastRunPath.get(id)
+
+  /**
+   * Calculate the nesting level of this subflow node based on its parent hierarchy.
+   * Used to apply appropriate styling for nested containers.
+   */
   const nestingLevel = useMemo(() => {
     let level = 0
     let currentParentId = data?.parentId
@@ -98,150 +108,180 @@ export const SubflowNodeComponent = memo(({ data, id }: NodeProps<SubflowNodeDat
     }
 
     return level
-  }, [id, data?.parentId, getNodes])
-
-  const getNestedStyles = () => {
-    const styles: Record<string, string> = {
-      backgroundColor: 'rgba(0, 0, 0, 0.02)',
-    }
-    if (nestingLevel > 0) {
-      const colors = ['#e2e8f0', '#cbd5e1', '#94a3b8', '#64748b', '#475569']
-      const colorIndex = (nestingLevel - 1) % colors.length
-      styles.backgroundColor = `${colors[colorIndex]}30`
-    }
-    return styles
-  }
-
-  const nestedStyles = getNestedStyles()
+  }, [data?.parentId, getNodes])
 
   const startHandleId = data.kind === 'loop' ? 'loop-start-source' : 'parallel-start-source'
   const endHandleId = data.kind === 'loop' ? 'loop-end-source' : 'parallel-end-source'
-  const startBg = data.kind === 'loop' ? '#2FB3FF' : '#FEE12B'
+  const BlockIcon = data.kind === 'loop' ? RepeatIcon : SplitIcon
+  const blockIconBg = data.kind === 'loop' ? '#2FB3FF' : '#FEE12B'
+  const blockName = data.name || (data.kind === 'loop' ? 'Loop' : 'Parallel')
+
+  /**
+   * Determine the ring styling based on subflow state priority:
+   * 1. Focused (selected in editor), selected (shift-click/box), or preview selected - blue ring
+   * 2. Diff status (version comparison) - green/orange ring
+   * 3. Run path status (execution result) - green/red ring
+   */
+  const isSelected = !isPreview && selected
+  const hasRing =
+    isFocused ||
+    isSelected ||
+    isPreviewSelected ||
+    diffStatus === 'new' ||
+    diffStatus === 'edited' ||
+    !!runPathStatus
+
+  /**
+   * Compute the ring color for the subflow selection indicator.
+   * Uses boxShadow (not CSS outline) to match the ring styling of regular workflow blocks.
+   * This works because ReactFlow renders child nodes as sibling divs at the viewport level
+   * (not as DOM children), so children at zIndex 1000 don't clip the parent's boxShadow.
+   */
+  const getRingColor = (): string | undefined => {
+    if (!hasRing) return undefined
+    if (isFocused || isSelected || isPreviewSelected) return 'var(--brand-secondary)'
+    if (diffStatus === 'new') return 'var(--brand-accent)'
+    if (diffStatus === 'edited') return 'var(--warning)'
+    if (runPathStatus === 'success') {
+      return executionStatus ? 'var(--brand-accent)' : 'var(--border-success)'
+    }
+    if (runPathStatus === 'error') return 'var(--text-error)'
+    return undefined
+  }
+  const ringColor = getRingColor()
 
   return (
-    <>
-      <SubflowNodeStyles />
-      <div className='group relative'>
-        <Card
-          ref={blockRef}
-          className={cn(
-            'relative cursor-default select-none',
-            'transition-block-bg transition-ring',
-            'z-[20]',
-            nestingLevel > 0 &&
-              `border border-[0.5px] ${nestingLevel % 2 === 0 ? 'border-slate-300/60' : 'border-slate-400/60'}`,
-            data?.hasNestedError && 'border-2 border-red-500 bg-red-50/50',
-            diffStatus === 'new' && 'bg-green-50/50 ring-2 ring-green-500 dark:bg-green-900/10',
-            diffStatus === 'edited' &&
-              'bg-orange-50/50 ring-2 ring-orange-500 dark:bg-orange-900/10'
-          )}
-          style={{
-            width: data.width || 500,
-            height: data.height || 300,
-            position: 'relative',
-            overflow: 'visible',
-            ...nestedStyles,
-            pointerEvents: isPreview ? 'none' : 'all',
-          }}
-          data-node-id={id}
-          data-type='subflowNode'
-          data-nesting-level={nestingLevel}
+    <div className='group pointer-events-none relative'>
+      <div
+        className='relative select-none rounded-lg border border-[var(--border-1)] transition-block-bg'
+        style={{
+          width: data.width || 500,
+          height: data.height || 300,
+          overflow: 'visible',
+          pointerEvents: 'none',
+          ...(ringColor && {
+            boxShadow: `0 0 0 1.75px ${ringColor}`,
+          }),
+        }}
+        data-node-id={id}
+        data-type='subflowNode'
+        data-nesting-level={nestingLevel}
+        data-subflow-selected={isFocused || isSelected || isPreviewSelected}
+      >
+        {!isPreview && <ActionBar blockId={id} blockType={data.kind} disabled={!canEditWorkflow} />}
+
+        {/* Header Section */}
+        <div
+          role='button'
+          tabIndex={0}
+          aria-label={`Select ${blockName}`}
+          onClick={() => setCurrentBlockId(id)}
+          onKeyDown={(event) => handleKeyboardActivation(event, () => setCurrentBlockId(id))}
+          className='workflow-drag-handle flex cursor-grab items-center justify-between rounded-t-[8px] border-[var(--border)] border-b bg-[var(--surface-2)] py-2 pr-3 pl-2 [&:active]:cursor-grabbing'
+          style={{ pointerEvents: 'auto' }}
         >
-          {!isPreview && (
+          <div className='flex min-w-0 flex-1 items-center gap-2.5'>
             <div
-              className='workflow-drag-handle absolute top-0 right-0 left-0 z-10 h-10 cursor-move'
-              style={{ pointerEvents: 'auto' }}
-            />
-          )}
-
-          {!isPreview && (
-            <div
-              className='absolute right-2 bottom-2 z-20 flex h-8 w-8 cursor-se-resize items-center justify-center text-muted-foreground'
-              style={{ pointerEvents: 'auto' }}
-            />
-          )}
-
-          <div
-            className='h-[calc(100%-10px)] p-4'
-            data-dragarea='true'
-            style={{
-              position: 'relative',
-              minHeight: '100%',
-              pointerEvents: isPreview ? 'none' : 'auto',
-            }}
-          >
-            {!isPreview && (
-              <Button
-                variant='ghost'
-                size='sm'
-                onClick={(e) => {
-                  e.stopPropagation()
-                  collaborativeRemoveBlock(id)
-                }}
-                className='absolute top-2 right-2 z-20 text-gray-500 opacity-0 transition-opacity duration-200 hover:text-red-600 group-hover:opacity-100'
-                style={{ pointerEvents: 'auto' }}
-              >
-                <Trash2 className='h-4 w-4' />
-              </Button>
-            )}
-
-            {/* Subflow Start */}
-            <div
-              className='-translate-y-1/2 absolute top-1/2 left-8 flex h-10 w-10 transform items-center justify-center rounded-md p-2'
-              style={{ pointerEvents: isPreview ? 'none' : 'auto', backgroundColor: startBg }}
-              data-parent-id={id}
-              data-node-role={`${data.kind}-start`}
-              data-extent='parent'
+              className='flex size-[24px] flex-shrink-0 items-center justify-center rounded-md'
+              style={{ backgroundColor: isEnabled ? blockIconBg : 'gray' }}
             >
-              <StartIcon className='h-6 w-6 text-white' />
-
-              <Handle
-                type='source'
-                position={Position.Right}
-                id={startHandleId}
-                className='!w-[6px] !h-4 !bg-slate-300 dark:!bg-slate-500 !rounded-[2px] !border-none !z-[30] hover:!w-[10px] hover:!right-[-10px] hover:!rounded-r-full hover:!rounded-l-none !cursor-crosshair transition-[colors] duration-150'
-                style={{
-                  right: '-6px',
-                  top: '50%',
-                  transform: 'translateY(-50%)',
-                  pointerEvents: 'auto',
-                }}
-                data-parent-id={id}
-              />
+              <BlockIcon className='size-[16px] text-white' />
             </div>
+            <span
+              className={cn(
+                'truncate font-medium text-md',
+                !isEnabled && 'text-[var(--text-muted)]'
+              )}
+              title={blockName}
+            >
+              {blockName}
+            </span>
           </div>
+          <div className='flex items-center gap-1'>
+            {!isEnabled && <Badge variant='gray-secondary'>disabled</Badge>}
+            {isLocked && <Badge variant='gray-secondary'>locked</Badge>}
+          </div>
+        </div>
 
-          {/* Input handle on left middle */}
-          <Handle
-            type='target'
-            position={Position.Left}
-            className='!w-[7px] !h-5 !bg-slate-300 dark:!bg-slate-500 !rounded-[2px] !border-none !z-[30] hover:!w-[10px] hover:!left-[-10px] hover:!rounded-l-full hover:!rounded-r-none !cursor-crosshair transition-[colors] duration-150'
-            style={{
-              left: '-7px',
-              top: '50%',
-              transform: 'translateY(-50%)',
-              pointerEvents: 'auto',
-            }}
+        {/*
+         * Subflow body background. Captures clicks to select the subflow in the
+         * panel editor, matching the header click behavior. Child nodes and edges
+         * are rendered as sibling divs at the viewport level by ReactFlow (not as
+         * DOM children), so enabling pointer events here doesn't block them.
+         */}
+        <div
+          role='button'
+          tabIndex={isPreview ? -1 : 0}
+          aria-label={`Select ${blockName}`}
+          className='workflow-drag-handle absolute inset-0 top-[44px] cursor-grab rounded-b-[8px] [&:active]:cursor-grabbing'
+          style={{ pointerEvents: isPreview ? 'none' : 'auto' }}
+          onClick={() => setCurrentBlockId(id)}
+          onKeyDown={(event) => handleKeyboardActivation(event, () => setCurrentBlockId(id))}
+        />
+
+        {!isPreview && canEditWorkflow && (
+          <div
+            role='separator'
+            aria-orientation='horizontal'
+            className='absolute right-[8px] bottom-2 z-20 flex size-[32px] cursor-se-resize items-center justify-center text-muted-foreground'
+            style={{ pointerEvents: 'auto' }}
           />
+        )}
 
-          {/* Output handle on right middle */}
-          <Handle
-            type='source'
-            position={Position.Right}
-            className='!w-[7px] !h-5 !bg-slate-300 dark:!bg-slate-500 !rounded-[2px] !border-none !z-[30] hover:!w-[10px] hover:!right-[-10px] hover:!rounded-r-full hover:!rounded-l-none !cursor-crosshair transition-[colors] duration-150'
-            style={{
-              right: '-7px',
-              top: '50%',
-              transform: 'translateY(-50%)',
-              pointerEvents: 'auto',
-            }}
-            id={endHandleId}
-          />
+        <div
+          className='relative h-[calc(100%-50px)] pt-4 pr-[80px] pb-4 pl-4'
+          data-dragarea='true'
+          style={{ pointerEvents: 'none' }}
+        >
+          {/* Subflow Start */}
+          <div
+            className='absolute top-4 left-[16px] flex items-center justify-center rounded-lg border border-[var(--border-1)] bg-[var(--surface-2)] px-3 py-1.5'
+            style={{ pointerEvents: isPreview ? 'none' : 'auto' }}
+            data-parent-id={id}
+            data-node-role={`${data.kind}-start`}
+            data-extent='parent'
+          >
+            <span className='font-medium text-[var(--text-primary)] text-sm'>Start</span>
 
-          <IterationBadges nodeId={id} data={data} iterationType={data.kind} />
-        </Card>
+            <Handle
+              type='source'
+              position={Position.Right}
+              id={startHandleId}
+              className={getHandleClasses('right')}
+              style={{
+                top: '50%',
+                transform: 'translateY(-50%)',
+                pointerEvents: 'auto',
+              }}
+              data-parent-id={id}
+            />
+          </div>
+        </div>
+
+        {/* Input handle on left middle */}
+        <Handle
+          type='target'
+          position={Position.Left}
+          className={getHandleClasses('left')}
+          style={{
+            ...HANDLE_STYLE,
+            pointerEvents: 'auto',
+          }}
+        />
+
+        {/* Output handle on right middle */}
+        <Handle
+          type='source'
+          position={Position.Right}
+          className={getHandleClasses('right')}
+          style={{
+            ...HANDLE_STYLE,
+            pointerEvents: 'auto',
+          }}
+          id={endHandleId}
+        />
       </div>
-    </>
+    </div>
   )
 })
 

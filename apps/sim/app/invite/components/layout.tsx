@@ -1,6 +1,5 @@
-'use client'
-
-import Nav from '@/app/(landing)/components/nav/nav'
+import { SupportFooter } from '@/app/(auth)/components/support-footer'
+import Navbar from '@/app/(landing)/components/navbar/navbar'
 
 interface InviteLayoutProps {
   children: React.ReactNode
@@ -8,11 +7,16 @@ interface InviteLayoutProps {
 
 export default function InviteLayout({ children }: InviteLayoutProps) {
   return (
-    <div className='bg-white'>
-      <Nav variant='auth' />
-      <div className='flex min-h-[calc(100vh-120px)] items-center justify-center px-4'>
-        <div className='w-full max-w-[410px]'>{children}</div>
-      </div>
+    <div className='relative flex min-h-screen flex-col bg-[var(--landing-bg)] font-[430] font-season text-[var(--landing-text)]'>
+      <header className='shrink-0'>
+        <Navbar logoOnly />
+      </header>
+      <main className='flex flex-1 flex-col items-center justify-center px-4'>
+        <div className='w-full max-w-lg px-4'>
+          <div className='flex flex-col items-center justify-center'>{children}</div>
+        </div>
+      </main>
+      <SupportFooter position='absolute' />
     </div>
   )
 }

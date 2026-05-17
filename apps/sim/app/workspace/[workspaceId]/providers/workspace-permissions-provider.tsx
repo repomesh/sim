@@ -1,31 +1,29 @@
 'use client'
 
 import type React from 'react'
-import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createLogger } from '@sim/logger'
+import { useQueryClient } from '@tanstack/react-query'
 import { useParams } from 'next/navigation'
-import { createLogger } from '@/lib/logs/console/logger'
-import { useCollaborativeWorkflow } from '@/hooks/use-collaborative-workflow'
-import { useUserPermissions, type WorkspaceUserPermissions } from '@/hooks/use-user-permissions'
+import { useSocket } from '@/app/workspace/providers/socket-provider'
 import {
-  useWorkspacePermissions,
+  useWorkspacePermissionsQuery,
   type WorkspacePermissions,
-} from '@/hooks/use-workspace-permissions'
+  workspaceKeys,
+} from '@/hooks/queries/workspace'
+import { useUserPermissions, type WorkspaceUserPermissions } from '@/hooks/use-user-permissions'
+import { useNotificationStore } from '@/stores/notifications'
+import { useOperationQueueStore } from '@/stores/operation-queue/store'
 
 const logger = createLogger('WorkspacePermissionsProvider')
 
 interface WorkspacePermissionsContextType {
-  // Raw workspace permissions data
   workspacePermissions: WorkspacePermissions | null
   permissionsLoading: boolean
   permissionsError: string | null
   updatePermissions: (newPermissions: WorkspacePermissions) => void
   refetchPermissions: () => Promise<void>
-
-  // Computed user permissions (connection-aware)
   userPermissions: WorkspaceUserPermissions & { isOfflineMode?: boolean }
-
-  // Connection state management
-  setOfflineMode: (isOffline: boolean) => void
 }
 
 const WorkspacePermissionsContext = createContext<WorkspacePermissionsContextType>({
@@ -42,7 +40,6 @@ const WorkspacePermissionsContext = createContext<WorkspacePermissionsContextTyp
     isLoading: false,
     error: null,
   },
-  setOfflineMode: () => {},
 })
 
 interface WorkspacePermissionsProviderProps {
@@ -50,60 +47,127 @@ interface WorkspacePermissionsProviderProps {
 }
 
 /**
- * Provider that manages workspace permissions and user access
- * Also provides connection-aware permissions that enforce read-only mode when offline
+ * Provides workspace permissions and connection-aware user access throughout the app.
+ * Enforces read-only mode when offline to prevent data loss.
  */
 export function WorkspacePermissionsProvider({ children }: WorkspacePermissionsProviderProps) {
   const params = useParams()
   const workspaceId = params?.workspaceId as string
+  const queryClient = useQueryClient()
 
-  // Manage offline mode state locally
-  const [isOfflineMode, setIsOfflineMode] = useState(false)
+  const [hasShownOfflineNotification, setHasShownOfflineNotification] = useState(false)
+  const hasOperationError = useOperationQueueStore((state) => state.hasOperationError)
+  const addNotification = useNotificationStore((state) => state.addNotification)
+  const removeNotification = useNotificationStore((state) => state.removeNotification)
+  const { isReconnecting, isRetryingWorkflowJoin } = useSocket()
+  const realtimeStatusNotificationIdRef = useRef<string | null>(null)
+  const realtimeStatusNotificationMessageRef = useRef<string | null>(null)
 
-  // Get operation error state from collaborative workflow
-  const { hasOperationError } = useCollaborativeWorkflow()
+  const isOfflineMode = hasOperationError
+  const realtimeStatusMessage = isReconnecting
+    ? 'Reconnecting...'
+    : isRetryingWorkflowJoin
+      ? 'Joining workflow...'
+      : null
 
-  // Set offline mode when there are operation errors
-  useEffect(() => {
-    if (hasOperationError) {
-      setIsOfflineMode(true)
+  const clearRealtimeStatusNotification = useCallback(() => {
+    if (!realtimeStatusNotificationIdRef.current) {
+      return
     }
-  }, [hasOperationError])
 
-  // Fetch workspace permissions and loading state
+    removeNotification(realtimeStatusNotificationIdRef.current)
+    realtimeStatusNotificationIdRef.current = null
+    realtimeStatusNotificationMessageRef.current = null
+  }, [removeNotification])
+
+  useEffect(() => {
+    if (isOfflineMode || !realtimeStatusMessage) {
+      clearRealtimeStatusNotification()
+      return
+    }
+
+    if (
+      realtimeStatusNotificationIdRef.current &&
+      realtimeStatusNotificationMessageRef.current === realtimeStatusMessage
+    ) {
+      return
+    }
+
+    clearRealtimeStatusNotification()
+
+    const id = addNotification({
+      level: 'error',
+      message: realtimeStatusMessage,
+    })
+
+    realtimeStatusNotificationIdRef.current = id
+    realtimeStatusNotificationMessageRef.current = realtimeStatusMessage
+  }, [addNotification, clearRealtimeStatusNotification, isOfflineMode, realtimeStatusMessage])
+
+  useEffect(() => {
+    return clearRealtimeStatusNotification
+  }, [clearRealtimeStatusNotification])
+
+  useEffect(() => {
+    if (!isOfflineMode || hasShownOfflineNotification) {
+      return
+    }
+
+    clearRealtimeStatusNotification()
+
+    try {
+      addNotification({
+        level: 'error',
+        message: 'Connection unavailable',
+        action: {
+          type: 'refresh',
+          message: '',
+        },
+      })
+      setHasShownOfflineNotification(true)
+    } catch (error) {
+      logger.error('Failed to add offline notification', { error })
+    }
+  }, [addNotification, clearRealtimeStatusNotification, hasShownOfflineNotification, isOfflineMode])
+
   const {
-    permissions: workspacePermissions,
-    loading: permissionsLoading,
-    error: permissionsError,
-    updatePermissions,
-    refetch: refetchPermissions,
-  } = useWorkspacePermissions(workspaceId)
+    data: workspacePermissions,
+    isLoading: permissionsLoading,
+    error: permissionsErrorObj,
+    refetch,
+  } = useWorkspacePermissionsQuery(workspaceId)
 
-  // Get base user permissions from workspace permissions
+  const permissionsError = permissionsErrorObj?.message ?? null
+
+  const updatePermissions = useCallback(
+    (newPermissions: WorkspacePermissions) => {
+      if (!workspaceId) return
+      queryClient.setQueryData(workspaceKeys.permissions(workspaceId), newPermissions)
+    },
+    [workspaceId, queryClient]
+  )
+
+  const refetchPermissions = useCallback(async () => {
+    await refetch()
+  }, [refetch])
+
   const baseUserPermissions = useUserPermissions(
-    workspacePermissions,
+    workspacePermissions ?? null,
     permissionsLoading,
     permissionsError
   )
 
-  // Note: Connection-based error detection removed - only rely on operation timeouts
-  // The 5-second operation timeout system will handle all error cases
-
-  // Create connection-aware permissions that override user permissions when offline
   const userPermissions = useMemo((): WorkspaceUserPermissions & { isOfflineMode?: boolean } => {
     if (isOfflineMode) {
-      // In offline mode, force read-only permissions regardless of actual user permissions
       return {
         ...baseUserPermissions,
         canEdit: false,
         canAdmin: false,
-        // Keep canRead true so users can still view content
         canRead: baseUserPermissions.canRead,
         isOfflineMode: true,
       }
     }
 
-    // When online, use normal permissions
     return {
       ...baseUserPermissions,
       isOfflineMode: false,
@@ -112,13 +176,12 @@ export function WorkspacePermissionsProvider({ children }: WorkspacePermissionsP
 
   const contextValue = useMemo(
     () => ({
-      workspacePermissions,
+      workspacePermissions: workspacePermissions ?? null,
       permissionsLoading,
       permissionsError,
       updatePermissions,
       refetchPermissions,
       userPermissions,
-      setOfflineMode: setIsOfflineMode,
     }),
     [
       workspacePermissions,
@@ -138,8 +201,8 @@ export function WorkspacePermissionsProvider({ children }: WorkspacePermissionsP
 }
 
 /**
- * Hook to access workspace permissions and data from context
- * This provides both raw workspace permissions and computed user permissions
+ * Accesses workspace permissions data and operations from context.
+ * Must be used within a WorkspacePermissionsProvider.
  */
 export function useWorkspacePermissionsContext(): WorkspacePermissionsContextType {
   const context = useContext(WorkspacePermissionsContext)
@@ -152,12 +215,44 @@ export function useWorkspacePermissionsContext(): WorkspacePermissionsContextTyp
 }
 
 /**
- * Hook to access user permissions from context
- * This replaces individual useUserPermissions calls and includes connection-aware permissions
+ * Accesses the current user's computed permissions including offline mode status.
+ * Convenience hook that extracts userPermissions from the context.
  */
 export function useUserPermissionsContext(): WorkspaceUserPermissions & {
   isOfflineMode?: boolean
 } {
   const { userPermissions } = useWorkspacePermissionsContext()
   return userPermissions
+}
+
+/**
+ * Lightweight permissions provider for sandbox/academy contexts.
+ * Grants full edit access without any API calls or workspace dependencies.
+ */
+export function SandboxWorkspacePermissionsProvider({ children }: { children: React.ReactNode }) {
+  const sandboxPermissions = useMemo(
+    (): WorkspacePermissionsContextType => ({
+      workspacePermissions: null,
+      permissionsLoading: false,
+      permissionsError: null,
+      updatePermissions: () => {},
+      refetchPermissions: async () => {},
+      userPermissions: {
+        canRead: true,
+        canEdit: true,
+        canAdmin: false,
+        userPermissions: 'write',
+        isLoading: false,
+        error: null,
+        isOfflineMode: false,
+      },
+    }),
+    []
+  )
+
+  return (
+    <WorkspacePermissionsContext.Provider value={sandboxPermissions}>
+      {children}
+    </WorkspacePermissionsContext.Provider>
+  )
 }

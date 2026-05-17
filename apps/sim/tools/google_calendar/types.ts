@@ -3,7 +3,7 @@ import type { ToolResponse } from '@/tools/types'
 export const CALENDAR_API_BASE = 'https://www.googleapis.com/calendar/v3'
 
 // Shared attendee interface that matches Google Calendar API specification
-export interface CalendarAttendee {
+interface CalendarAttendee {
   id?: string
   email: string
   displayName?: string
@@ -75,6 +75,38 @@ export interface GoogleCalendarInviteParams extends BaseGoogleCalendarParams {
   replaceExisting?: boolean // Whether to replace existing attendees or add to them
 }
 
+interface GoogleCalendarMoveParams extends BaseGoogleCalendarParams {
+  eventId: string
+  destinationCalendarId: string
+  sendUpdates?: 'all' | 'externalOnly' | 'none'
+}
+
+interface GoogleCalendarInstancesParams extends BaseGoogleCalendarParams {
+  eventId: string
+  timeMin?: string
+  timeMax?: string
+  maxResults?: number
+  pageToken?: string
+  showDeleted?: boolean
+}
+
+export interface GoogleCalendarFreeBusyParams {
+  accessToken: string
+  calendarIds: string // Comma-separated calendar IDs (e.g., "primary,other@example.com")
+  timeMin: string // RFC3339 timestamp (e.g., 2025-06-03T00:00:00Z)
+  timeMax: string // RFC3339 timestamp (e.g., 2025-06-04T00:00:00Z)
+  timeZone?: string // IANA time zone (e.g., "UTC", "America/New_York")
+}
+
+interface GoogleCalendarListCalendarsParams {
+  accessToken: string
+  minAccessRole?: 'freeBusyReader' | 'reader' | 'writer' | 'owner'
+  maxResults?: number
+  pageToken?: string
+  showDeleted?: boolean
+  showHidden?: boolean
+}
+
 export type GoogleCalendarToolParams =
   | GoogleCalendarCreateParams
   | GoogleCalendarListParams
@@ -83,6 +115,10 @@ export type GoogleCalendarToolParams =
   | GoogleCalendarDeleteParams
   | GoogleCalendarQuickAddParams
   | GoogleCalendarInviteParams
+  | GoogleCalendarMoveParams
+  | GoogleCalendarInstancesParams
+  | GoogleCalendarFreeBusyParams
+  | GoogleCalendarListCalendarsParams
 
 interface EventMetadata {
   id: string
@@ -119,7 +155,7 @@ interface ListMetadata {
   timeZone: string
 }
 
-export interface GoogleCalendarToolResponse extends ToolResponse {
+interface GoogleCalendarToolResponse extends ToolResponse {
   output: {
     content: string
     metadata: EventMetadata | ListMetadata
@@ -169,7 +205,7 @@ export interface GoogleCalendarInviteResponse extends ToolResponse {
   }
 }
 
-export interface GoogleCalendarEvent {
+interface GoogleCalendarEvent {
   id: string
   status: string
   htmlLink: string
@@ -277,6 +313,95 @@ export interface GoogleCalendarApiListResponse {
   items: GoogleCalendarApiEventResponse[]
 }
 
+interface GoogleCalendarDeleteResponse extends ToolResponse {
+  output: {
+    content: string
+    metadata: {
+      eventId: string
+      deleted: boolean
+    }
+  }
+}
+
+interface GoogleCalendarMoveResponse extends ToolResponse {
+  output: {
+    content: string
+    metadata: EventMetadata
+  }
+}
+
+interface GoogleCalendarInstancesResponse extends ToolResponse {
+  output: {
+    content: string
+    metadata: {
+      nextPageToken?: string
+      timeZone: string
+      instances: Array<
+        EventMetadata & {
+          recurringEventId: string
+          originalStartTime: {
+            dateTime?: string
+            date?: string
+            timeZone?: string
+          }
+        }
+      >
+    }
+  }
+}
+
+export interface GoogleCalendarFreeBusyResponse extends ToolResponse {
+  output: {
+    content: string
+    metadata: {
+      timeMin: string
+      timeMax: string
+      calendars: Record<
+        string,
+        {
+          busy: Array<{ start: string; end: string }>
+          errors?: Array<{ domain: string; reason: string }>
+        }
+      >
+    }
+  }
+}
+
+export interface GoogleCalendarApiFreeBusyResponse {
+  kind: string
+  timeMin: string
+  timeMax: string
+  calendars: Record<
+    string,
+    {
+      busy: Array<{ start: string; end: string }>
+      errors?: Array<{ domain: string; reason: string }>
+    }
+  >
+}
+
+interface GoogleCalendarListCalendarsResponse extends ToolResponse {
+  output: {
+    content: string
+    metadata: {
+      nextPageToken?: string
+      calendars: Array<{
+        id: string
+        summary: string
+        description?: string
+        location?: string
+        timeZone: string
+        accessRole: string
+        backgroundColor: string
+        foregroundColor: string
+        primary?: boolean
+        hidden?: boolean
+        selected?: boolean
+      }>
+    }
+  }
+}
+
 export type GoogleCalendarResponse =
   | GoogleCalendarCreateResponse
   | GoogleCalendarListResponse
@@ -284,3 +409,8 @@ export type GoogleCalendarResponse =
   | GoogleCalendarQuickAddResponse
   | GoogleCalendarInviteResponse
   | GoogleCalendarUpdateResponse
+  | GoogleCalendarDeleteResponse
+  | GoogleCalendarMoveResponse
+  | GoogleCalendarInstancesResponse
+  | GoogleCalendarFreeBusyResponse
+  | GoogleCalendarListCalendarsResponse

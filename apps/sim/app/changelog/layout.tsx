@@ -1,10 +1,19 @@
-import Nav from '@/app/(landing)/components/nav/nav'
+import { getNavBlogPosts } from '@/lib/blog/registry'
+import { martianMono } from '@/app/_styles/fonts/martian-mono/martian-mono'
+import Footer from '@/app/(landing)/components/footer/footer'
+import Navbar from '@/app/(landing)/components/navbar/navbar'
 
-export default function ChangelogLayout({ children }: { children: React.ReactNode }) {
+export default async function ChangelogLayout({ children }: { children: React.ReactNode }) {
+  const blogPosts = await getNavBlogPosts()
   return (
-    <div className='min-h-screen bg-background font-geist-sans text-foreground'>
-      <Nav />
+    <div
+      className={`${martianMono.variable} relative min-h-screen bg-[var(--landing-bg)] font-[430] font-season text-[var(--landing-text)]`}
+    >
+      <header>
+        <Navbar blogPosts={blogPosts} />
+      </header>
       {children}
+      <Footer hideCTA />
     </div>
   )
 }

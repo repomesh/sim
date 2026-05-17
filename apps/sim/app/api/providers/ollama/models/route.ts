@@ -1,17 +1,26 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { env } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
-import type { ModelsObject } from '@/providers/ollama/types'
+import {
+  ollamaUpstreamResponseSchema,
+  providerModelsResponseSchema,
+} from '@/lib/api/contracts/providers'
+import { getOllamaUrl } from '@/lib/core/utils/urls'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { filterBlacklistedModels, isProviderBlacklisted } from '@/providers/utils'
 
 const logger = createLogger('OllamaModelsAPI')
-const OLLAMA_HOST = env.OLLAMA_URL || 'http://localhost:11434'
-
-export const dynamic = 'force-dynamic'
+const OLLAMA_HOST = getOllamaUrl()
 
 /**
  * Get available Ollama models
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (_request: NextRequest) => {
+  if (isProviderBlacklisted('ollama')) {
+    logger.info('Ollama provider is blacklisted, returning empty models')
+    return NextResponse.json({ models: [] })
+  }
+
   try {
     logger.info('Fetching Ollama models', {
       host: OLLAMA_HOST,
@@ -21,6 +30,7 @@ export async function GET(request: NextRequest) {
       headers: {
         'Content-Type': 'application/json',
       },
+      next: { revalidate: 60 },
     })
 
     if (!response.ok) {
@@ -31,22 +41,23 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ models: [] })
     }
 
-    const data = (await response.json()) as ModelsObject
-    const models = data.models.map((model) => model.name)
+    const data = ollamaUpstreamResponseSchema.parse(await response.json())
+    const allModels = data.models.map((model) => model.name)
+    const models = filterBlacklistedModels(allModels)
 
     logger.info('Successfully fetched Ollama models', {
       count: models.length,
+      filtered: allModels.length - models.length,
       models,
     })
 
-    return NextResponse.json({ models })
+    return NextResponse.json(providerModelsResponseSchema.parse({ models }))
   } catch (error) {
     logger.error('Failed to fetch Ollama models', {
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: getErrorMessage(error, 'Unknown error'),
       host: OLLAMA_HOST,
     })
 
-    // Return empty array instead of error to avoid breaking the UI
     return NextResponse.json({ models: [] })
   }
-}
+})

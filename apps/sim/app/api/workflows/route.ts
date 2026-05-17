@@ -1,47 +1,46 @@
 import { db } from '@sim/db'
-import { workflow, workspace } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { permissions, workflow } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
-import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
-import { verifyWorkspaceMembership } from './utils'
+import { createWorkflowContract, workflowListQuerySchema } from '@/lib/api/contracts/workflows'
+import { parseRequest } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { captureServerEvent } from '@/lib/posthog/server'
+import { performCreateWorkflow } from '@/lib/workflows/orchestration'
+import { getUserEntityPermissions, workspaceExists } from '@/lib/workspaces/permissions/utils'
+import { verifyWorkspaceMembership } from '@/app/api/workflows/utils'
 
 const logger = createLogger('WorkflowAPI')
 
-const CreateWorkflowSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  description: z.string().optional().default(''),
-  color: z.string().optional().default('#3972F6'),
-  workspaceId: z.string().optional(),
-  folderId: z.string().nullable().optional(),
-})
-
 // GET /api/workflows - Get workflows for user (optionally filtered by workspaceId)
-export async function GET(request: Request) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
   const startTime = Date.now()
   const url = new URL(request.url)
-  const workspaceId = url.searchParams.get('workspaceId')
+  const query = workflowListQuerySchema.safeParse(Object.fromEntries(url.searchParams.entries()))
+  if (!query.success) {
+    return NextResponse.json(
+      { error: 'Invalid query parameters', details: query.error.issues },
+      { status: 400 }
+    )
+  }
+  const { workspaceId, scope } = query.data
 
   try {
-    const session = await getSession()
-    if (!session?.user?.id) {
+    const auth = await checkSessionOrInternalAuth(request, { requireWorkflowId: false })
+    if (!auth.success || !auth.userId) {
       logger.warn(`[${requestId}] Unauthorized workflow access attempt`)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    const userId = session.user.id
+    const userId = auth.userId
 
     if (workspaceId) {
-      const workspaceExists = await db
-        .select({ id: workspace.id })
-        .from(workspace)
-        .where(eq(workspace.id, workspaceId))
-        .then((rows) => rows.length > 0)
+      const wsExists = await workspaceExists(workspaceId)
 
-      if (!workspaceExists) {
+      if (!wsExists) {
         logger.warn(
           `[${requestId}] Attempt to fetch workflows for non-existent workspace: ${workspaceId}`
         )
@@ -66,82 +65,186 @@ export async function GET(request: Request) {
 
     let workflows
 
+    /**
+     * Project only the columns declared in `workflowListItemSchema` so the
+     * wire response matches the contract shape exactly. The full row is
+     * larger (`state`, `variables`, `apiKey`, `runCount`, etc.) and would
+     * be dropped client-side by Zod parse anyway — narrowing here saves
+     * bytes over the wire. Keep this list aligned with the contract.
+     */
+    const listColumns = {
+      id: workflow.id,
+      name: workflow.name,
+      description: workflow.description,
+      color: workflow.color,
+      workspaceId: workflow.workspaceId,
+      folderId: workflow.folderId,
+      sortOrder: workflow.sortOrder,
+      createdAt: workflow.createdAt,
+      updatedAt: workflow.updatedAt,
+      archivedAt: workflow.archivedAt,
+      locked: workflow.locked,
+    } as const
+    const orderByClause = [asc(workflow.sortOrder), asc(workflow.createdAt), asc(workflow.id)]
+
     if (workspaceId) {
-      workflows = await db.select().from(workflow).where(eq(workflow.workspaceId, workspaceId))
+      workflows = await db
+        .select(listColumns)
+        .from(workflow)
+        .where(
+          scope === 'all'
+            ? eq(workflow.workspaceId, workspaceId)
+            : scope === 'archived'
+              ? and(eq(workflow.workspaceId, workspaceId), sql`${workflow.archivedAt} IS NOT NULL`)
+              : and(eq(workflow.workspaceId, workspaceId), isNull(workflow.archivedAt))
+        )
+        .orderBy(...orderByClause)
     } else {
-      workflows = await db.select().from(workflow).where(eq(workflow.userId, userId))
+      const workspacePermissionRows = await db
+        .select({ workspaceId: permissions.entityId })
+        .from(permissions)
+        .where(and(eq(permissions.userId, userId), eq(permissions.entityType, 'workspace')))
+      const workspaceIds = workspacePermissionRows.map((row) => row.workspaceId)
+      if (workspaceIds.length === 0) {
+        return NextResponse.json({ data: [] }, { status: 200 })
+      }
+      workflows = await db
+        .select(listColumns)
+        .from(workflow)
+        .where(
+          scope === 'all'
+            ? inArray(workflow.workspaceId, workspaceIds)
+            : scope === 'archived'
+              ? and(
+                  inArray(workflow.workspaceId, workspaceIds),
+                  sql`${workflow.archivedAt} IS NOT NULL`
+                )
+              : and(inArray(workflow.workspaceId, workspaceIds), isNull(workflow.archivedAt))
+        )
+        .orderBy(...orderByClause)
     }
 
     return NextResponse.json({ data: workflows }, { status: 200 })
   } catch (error: any) {
     const elapsed = Date.now() - startTime
     logger.error(`[${requestId}] Workflow fetch error after ${elapsed}ms`, error)
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})
 
 // POST /api/workflows - Create a new workflow
-export async function POST(req: NextRequest) {
+export const POST = withRouteHandler(async (req: NextRequest) => {
   const requestId = generateRequestId()
-  const session = await getSession()
-
-  if (!session?.user?.id) {
+  const auth = await checkSessionOrInternalAuth(req, { requireWorkflowId: false })
+  if (!auth.success || !auth.userId) {
     logger.warn(`[${requestId}] Unauthorized workflow creation attempt`)
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+  const userId = auth.userId
 
   try {
-    const body = await req.json()
-    const { name, description, color, workspaceId, folderId } = CreateWorkflowSchema.parse(body)
-
-    const workflowId = crypto.randomUUID()
-    const now = new Date()
-
-    logger.info(`[${requestId}] Creating workflow ${workflowId} for user ${session.user.id}`)
-
-    await db.insert(workflow).values({
-      id: workflowId,
-      userId: session.user.id,
-      workspaceId: workspaceId || null,
-      folderId: folderId || null,
-      name,
-      description,
-      color,
-      lastSynced: now,
-      createdAt: now,
-      updatedAt: now,
-      isDeployed: false,
-      collaborators: [],
-      runCount: 0,
-      variables: {},
-      isPublished: false,
-      marketplaceData: null,
-    })
-
-    logger.info(`[${requestId}] Successfully created empty workflow ${workflowId}`)
-
-    return NextResponse.json({
-      id: workflowId,
-      name,
+    const parsed = await parseRequest(createWorkflowContract, req, {})
+    if (!parsed.success) return parsed.response
+    const {
+      id: clientId,
+      name: requestedName,
       description,
       color,
       workspaceId,
       folderId,
-      createdAt: now,
-      updatedAt: now,
-    })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      logger.warn(`[${requestId}] Invalid workflow creation data`, {
-        errors: error.errors,
-      })
+      sortOrder: providedSortOrder,
+      deduplicate,
+    } = parsed.data.body
+
+    if (!workspaceId) {
+      logger.warn(`[${requestId}] Workflow creation blocked: missing workspaceId`)
       return NextResponse.json(
-        { error: 'Invalid request data', details: error.errors },
+        {
+          error:
+            'workspaceId is required. Personal workflows are deprecated and cannot be created.',
+        },
         { status: 400 }
       )
     }
 
+    const workspacePermission = await getUserEntityPermissions(userId, 'workspace', workspaceId)
+
+    if (!workspacePermission || workspacePermission === 'read') {
+      logger.warn(
+        `[${requestId}] User ${userId} attempted to create workflow in workspace ${workspaceId} without write permissions`
+      )
+      return NextResponse.json(
+        { error: 'Write or Admin access required to create workflows in this workspace' },
+        { status: 403 }
+      )
+    }
+
+    const result = await performCreateWorkflow({
+      id: clientId,
+      name: requestedName,
+      description,
+      color,
+      workspaceId,
+      folderId,
+      sortOrder: providedSortOrder,
+      deduplicate,
+      userId,
+      requestId,
+    })
+
+    if (!result.success || !result.workflow) {
+      const status = result.errorCode === 'conflict' ? 409 : 500
+      return NextResponse.json({ error: result.error }, { status })
+    }
+
+    const createdWorkflow = result.workflow
+
+    import('@/lib/core/telemetry')
+      .then(({ PlatformEvents }) => {
+        PlatformEvents.workflowCreated({
+          workflowId: createdWorkflow.id,
+          name: createdWorkflow.name,
+          workspaceId: workspaceId || undefined,
+          folderId: folderId || undefined,
+        })
+      })
+      .catch(() => {
+        // Silently fail
+      })
+
+    logger.info(
+      `[${requestId}] Successfully created workflow ${createdWorkflow.id} with default blocks`
+    )
+
+    captureServerEvent(
+      userId,
+      'workflow_created',
+      {
+        workflow_id: createdWorkflow.id,
+        workspace_id: workspaceId ?? '',
+        name: createdWorkflow.name,
+      },
+      {
+        groups: workspaceId ? { workspace: workspaceId } : undefined,
+        setOnce: { first_workflow_created_at: new Date().toISOString() },
+      }
+    )
+
+    return NextResponse.json({
+      id: createdWorkflow.id,
+      name: createdWorkflow.name,
+      description: createdWorkflow.description,
+      color: createdWorkflow.color,
+      workspaceId: createdWorkflow.workspaceId,
+      folderId: createdWorkflow.folderId,
+      sortOrder: createdWorkflow.sortOrder,
+      createdAt: createdWorkflow.createdAt,
+      updatedAt: createdWorkflow.updatedAt,
+      startBlockId: createdWorkflow.startBlockId,
+      subBlockValues: createdWorkflow.subBlockValues,
+    })
+  } catch (error) {
     logger.error(`[${requestId}] Error creating workflow`, error)
     return NextResponse.json({ error: 'Failed to create workflow' }, { status: 500 })
   }
-}
+})

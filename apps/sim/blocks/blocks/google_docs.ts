@@ -1,6 +1,8 @@
 import { GoogleDocsIcon } from '@/components/icons'
+import { getScopesForService } from '@/lib/oauth/utils'
 import type { BlockConfig } from '@/blocks/types'
-import { AuthMode } from '@/blocks/types'
+import { AuthMode, IntegrationType } from '@/blocks/types'
+import { SERVICE_ACCOUNT_SUBBLOCKS } from '@/blocks/utils'
 import type { GoogleDocsResponse } from '@/tools/google_docs/types'
 
 export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
@@ -12,6 +14,8 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
     'Integrate Google Docs into the workflow. Can read, write, and create documents.',
   docsLink: 'https://docs.sim.ai/tools/google_docs',
   category: 'tools',
+  integrationType: IntegrationType.Documents,
+  tags: ['google-workspace', 'document-processing', 'content-management'],
   bgColor: '#E0E0E0',
   icon: GoogleDocsIcon,
   subBlocks: [
@@ -20,7 +24,6 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Read Document', id: 'read' },
         { label: 'Write to Document', id: 'write' },
@@ -33,22 +36,31 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'credential',
       title: 'Google Account',
       type: 'oauth-input',
-      layout: 'full',
+      canonicalParamId: 'oauthCredential',
+      mode: 'basic',
       required: true,
-      provider: 'google-docs',
       serviceId: 'google-docs',
-      requiredScopes: ['https://www.googleapis.com/auth/drive.file'],
+      requiredScopes: getScopesForService('google-docs'),
       placeholder: 'Select Google account',
     },
+    {
+      id: 'manualCredential',
+      title: 'Google Account',
+      type: 'short-input',
+      canonicalParamId: 'oauthCredential',
+      mode: 'advanced',
+      placeholder: 'Enter credential ID',
+      required: true,
+    },
+    ...SERVICE_ACCOUNT_SUBBLOCKS,
     // Document selector (basic mode)
     {
       id: 'documentId',
       title: 'Select Document',
       type: 'file-selector',
-      layout: 'full',
       canonicalParamId: 'documentId',
-      provider: 'google-drive',
-      serviceId: 'google-drive',
+      serviceId: 'google-docs',
+      selectorKey: 'google.drive',
       requiredScopes: [],
       mimeType: 'application/vnd.google-apps.document',
       placeholder: 'Select a document',
@@ -61,7 +73,6 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'manualDocumentId',
       title: 'Document ID',
       type: 'short-input',
-      layout: 'full',
       canonicalParamId: 'documentId',
       placeholder: 'Enter document ID',
       dependsOn: ['credential'],
@@ -73,20 +84,26 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'title',
       title: 'Document Title',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter title for the new document',
       condition: { field: 'operation', value: 'create' },
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate a clear, descriptive document title based on the user's request.
+The title should be concise but informative about the document's purpose.
+
+Return ONLY the document title - no explanations, no extra text.`,
+        placeholder: 'Describe the document...',
+      },
     },
     // Folder selector (basic mode)
     {
       id: 'folderSelector',
       title: 'Select Parent Folder',
       type: 'file-selector',
-      layout: 'full',
       canonicalParamId: 'folderId',
-      provider: 'google-drive',
-      serviceId: 'google-drive',
+      serviceId: 'google-docs',
+      selectorKey: 'google.drive',
       requiredScopes: [],
       mimeType: 'application/vnd.google-apps.folder',
       placeholder: 'Select a parent folder',
@@ -99,7 +116,6 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'folderId',
       title: 'Parent Folder ID',
       type: 'short-input',
-      layout: 'full',
       canonicalParamId: 'folderId',
       placeholder: 'Enter parent folder ID (leave empty for root folder)',
       dependsOn: ['credential'],
@@ -111,19 +127,33 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
       id: 'content',
       title: 'Content',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter document content',
       condition: { field: 'operation', value: 'write' },
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate document content based on the user's request.
+The content should be well-structured and appropriate for a Google Doc.
+
+Return ONLY the document content - no explanations, no extra text.`,
+        placeholder: 'Describe the document content you want to write...',
+      },
     },
     // Content Field for create operation
     {
       id: 'content',
       title: 'Content',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter document content',
       condition: { field: 'operation', value: 'create' },
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate initial document content based on the user's request.
+The content should be well-structured and appropriate for a new Google Doc.
+
+Return ONLY the document content - no explanations, no extra text.`,
+        placeholder: 'Describe the document content you want to create...',
+      },
     },
   ],
   tools: {
@@ -142,29 +172,26 @@ export const GoogleDocsBlock: BlockConfig<GoogleDocsResponse> = {
         }
       },
       params: (params) => {
-        const { credential, documentId, manualDocumentId, folderSelector, folderId, ...rest } =
-          params
+        const { oauthCredential, documentId, folderId, ...rest } = params
 
-        const effectiveDocumentId = (documentId || manualDocumentId || '').trim()
-        const effectiveFolderId = (folderSelector || folderId || '').trim()
+        const effectiveDocumentId = documentId ? String(documentId).trim() : ''
+        const effectiveFolderId = folderId ? String(folderId).trim() : ''
 
         return {
           ...rest,
           documentId: effectiveDocumentId || undefined,
           folderId: effectiveFolderId || undefined,
-          credential,
+          oauthCredential,
         }
       },
     },
   },
   inputs: {
     operation: { type: 'string', description: 'Operation to perform' },
-    credential: { type: 'string', description: 'Google Docs access token' },
-    documentId: { type: 'string', description: 'Document identifier' },
-    manualDocumentId: { type: 'string', description: 'Manual document identifier' },
+    oauthCredential: { type: 'string', description: 'Google Docs access token' },
+    documentId: { type: 'string', description: 'Document identifier (canonical param)' },
     title: { type: 'string', description: 'Document title' },
-    folderSelector: { type: 'string', description: 'Selected folder' },
-    folderId: { type: 'string', description: 'Folder identifier' },
+    folderId: { type: 'string', description: 'Parent folder identifier (canonical param)' },
     content: { type: 'string', description: 'Document content' },
   },
   outputs: {

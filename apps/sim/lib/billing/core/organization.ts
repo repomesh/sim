@@ -1,30 +1,22 @@
 import { db } from '@sim/db'
-import { member, organization, subscription, user, userStats } from '@sim/db/schema'
-import { and, eq } from 'drizzle-orm'
-import { getPlanPricing } from '@/lib/billing/core/billing'
-import { getFreeTierLimit } from '@/lib/billing/subscriptions/utils'
-import { createLogger } from '@/lib/logs/console/logger'
+import { invitation, member, organization, user, userStats } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { and, count, eq, gt, ne } from 'drizzle-orm'
+import { isOrganizationBillingBlocked } from '@/lib/billing/core/access'
+import { getOrganizationSubscription, getPlanPricing } from '@/lib/billing/core/billing'
+import {
+  computeDailyRefreshConsumed,
+  getOrgMemberRefreshBounds,
+} from '@/lib/billing/credits/daily-refresh'
+import { getPlanTierDollars, isEnterprise, isPaid } from '@/lib/billing/plan-helpers'
+import {
+  getEffectiveSeats,
+  getFreeTierLimit,
+  hasUsableSubscriptionStatus,
+} from '@/lib/billing/subscriptions/utils'
+import { toDecimal, toNumber } from '@/lib/billing/utils/decimal'
 
 const logger = createLogger('OrganizationBilling')
-
-/**
- * Get organization subscription directly by organization ID
- * This is for our new pattern where referenceId = organizationId
- */
-async function getOrganizationSubscription(organizationId: string) {
-  try {
-    const orgSubs = await db
-      .select()
-      .from(subscription)
-      .where(and(eq(subscription.referenceId, organizationId), eq(subscription.status, 'active')))
-      .limit(1)
-
-    return orgSubs.length > 0 ? orgSubs[0] : null
-  } catch (error) {
-    logger.error('Error getting organization subscription', { error, organizationId })
-    return null
-  }
-}
 
 function roundCurrency(value: number): number {
   return Math.round(value * 100) / 100
@@ -128,34 +120,49 @@ export async function getOrganizationBillingData(
     })
 
     // Calculate aggregated statistics
-    const totalCurrentUsage = members.reduce((sum, member) => sum + member.currentUsage, 0)
+    let totalCurrentUsage = members.reduce((sum, m) => sum + m.currentUsage, 0)
 
-    // Get per-seat pricing for the plan
+    if (isPaid(subscription.plan) && subscription.periodStart) {
+      const planDollars = getPlanTierDollars(subscription.plan)
+      if (planDollars > 0) {
+        const memberIds = members.map((m) => m.userId)
+        const userBounds = await getOrgMemberRefreshBounds(
+          subscription.referenceId,
+          subscription.periodStart
+        )
+        const refreshConsumed = await computeDailyRefreshConsumed({
+          userIds: memberIds,
+          periodStart: subscription.periodStart,
+          periodEnd: subscription.periodEnd ?? null,
+          planDollars,
+          seats: subscription.seats || 1,
+          userBounds: Object.keys(userBounds).length > 0 ? userBounds : undefined,
+        })
+        totalCurrentUsage = Math.max(0, totalCurrentUsage - refreshConsumed)
+      }
+    }
+
     const { basePrice: pricePerSeat } = getPlanPricing(subscription.plan)
 
-    // Use Stripe subscription seats as source of truth
-    // Ensure we always have at least 1 seat (protect against 0 or falsy values)
-    const licensedSeats = Math.max(subscription.seats || 1, 1)
+    // Stripe subscription quantity; `||` not `??` because 0 seats is
+    // never valid for a paid sub — fall through to 1.
+    const licensedSeats = subscription.seats || 1
 
-    // Calculate minimum billing amount
+    // UI seat count — metadata.seats on enterprise (column is always 1).
+    const effectiveSeats = getEffectiveSeats(subscription)
+
     let minimumBillingAmount: number
     let totalUsageLimit: number
 
-    if (subscription.plan === 'enterprise') {
-      // Enterprise has fixed pricing set through custom Stripe product
-      // Their usage limit is configured to match their monthly cost
-      const configuredLimit = organizationData.orgUsageLimit
-        ? Number.parseFloat(organizationData.orgUsageLimit)
-        : 0
-      minimumBillingAmount = configuredLimit // For enterprise, this equals their fixed monthly cost
-      totalUsageLimit = configuredLimit // Same as their monthly cost
+    if (isEnterprise(subscription.plan)) {
+      const configuredLimit = toNumber(toDecimal(organizationData.orgUsageLimit))
+      minimumBillingAmount = configuredLimit
+      totalUsageLimit = configuredLimit
     } else {
-      // Team plan: Billing is based on licensed seats from Stripe
       minimumBillingAmount = licensedSeats * pricePerSeat
 
-      // Total usage limit: never below the minimum based on licensed seats
       const configuredLimit = organizationData.orgUsageLimit
-        ? Number.parseFloat(organizationData.orgUsageLimit)
+        ? toNumber(toDecimal(organizationData.orgUsageLimit))
         : null
       totalUsageLimit =
         configuredLimit !== null
@@ -165,7 +172,19 @@ export async function getOrganizationBillingData(
 
     const averageUsagePerMember = members.length > 0 ? totalCurrentUsage / members.length : 0
 
-    // Billing period comes from the organization's subscription
+    const [pendingInvitationCount] = await db
+      .select({ count: count() })
+      .from(invitation)
+      .where(
+        and(
+          eq(invitation.organizationId, organizationId),
+          eq(invitation.status, 'pending'),
+          ne(invitation.membershipIntent, 'external'),
+          gt(invitation.expiresAt, new Date())
+        )
+      )
+    const usedSeats = members.length + (pendingInvitationCount?.count ?? 0)
+
     const billingPeriodStart = subscription.periodStart || null
     const billingPeriodEnd = subscription.periodEnd || null
 
@@ -174,8 +193,8 @@ export async function getOrganizationBillingData(
       organizationName: organizationData.name || '',
       subscriptionPlan: subscription.plan,
       subscriptionStatus: subscription.status || 'inactive',
-      totalSeats: Math.max(subscription.seats || 1, 1),
-      usedSeats: members.length,
+      totalSeats: effectiveSeats,
+      usedSeats,
       seatsCount: licensedSeats,
       totalCurrentUsage: roundCurrency(totalCurrentUsage),
       totalUsageLimit: roundCurrency(totalUsageLimit),
@@ -216,27 +235,31 @@ export async function updateOrganizationUsageLimit(
       return { success: false, error: 'No active subscription found' }
     }
 
-    // Enterprise plans have fixed usage limits that cannot be changed
-    if (subscription.plan === 'enterprise') {
+    if (
+      !hasUsableSubscriptionStatus(subscription.status) ||
+      (await isOrganizationBillingBlocked(organizationId))
+    ) {
+      return { success: false, error: 'An active subscription is required to edit usage limits' }
+    }
+
+    if (isEnterprise(subscription.plan)) {
       return {
         success: false,
         error: 'Enterprise plans have fixed usage limits that cannot be changed',
       }
     }
 
-    // Only team plans can update their usage limits
-    if (subscription.plan !== 'team') {
+    if (!isPaid(subscription.plan)) {
       return {
         success: false,
-        error: 'Only team organizations can update usage limits',
+        error: 'Organization is not on a paid plan',
       }
     }
 
-    // Team plans have minimum based on seats
     const { basePrice } = getPlanPricing(subscription.plan)
-    const minimumLimit = Math.max(subscription.seats || 1, 1) * basePrice
+    const seatCount = subscription.seats || 1
+    const minimumLimit = seatCount * basePrice
 
-    // Validate new limit is not below minimum
     if (newLimit < minimumLimit) {
       return {
         success: false,
@@ -244,8 +267,6 @@ export async function updateOrganizationUsageLimit(
       }
     }
 
-    // Update the organization usage limit
-    // Convert number to string for decimal column
     await db
       .update(organization)
       .set({
@@ -277,7 +298,7 @@ export async function updateOrganizationUsageLimit(
 /**
  * Get organization billing summary for admin dashboard
  */
-export async function getOrganizationBillingSummary(organizationId: string) {
+async function getOrganizationBillingSummary(organizationId: string) {
   try {
     const billingData = await getOrganizationBillingData(organizationId)
 

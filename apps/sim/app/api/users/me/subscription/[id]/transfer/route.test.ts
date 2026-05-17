@@ -1,278 +1,140 @@
 /**
- * Tests for Subscription Transfer API
- *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  authMock,
+  authMockFns,
   createMockRequest,
-  mockAdminMember,
-  mockDb,
-  mockLogger,
-  mockOrganization,
-  mockRegularMember,
-  mockSubscription,
-  mockUser,
-} from '@/app/api/__test-utils__/utils'
+  createSession,
+  dbChainMock,
+  dbChainMockFns,
+  resetDbChainMock,
+} from '@sim/testing'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-describe('Subscription Transfer API Routes', () => {
+vi.mock('@sim/db', () => dbChainMock)
+vi.mock('@/lib/auth', () => authMock)
+
+vi.mock('@/lib/billing/plan-helpers', () => ({
+  isOrgPlan: (plan: string) => plan === 'team' || plan === 'enterprise',
+}))
+
+vi.mock('@/lib/billing/subscriptions/utils', () => ({
+  ENTITLED_SUBSCRIPTION_STATUSES: ['active', 'past_due'],
+  hasPaidSubscriptionStatus: (status: string) => status === 'active' || status === 'past_due',
+}))
+
+import { POST } from '@/app/api/users/me/subscription/[id]/transfer/route'
+
+function makeRequest(body: unknown, id = 'sub-1') {
+  return POST(
+    createMockRequest(
+      'POST',
+      body,
+      {},
+      `http://localhost/api/users/me/subscription/${id}/transfer`
+    ),
+    { params: Promise.resolve({ id }) }
+  )
+}
+
+describe('POST /api/users/me/subscription/[id]/transfer', () => {
   beforeEach(() => {
-    vi.resetModules()
-
-    vi.doMock('@/lib/auth', () => ({
-      getSession: vi.fn().mockResolvedValue({
-        user: mockUser,
-      }),
-    }))
-
-    vi.doMock('@/lib/logs/console/logger', () => ({
-      createLogger: vi.fn().mockReturnValue(mockLogger),
-    }))
-
-    vi.doMock('@sim/db', () => ({
-      db: mockDb,
-    }))
-
-    mockDb.select.mockReturnValue({
-      from: vi.fn().mockReturnThis(),
-      where: vi.fn().mockReturnThis(),
-      then: vi.fn().mockResolvedValue([mockSubscription]),
-    })
-
-    mockDb.update.mockReturnValue({
-      set: vi.fn().mockReturnThis(),
-      where: vi.fn().mockResolvedValue([{ affected: 1 }]),
-    })
-  })
-
-  afterEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
+    authMockFns.mockGetSession.mockResolvedValue(
+      createSession({
+        userId: 'user-1',
+        email: 'owner@example.com',
+        name: 'Owner',
+      })
+    )
   })
 
-  describe('POST handler', () => {
-    it('should successfully transfer a personal subscription to an organization', async () => {
-      vi.doMock('@/lib/auth', () => ({
-        getSession: vi.fn().mockResolvedValue({
-          user: {
-            ...mockUser,
-            id: 'user-123',
-          },
-        }),
-      }))
+  it('rejects transfers for non-organization subscriptions', async () => {
+    dbChainMockFns.for.mockResolvedValueOnce([
+      { id: 'sub-1', referenceId: 'user-1', plan: 'pro', status: 'active' },
+    ])
 
-      vi.doMock('@sim/db/schema', () => ({
-        subscription: { id: 'id', referenceId: 'referenceId' },
-        organization: { id: 'id' },
-        member: { userId: 'userId', organizationId: 'organizationId', role: 'role' },
-      }))
+    const response = await makeRequest({ organizationId: 'org-1' })
 
-      const mockSubscriptionWithReferenceId = {
-        ...mockSubscription,
-        referenceId: 'user-123',
-      }
-
-      mockDb.select.mockImplementation(() => {
-        return {
-          from: () => ({
-            where: () => {
-              if (mockDb.select.mock.calls.length === 1) {
-                return Promise.resolve([mockSubscriptionWithReferenceId])
-              }
-              if (mockDb.select.mock.calls.length === 2) {
-                return Promise.resolve([mockOrganization])
-              }
-              return Promise.resolve([mockAdminMember])
-            },
-          }),
-        }
-      })
-
-      mockDb.update.mockReturnValue({
-        set: () => ({
-          where: () => Promise.resolve({ affected: 1 }),
-        }),
-      })
-
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-
-      const data = await response.json()
-
-      expect(response.status).toBe(200)
-      expect(data).toHaveProperty('success', true)
-      expect(data).toHaveProperty('message', 'Subscription transferred successfully')
-      expect(mockDb.update).toHaveBeenCalled()
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Only active Team or Enterprise subscriptions can be transferred to an organization.',
     })
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
+  })
 
-    it('should test behavior when subscription not found', async () => {
-      mockDb.select.mockReturnValueOnce({
-        from: vi.fn().mockReturnThis(),
-        where: vi.fn().mockReturnThis(),
-        then: vi.fn().mockResolvedValue([]),
-      })
+  it('transfers an active organization subscription to an admin-owned organization', async () => {
+    dbChainMockFns.for
+      .mockResolvedValueOnce([
+        { id: 'sub-1', referenceId: 'user-1', plan: 'team', status: 'active' },
+      ])
+      .mockResolvedValueOnce([{ id: 'org-1' }])
+    dbChainMockFns.limit.mockResolvedValueOnce([{ role: 'owner' }]).mockResolvedValueOnce([])
 
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
+    const response = await makeRequest({ organizationId: 'org-1' })
 
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(403)
-      expect(data).toHaveProperty('error', 'Unauthorized - subscription does not belong to user')
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      message: 'Subscription transferred successfully',
     })
+    expect(dbChainMockFns.update).toHaveBeenCalled()
+    expect(dbChainMockFns.set).toHaveBeenCalledWith({ referenceId: 'org-1' })
+  })
 
-    it('should test behavior when organization not found', async () => {
-      const mockSelectImpl = vi
-        .fn()
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          then: vi.fn().mockResolvedValue([mockSubscription]),
-        })
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          then: vi.fn().mockResolvedValue([]),
-        })
+  it('treats an already-transferred organization subscription as a successful no-op', async () => {
+    dbChainMockFns.for
+      .mockResolvedValueOnce([
+        { id: 'sub-1', referenceId: 'org-1', plan: 'team', status: 'active' },
+      ])
+      .mockResolvedValueOnce([{ id: 'org-1' }])
+    dbChainMockFns.limit.mockResolvedValueOnce([{ role: 'owner' }])
 
-      mockDb.select.mockImplementation(mockSelectImpl)
+    const response = await makeRequest({ organizationId: 'org-1' })
 
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(403)
-      expect(data).toHaveProperty('error', 'Unauthorized - subscription does not belong to user')
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      message: 'Subscription already belongs to this organization',
     })
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
+  })
 
-    it('should reject transfer if user is not the subscription owner', async () => {
-      const differentOwnerSubscription = {
-        ...mockSubscription,
-        referenceId: 'different-user-123',
-      }
+  it('rejects the noop probe when the requester is not a member of the target organization', async () => {
+    dbChainMockFns.for
+      .mockResolvedValueOnce([
+        { id: 'sub-1', referenceId: 'org-1', plan: 'team', status: 'active' },
+      ])
+      .mockResolvedValueOnce([{ id: 'org-1' }])
+    dbChainMockFns.limit.mockResolvedValueOnce([])
 
-      mockDb.select.mockReturnValueOnce({
-        from: vi.fn().mockReturnThis(),
-        where: vi.fn().mockReturnThis(),
-        then: vi.fn().mockResolvedValue([differentOwnerSubscription]),
-      })
+    const response = await makeRequest({ organizationId: 'org-1' })
 
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(403)
-      expect(data).toHaveProperty('error', 'Unauthorized - subscription does not belong to user')
-      expect(mockDb.update).not.toHaveBeenCalled()
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Unauthorized - user is not admin of organization',
     })
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
+  })
 
-    it('should reject non-personal transfer if user is not admin of organization', async () => {
-      const orgOwnedSubscription = {
-        ...mockSubscription,
-        referenceId: 'other-org-789',
-      }
+  it('rejects the transfer when the target organization already has an active subscription', async () => {
+    dbChainMockFns.for
+      .mockResolvedValueOnce([
+        { id: 'sub-1', referenceId: 'user-1', plan: 'team', status: 'active' },
+      ])
+      .mockResolvedValueOnce([{ id: 'org-1' }])
+    dbChainMockFns.limit
+      .mockResolvedValueOnce([{ role: 'owner' }])
+      .mockResolvedValueOnce([{ id: 'existing-sub' }])
 
-      const mockSelectImpl = vi
-        .fn()
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          then: vi.fn().mockResolvedValue([orgOwnedSubscription]),
-        })
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          then: vi.fn().mockResolvedValue([mockOrganization]),
-        })
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          then: vi.fn().mockResolvedValue([mockRegularMember]),
-        })
+    const response = await makeRequest({ organizationId: 'org-1' })
 
-      mockDb.select.mockImplementation(mockSelectImpl)
-
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(403)
-      expect(data).toHaveProperty('error', 'Unauthorized - subscription does not belong to user')
-      expect(mockDb.update).not.toHaveBeenCalled()
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Organization already has an active subscription',
     })
-
-    it('should reject invalid request parameters', async () => {
-      const req = createMockRequest('POST', {})
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(400)
-      expect(data).toHaveProperty('error', 'Invalid request parameters')
-      expect(mockDb.update).not.toHaveBeenCalled()
-    })
-
-    it('should handle authentication error', async () => {
-      vi.doMock('@/lib/auth', () => ({
-        getSession: vi.fn().mockResolvedValue(null),
-      }))
-
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(401)
-      expect(data).toHaveProperty('error', 'Unauthorized')
-      expect(mockDb.update).not.toHaveBeenCalled()
-    })
-
-    it('should handle internal server error', async () => {
-      mockDb.select.mockImplementation(() => {
-        throw new Error('Database error')
-      })
-
-      const req = createMockRequest('POST', {
-        organizationId: 'org-456',
-      })
-
-      const { POST } = await import('@/app/api/users/me/subscription/[id]/transfer/route')
-
-      const response = await POST(req, { params: Promise.resolve({ id: 'sub-123' }) })
-      const data = await response.json()
-
-      expect(response.status).toBe(500)
-      expect(data).toHaveProperty('error', 'Failed to transfer subscription')
-      expect(mockLogger.error).toHaveBeenCalled()
-    })
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
   })
 })

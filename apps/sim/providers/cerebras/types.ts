@@ -24,7 +24,7 @@ interface CerebrasUsage {
   total_tokens: number
 }
 
-interface CerebrasResponse {
+export interface CerebrasResponse {
   id: string
   object: string
   created: number

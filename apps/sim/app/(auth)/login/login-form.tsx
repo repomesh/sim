@@ -1,28 +1,33 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { Eye, EyeOff } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Button } from '@/components/ui/button'
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { client } from '@/lib/auth-client'
-import { quickValidateEmail } from '@/lib/email/validation'
-import { env, isFalsy, isTruthy } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
-import { cn } from '@/lib/utils'
+  Input,
+  Label,
+  Loader,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalDescription,
+  ModalHeader,
+} from '@/components/emcn'
+import { requestJson } from '@/lib/api/client/request'
+import { forgetPasswordContract } from '@/lib/api/contracts'
+import { client } from '@/lib/auth/auth-client'
+import { getEnv, isFalsy, isTruthy } from '@/lib/core/config/env'
+import { validateCallbackUrl } from '@/lib/core/security/input-validation'
+import { cn } from '@/lib/core/utils/cn'
+import { getBaseUrl } from '@/lib/core/utils/urls'
+import { quickValidateEmail } from '@/lib/messaging/email/validation'
+import { captureClientEvent } from '@/lib/posthog/client'
+import { AUTH_SUBMIT_BTN } from '@/app/(auth)/components/auth-button-classes'
 import { SocialLoginButtons } from '@/app/(auth)/components/social-login-buttons'
 import { SSOLoginButton } from '@/app/(auth)/components/sso-login-button'
-import { inter } from '@/app/fonts/inter'
-import { soehne } from '@/app/fonts/soehne/soehne'
 
 const logger = createLogger('LoginForm')
 
@@ -53,24 +58,6 @@ const PASSWORD_VALIDATIONS = {
   },
 }
 
-const validateCallbackUrl = (url: string): boolean => {
-  try {
-    if (url.startsWith('/')) {
-      return true
-    }
-
-    const currentOrigin = typeof window !== 'undefined' ? window.location.origin : ''
-    if (url.startsWith(currentOrigin)) {
-      return true
-    }
-
-    return false
-  } catch (error) {
-    logger.error('Error validating callback URL:', { error, url })
-    return false
-  }
-}
-
 const validatePassword = (passwordValue: string): string[] => {
   const errors: string[] = []
 
@@ -99,15 +86,20 @@ export default function LoginPage({
   const router = useRouter()
   const searchParams = useSearchParams()
   const [isLoading, setIsLoading] = useState(false)
-  const [_mounted, setMounted] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [password, setPassword] = useState('')
   const [passwordErrors, setPasswordErrors] = useState<string[]>([])
   const [showValidationError, setShowValidationError] = useState(false)
-  const [buttonClass, setButtonClass] = useState('auth-button-gradient')
-
-  const [callbackUrl, setCallbackUrl] = useState('/workspace')
-  const [isInviteFlow, setIsInviteFlow] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
+  const callbackUrlParam = searchParams?.get('callbackUrl')
+  const isValidCallbackUrl = callbackUrlParam ? validateCallbackUrl(callbackUrlParam) : false
+  const invalidCallbackRef = useRef(false)
+  if (callbackUrlParam && !isValidCallbackUrl && !invalidCallbackRef.current) {
+    invalidCallbackRef.current = true
+    logger.warn('Invalid callback URL detected and blocked:', { url: callbackUrlParam })
+  }
+  const callbackUrl = isValidCallbackUrl ? callbackUrlParam! : '/workspace'
+  const isInviteFlow = searchParams?.get('invite_flow') === 'true'
 
   const [forgotPasswordOpen, setForgotPasswordOpen] = useState(false)
   const [forgotPasswordEmail, setForgotPasswordEmail] = useState('')
@@ -120,62 +112,15 @@ export default function LoginPage({
   const [email, setEmail] = useState('')
   const [emailErrors, setEmailErrors] = useState<string[]>([])
   const [showEmailValidationError, setShowEmailValidationError] = useState(false)
+  const [resetSuccessMessage, setResetSuccessMessage] = useState<string | null>(() =>
+    searchParams?.get('resetSuccess') === 'true'
+      ? 'Password reset successful. Please sign in with your new password.'
+      : null
+  )
 
   useEffect(() => {
-    setMounted(true)
-
-    if (searchParams) {
-      const callback = searchParams.get('callbackUrl')
-      if (callback) {
-        if (validateCallbackUrl(callback)) {
-          setCallbackUrl(callback)
-        } else {
-          logger.warn('Invalid callback URL detected and blocked:', { url: callback })
-        }
-      }
-
-      const inviteFlow = searchParams.get('invite_flow') === 'true'
-      setIsInviteFlow(inviteFlow)
-    }
-
-    const checkCustomBrand = () => {
-      const computedStyle = getComputedStyle(document.documentElement)
-      const brandAccent = computedStyle.getPropertyValue('--brand-accent-hex').trim()
-
-      if (brandAccent && brandAccent !== '#6f3dfa') {
-        setButtonClass('auth-button-custom')
-      } else {
-        setButtonClass('auth-button-gradient')
-      }
-    }
-
-    checkCustomBrand()
-
-    window.addEventListener('resize', checkCustomBrand)
-    const observer = new MutationObserver(checkCustomBrand)
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['style', 'class'],
-    })
-
-    return () => {
-      window.removeEventListener('resize', checkCustomBrand)
-      observer.disconnect()
-    }
-  }, [searchParams])
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Enter' && forgotPasswordOpen) {
-        handleForgotPassword()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [forgotPasswordEmail, forgotPasswordOpen])
+    captureClientEvent('login_page_viewed', {})
+  }, [])
 
   const handleEmailChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newEmail = e.target.value
@@ -199,6 +144,13 @@ export default function LoginPage({
     e.preventDefault()
     setIsLoading(true)
 
+    const redirectToVerify = (emailToVerify: string) => {
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem('verificationEmail', emailToVerify)
+      }
+      router.push('/verify')
+    }
+
     const formData = new FormData(e.currentTarget)
     const emailRaw = formData.get('email') as string
     const email = emailRaw.trim().toLowerCase()
@@ -217,8 +169,10 @@ export default function LoginPage({
     }
 
     try {
-      const safeCallbackUrl = validateCallbackUrl(callbackUrl) ? callbackUrl : '/workspace'
+      const safeCallbackUrl = callbackUrl
+      let errorHandled = false
 
+      setFormError(null)
       const result = await client.signIn.email(
         {
           email,
@@ -226,13 +180,18 @@ export default function LoginPage({
           callbackURL: safeCallbackUrl,
         },
         {
-          onError: (ctx) => {
-            console.error('Login error:', ctx.error)
-            const errorMessage: string[] = ['Invalid email or password']
+          onError: (ctx: any) => {
+            logger.error('Login error:', ctx.error)
 
             if (ctx.error.code?.includes('EMAIL_NOT_VERIFIED')) {
+              errorHandled = true
+              redirectToVerify(email)
               return
             }
+
+            errorHandled = true
+            const errorMessage: string[] = ['Invalid email or password']
+
             if (
               ctx.error.code?.includes('BAD_REQUEST') ||
               ctx.error.message?.includes('Email and password sign in is not enabled')
@@ -268,6 +227,7 @@ export default function LoginPage({
               errorMessage.push('Too many requests. Please wait a moment before trying again.')
             }
 
+            setResetSuccessMessage(null)
             setPasswordErrors(errorMessage)
             setShowValidationError(true)
           },
@@ -275,19 +235,29 @@ export default function LoginPage({
       )
 
       if (!result || result.error) {
+        // Show error if not already handled by onError callback
+        if (!errorHandled) {
+          setResetSuccessMessage(null)
+          const errorMessage = result?.error?.message || 'Login failed. Please try again.'
+          setPasswordErrors([errorMessage])
+          setShowValidationError(true)
+        }
         setIsLoading(false)
         return
       }
+
+      // Clear reset success message on successful login
+      setResetSuccessMessage(null)
+
+      // Explicit redirect fallback if better-auth doesn't redirect
+      router.push(safeCallbackUrl)
     } catch (err: any) {
       if (err.message?.includes('not verified') || err.code?.includes('EMAIL_NOT_VERIFIED')) {
-        if (typeof window !== 'undefined') {
-          sessionStorage.setItem('verificationEmail', email)
-        }
-        router.push('/verify')
+        redirectToVerify(email)
         return
       }
 
-      console.error('Uncaught login error:', err)
+      logger.error('Uncaught login error:', err)
     } finally {
       setIsLoading(false)
     }
@@ -315,20 +285,15 @@ export default function LoginPage({
       setIsSubmittingReset(true)
       setResetStatus({ type: null, message: '' })
 
-      const response = await fetch('/api/auth/forget-password', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          email: forgotPasswordEmail,
-          redirectTo: `${window.location.origin}/reset-password`,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        let errorMessage = errorData.message || 'Failed to request password reset'
+      try {
+        await requestJson(forgetPasswordContract, {
+          body: {
+            email: forgotPasswordEmail,
+            redirectTo: `${getBaseUrl()}/reset-password`,
+          },
+        })
+      } catch (requestError) {
+        let errorMessage = getErrorMessage(requestError, 'Failed to request password reset')
 
         if (
           errorMessage.includes('Invalid body parameters') ||
@@ -360,15 +325,15 @@ export default function LoginPage({
       logger.error('Error requesting password reset:', { error })
       setResetStatus({
         type: 'error',
-        message: error instanceof Error ? error.message : 'Failed to request password reset',
+        message: getErrorMessage(error, 'Failed to request password reset'),
       })
     } finally {
       setIsSubmittingReset(false)
     }
   }
 
-  const ssoEnabled = isTruthy(env.NEXT_PUBLIC_SSO_ENABLED)
-  const emailEnabled = !isFalsy(env.NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED)
+  const ssoEnabled = isTruthy(getEnv('NEXT_PUBLIC_SSO_ENABLED'))
+  const emailEnabled = !isFalsy(getEnv('NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED'))
   const hasSocial = githubAvailable || googleAvailable
   const hasOnlySSO = ssoEnabled && !emailEnabled && !hasSocial
   const showTopSSO = hasOnlySSO
@@ -378,28 +343,24 @@ export default function LoginPage({
   return (
     <>
       <div className='space-y-1 text-center'>
-        <h1 className={`${soehne.className} font-medium text-[32px] text-black tracking-tight`}>
+        <h1 className='text-balance font-[430] font-season text-[40px] text-white leading-[110%] tracking-[-0.02em]'>
           Sign in
         </h1>
-        <p className={`${inter.className} font-[380] text-[16px] text-muted-foreground`}>
+        <p className='font-[430] font-season text-[color-mix(in_srgb,var(--landing-text-subtle)_60%,transparent)] text-lg leading-[125%] tracking-[0.02em]'>
           Enter your details
         </p>
       </div>
 
       {/* SSO Login Button (primary top-only when it is the only method) */}
       {showTopSSO && (
-        <div className={`${inter.className} mt-8`}>
-          <SSOLoginButton
-            callbackURL={callbackUrl}
-            variant='primary'
-            primaryClassName={buttonClass}
-          />
+        <div className='mt-8'>
+          <SSOLoginButton callbackURL={callbackUrl} variant='primary' />
         </div>
       )}
 
       {/* Email/Password Form - show unless explicitly disabled */}
-      {!isFalsy(env.NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED) && (
-        <form onSubmit={onSubmit} className={`${inter.className} mt-8 space-y-8`}>
+      {!isFalsy(getEnv('NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED')) && (
+        <form onSubmit={onSubmit} className='mt-8 space-y-8'>
           <div className='space-y-6'>
             <div className='space-y-2'>
               <div className='flex items-center justify-between'>
@@ -416,16 +377,15 @@ export default function LoginPage({
                 value={email}
                 onChange={handleEmailChange}
                 className={cn(
-                  'rounded-[10px] shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
                   showEmailValidationError &&
                     emailErrors.length > 0 &&
-                    'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
+                    'border-red-500 focus:border-red-500'
                 )}
               />
               {showEmailValidationError && emailErrors.length > 0 && (
                 <div className='mt-1 space-y-1 text-red-400 text-xs'>
-                  {emailErrors.map((error, index) => (
-                    <p key={index}>{error}</p>
+                  {emailErrors.map((error) => (
+                    <p key={error}>{error}</p>
                   ))}
                 </div>
               )}
@@ -436,7 +396,7 @@ export default function LoginPage({
                 <button
                   type='button'
                   onClick={() => setForgotPasswordOpen(true)}
-                  className='font-medium text-muted-foreground text-xs transition hover:text-foreground'
+                  className='font-medium text-[var(--landing-text-muted)] text-xs transition hover:text-[var(--landing-text)]'
                 >
                   Forgot password?
                 </button>
@@ -454,16 +414,16 @@ export default function LoginPage({
                   value={password}
                   onChange={handlePasswordChange}
                   className={cn(
-                    'rounded-[10px] pr-10 shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
+                    'pr-10',
                     showValidationError &&
                       passwordErrors.length > 0 &&
-                      'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
+                      'border-red-500 focus:border-red-500'
                   )}
                 />
                 <button
                   type='button'
                   onClick={() => setShowPassword(!showPassword)}
-                  className='-translate-y-1/2 absolute top-1/2 right-3 text-gray-500 transition hover:text-gray-700'
+                  className='-translate-y-1/2 absolute top-1/2 right-3 text-[var(--landing-text-muted)] transition hover:text-[var(--landing-text)]'
                   aria-label={showPassword ? 'Hide password' : 'Show password'}
                 >
                   {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
@@ -471,38 +431,55 @@ export default function LoginPage({
               </div>
               {showValidationError && passwordErrors.length > 0 && (
                 <div className='mt-1 space-y-1 text-red-400 text-xs'>
-                  {passwordErrors.map((error, index) => (
-                    <p key={index}>{error}</p>
+                  {passwordErrors.map((error) => (
+                    <p key={error}>{error}</p>
                   ))}
                 </div>
               )}
             </div>
           </div>
 
-          <Button
-            type='submit'
-            className={`${buttonClass} flex w-full items-center justify-center gap-2 rounded-[10px] border font-medium text-[15px] text-white transition-all duration-200`}
-            disabled={isLoading}
-          >
-            {isLoading ? 'Signing in...' : 'Sign in'}
-          </Button>
+          {resetSuccessMessage && (
+            <div className='text-[#4CAF50] text-xs'>
+              <p>{resetSuccessMessage}</p>
+            </div>
+          )}
+
+          {formError && (
+            <div className='text-red-400 text-xs'>
+              <p>{formError}</p>
+            </div>
+          )}
+
+          <button type='submit' disabled={isLoading} className={AUTH_SUBMIT_BTN}>
+            {isLoading ? (
+              <span className='flex items-center gap-2'>
+                <Loader className='size-4' animate />
+                Signing in…
+              </span>
+            ) : (
+              'Sign in'
+            )}
+          </button>
         </form>
       )}
 
       {/* Divider - show when we have multiple auth methods */}
       {showDivider && (
-        <div className={`${inter.className} relative my-6 font-light`}>
+        <div className='relative my-6 font-light'>
           <div className='absolute inset-0 flex items-center'>
-            <div className='auth-divider w-full border-t' />
+            <div className='w-full border-[var(--landing-bg-elevated)] border-t' />
           </div>
           <div className='relative flex justify-center text-sm'>
-            <span className='bg-white px-4 font-[340] text-muted-foreground'>Or continue with</span>
+            <span className='bg-[var(--landing-bg)] px-4 font-[340] text-[var(--landing-text-muted)]'>
+              Or continue with
+            </span>
           </div>
         </div>
       )}
 
       {showBottomSection && (
-        <div className={cn(inter.className, !emailEnabled ? 'mt-8' : undefined)}>
+        <div className={cn(!emailEnabled ? 'mt-8' : undefined)}>
           <SocialLoginButtons
             googleAvailable={googleAvailable}
             githubAvailable={githubAvailable}
@@ -510,38 +487,32 @@ export default function LoginPage({
             callbackURL={callbackUrl}
           >
             {ssoEnabled && !hasOnlySSO && (
-              <SSOLoginButton
-                callbackURL={callbackUrl}
-                variant='outline'
-                primaryClassName={buttonClass}
-              />
+              <SSOLoginButton callbackURL={callbackUrl} variant='outline' />
             )}
           </SocialLoginButtons>
         </div>
       )}
 
       {/* Only show signup link if email/password signup is enabled */}
-      {!isFalsy(env.NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED) && (
-        <div className={`${inter.className} pt-6 text-center font-light text-[14px]`}>
+      {!isFalsy(getEnv('NEXT_PUBLIC_EMAIL_PASSWORD_SIGNUP_ENABLED')) && (
+        <div className='pt-6 text-center font-light text-[14px]'>
           <span className='font-normal'>Don't have an account? </span>
           <Link
             href={isInviteFlow ? `/signup?invite_flow=true&callbackUrl=${callbackUrl}` : '/signup'}
-            className='font-medium text-[var(--brand-accent-hex)] underline-offset-4 transition hover:text-[var(--brand-accent-hover-hex)] hover:underline'
+            className='font-medium text-[var(--landing-text)] underline-offset-4 transition hover:text-white hover:underline'
           >
             Sign up
           </Link>
         </div>
       )}
 
-      <div
-        className={`${inter.className} auth-text-muted absolute right-0 bottom-0 left-0 px-8 pb-8 text-center font-[340] text-[13px] leading-relaxed sm:px-8 md:px-[44px]`}
-      >
+      <div className='absolute right-0 bottom-0 left-0 px-8 pb-8 text-center font-[340] text-[13px] text-[var(--landing-text-muted)] leading-relaxed sm:px-8 md:px-11'>
         By signing in, you agree to our{' '}
         <Link
           href='/terms'
           target='_blank'
           rel='noopener noreferrer'
-          className='auth-link underline-offset-4 transition hover:underline'
+          className='text-[var(--landing-text-muted)] underline-offset-4 transition hover:text-[var(--landing-text)] hover:underline'
         >
           Terms of Service
         </Link>{' '}
@@ -550,63 +521,66 @@ export default function LoginPage({
           href='/privacy'
           target='_blank'
           rel='noopener noreferrer'
-          className='auth-link underline-offset-4 transition hover:underline'
+          className='text-[var(--landing-text-muted)] underline-offset-4 transition hover:text-[var(--landing-text)] hover:underline'
         >
           Privacy Policy
         </Link>
       </div>
 
-      <Dialog open={forgotPasswordOpen} onOpenChange={setForgotPasswordOpen}>
-        <DialogContent className='auth-card auth-card-shadow max-w-[540px] rounded-[10px] border backdrop-blur-sm'>
-          <DialogHeader>
-            <DialogTitle className='auth-text-primary font-semibold text-xl tracking-tight'>
-              Reset Password
-            </DialogTitle>
-            <DialogDescription className='auth-text-secondary text-sm'>
-              Enter your email address and we'll send you a link to reset your password if your
-              account exists.
-            </DialogDescription>
-          </DialogHeader>
-          <div className='space-y-4'>
-            <div className='space-y-2'>
-              <div className='flex items-center justify-between'>
-                <Label htmlFor='reset-email'>Email</Label>
-              </div>
-              <Input
-                id='reset-email'
-                value={forgotPasswordEmail}
-                onChange={(e) => setForgotPasswordEmail(e.target.value)}
-                placeholder='Enter your email'
-                required
-                type='email'
-                className={cn(
-                  'rounded-[10px] shadow-sm transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100',
-                  resetStatus.type === 'error' &&
-                    'border-red-500 focus:border-red-500 focus:ring-red-100 focus-visible:ring-red-500'
-                )}
-              />
-              {resetStatus.type === 'error' && (
-                <div className='mt-1 space-y-1 text-red-400 text-xs'>
-                  <p>{resetStatus.message}</p>
-                </div>
-              )}
-            </div>
-            {resetStatus.type === 'success' && (
-              <div className='mt-1 space-y-1 text-[#4CAF50] text-xs'>
-                <p>{resetStatus.message}</p>
-              </div>
-            )}
-            <Button
-              type='button'
-              onClick={handleForgotPassword}
-              className={`${buttonClass} w-full rounded-[10px] border font-medium text-[15px] text-white transition-all duration-200`}
-              disabled={isSubmittingReset}
+      <Modal open={forgotPasswordOpen} onOpenChange={setForgotPasswordOpen}>
+        <ModalContent className='dark' size='sm'>
+          <ModalHeader>Reset Password</ModalHeader>
+          <ModalBody>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                handleForgotPassword()
+              }}
             >
-              {isSubmittingReset ? 'Sending...' : 'Send Reset Link'}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+              <ModalDescription className='mb-4 text-[var(--text-muted)] text-sm'>
+                Enter your email address and we'll send you a link to reset your password if your
+                account exists.
+              </ModalDescription>
+              <div className='space-y-4'>
+                <div className='space-y-2'>
+                  <Label htmlFor='reset-email'>Email</Label>
+                  <Input
+                    id='reset-email'
+                    value={forgotPasswordEmail}
+                    onChange={(e) => setForgotPasswordEmail(e.target.value)}
+                    placeholder='Enter your email'
+                    required
+                    type='email'
+                    className={cn(
+                      resetStatus.type === 'error' && 'border-red-500 focus:border-red-500'
+                    )}
+                  />
+                  {resetStatus.type === 'error' && (
+                    <div className='mt-1 text-red-400 text-xs'>
+                      <p>{resetStatus.message}</p>
+                    </div>
+                  )}
+                </div>
+                {resetStatus.type === 'success' && (
+                  <div className='mt-1 text-[#4CAF50] text-xs'>
+                    <p>{resetStatus.message}</p>
+                  </div>
+                )}
+                <button type='submit' disabled={isSubmittingReset} className={AUTH_SUBMIT_BTN}>
+                  {isSubmittingReset ? (
+                    <span className='flex items-center gap-2'>
+                      <Loader className='size-4' animate />
+                      Sending…
+                    </span>
+                  ) : (
+                    'Send Reset Link'
+                  )}
+                </button>
+              </div>
+            </form>
+          </ModalBody>
+        </ModalContent>
+      </Modal>
     </>
   )
 }

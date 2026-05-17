@@ -1,114 +1,110 @@
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
+import { createLogger } from '@sim/logger'
 import { type NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
-import { getSession } from '@/lib/auth'
+import { updateKnowledgeDocumentContract } from '@/lib/api/contracts/knowledge'
+import { parseRequest } from '@/lib/api/server'
+import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import {
   deleteDocument,
   markDocumentAsFailedTimeout,
   retryDocumentProcessing,
   updateDocument,
 } from '@/lib/knowledge/documents/service'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { captureServerEvent } from '@/lib/posthog/server'
 import { checkDocumentAccess, checkDocumentWriteAccess } from '@/app/api/knowledge/utils'
 
 const logger = createLogger('DocumentByIdAPI')
 
-const UpdateDocumentSchema = z.object({
-  filename: z.string().min(1, 'Filename is required').optional(),
-  enabled: z.boolean().optional(),
-  chunkCount: z.number().min(0).optional(),
-  tokenCount: z.number().min(0).optional(),
-  characterCount: z.number().min(0).optional(),
-  processingStatus: z.enum(['pending', 'processing', 'completed', 'failed']).optional(),
-  processingError: z.string().optional(),
-  markFailedDueToTimeout: z.boolean().optional(),
-  retryProcessing: z.boolean().optional(),
-  // Tag fields
-  tag1: z.string().optional(),
-  tag2: z.string().optional(),
-  tag3: z.string().optional(),
-  tag4: z.string().optional(),
-  tag5: z.string().optional(),
-  tag6: z.string().optional(),
-  tag7: z.string().optional(),
-})
-
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string; documentId: string }> }
-) {
-  const requestId = generateRequestId()
-  const { id: knowledgeBaseId, documentId } = await params
-
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized document access attempt`)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const accessCheck = await checkDocumentAccess(knowledgeBaseId, documentId, session.user.id)
-
-    if (!accessCheck.hasAccess) {
-      if (accessCheck.notFound) {
-        logger.warn(
-          `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
-        )
-        return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
-      }
-      logger.warn(
-        `[${requestId}] User ${session.user.id} attempted unauthorized document access: ${accessCheck.reason}`
-      )
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    logger.info(
-      `[${requestId}] Retrieved document: ${documentId} from knowledge base ${knowledgeBaseId}`
-    )
-
-    return NextResponse.json({
-      success: true,
-      data: accessCheck.document,
-    })
-  } catch (error) {
-    logger.error(`[${requestId}] Error fetching document`, error)
-    return NextResponse.json({ error: 'Failed to fetch document' }, { status: 500 })
-  }
-}
-
-export async function PUT(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string; documentId: string }> }
-) {
-  const requestId = generateRequestId()
-  const { id: knowledgeBaseId, documentId } = await params
-
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized document update attempt`)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const accessCheck = await checkDocumentWriteAccess(knowledgeBaseId, documentId, session.user.id)
-
-    if (!accessCheck.hasAccess) {
-      if (accessCheck.notFound) {
-        logger.warn(
-          `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
-        )
-        return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
-      }
-      logger.warn(
-        `[${requestId}] User ${session.user.id} attempted unauthorized document update: ${accessCheck.reason}`
-      )
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const body = await req.json()
+export const GET = withRouteHandler(
+  async (req: NextRequest, { params }: { params: Promise<{ id: string; documentId: string }> }) => {
+    const requestId = generateRequestId()
+    const { id: knowledgeBaseId, documentId } = await params
 
     try {
-      const validatedData = UpdateDocumentSchema.parse(body)
+      const auth = await checkSessionOrInternalAuth(req, { requireWorkflowId: false })
+      if (!auth.success || !auth.userId) {
+        logger.warn(`[${requestId}] Unauthorized document access attempt`)
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+      const userId = auth.userId
+
+      const accessCheck = await checkDocumentAccess(knowledgeBaseId, documentId, userId)
+
+      if (!accessCheck.hasAccess) {
+        if (accessCheck.notFound) {
+          logger.warn(
+            `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
+          )
+          return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
+        }
+        logger.warn(
+          `[${requestId}] User ${userId} attempted unauthorized document access: ${accessCheck.reason}`
+        )
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+
+      logger.info(
+        `[${requestId}] Retrieved document: ${documentId} from knowledge base ${knowledgeBaseId}`
+      )
+
+      return NextResponse.json({
+        success: true,
+        data: accessCheck.document,
+      })
+    } catch (error) {
+      logger.error(`[${requestId}] Error fetching document`, error)
+      return NextResponse.json({ error: 'Failed to fetch document' }, { status: 500 })
+    }
+  }
+)
+
+export const PUT = withRouteHandler(
+  async (req: NextRequest, { params }: { params: Promise<{ id: string; documentId: string }> }) => {
+    const requestId = generateRequestId()
+    const { id: knowledgeBaseId, documentId } = await params
+
+    try {
+      const auth = await checkSessionOrInternalAuth(req, { requireWorkflowId: false })
+      if (!auth.success || !auth.userId) {
+        logger.warn(`[${requestId}] Unauthorized document update attempt`)
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+      const userId = auth.userId
+
+      const accessCheck = await checkDocumentWriteAccess(knowledgeBaseId, documentId, userId)
+
+      if (!accessCheck.hasAccess) {
+        if (accessCheck.notFound) {
+          logger.warn(
+            `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
+          )
+          return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
+        }
+        logger.warn(
+          `[${requestId}] User ${userId} attempted unauthorized document update: ${accessCheck.reason}`
+        )
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+
+      const parsed = await parseRequest(
+        updateKnowledgeDocumentContract,
+        req,
+        { params },
+        {
+          validationErrorResponse: (error) => {
+            logger.warn(`[${requestId}] Invalid document update data`, { errors: error.issues })
+            return NextResponse.json(
+              { error: 'Invalid request data', details: error.issues },
+              { status: 400 }
+            )
+          },
+        }
+      )
+      if (!parsed.success) return parsed.response
+
+      const validatedData = parsed.data.body
 
       const updateData: any = {}
 
@@ -182,71 +178,109 @@ export async function PUT(
           `[${requestId}] Document updated: ${documentId} in knowledge base ${knowledgeBaseId}`
         )
 
+        recordAudit({
+          workspaceId: accessCheck.knowledgeBase?.workspaceId ?? null,
+          actorId: userId,
+          actorName: auth.userName,
+          actorEmail: auth.userEmail,
+          action: AuditAction.DOCUMENT_UPDATED,
+          resourceType: AuditResourceType.DOCUMENT,
+          resourceId: documentId,
+          resourceName: validatedData.filename ?? accessCheck.document?.filename,
+          description: `Updated document "${validatedData.filename ?? accessCheck.document?.filename}" in knowledge base "${knowledgeBaseId}"`,
+          metadata: {
+            knowledgeBaseId,
+            knowledgeBaseName: accessCheck.knowledgeBase?.name,
+            fileName: validatedData.filename ?? accessCheck.document?.filename,
+            updatedFields: Object.keys(validatedData).filter(
+              (k) => validatedData[k as keyof typeof validatedData] !== undefined
+            ),
+            ...(validatedData.enabled !== undefined && { enabled: validatedData.enabled }),
+          },
+          request: req,
+        })
+
         return NextResponse.json({
           success: true,
           data: updatedDocument,
         })
       }
-    } catch (validationError) {
-      if (validationError instanceof z.ZodError) {
-        logger.warn(`[${requestId}] Invalid document update data`, {
-          errors: validationError.errors,
-          documentId,
-        })
-        return NextResponse.json(
-          { error: 'Invalid request data', details: validationError.errors },
-          { status: 400 }
-        )
-      }
-      throw validationError
+    } catch (error) {
+      logger.error(`[${requestId}] Error updating document ${documentId}`, error)
+      return NextResponse.json({ error: 'Failed to update document' }, { status: 500 })
     }
-  } catch (error) {
-    logger.error(`[${requestId}] Error updating document ${documentId}`, error)
-    return NextResponse.json({ error: 'Failed to update document' }, { status: 500 })
   }
-}
+)
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string; documentId: string }> }
-) {
-  const requestId = generateRequestId()
-  const { id: knowledgeBaseId, documentId } = await params
+export const DELETE = withRouteHandler(
+  async (req: NextRequest, { params }: { params: Promise<{ id: string; documentId: string }> }) => {
+    const requestId = generateRequestId()
+    const { id: knowledgeBaseId, documentId } = await params
 
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized document delete attempt`)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    try {
+      const auth = await checkSessionOrInternalAuth(req, { requireWorkflowId: false })
+      if (!auth.success || !auth.userId) {
+        logger.warn(`[${requestId}] Unauthorized document delete attempt`)
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+      const userId = auth.userId
 
-    const accessCheck = await checkDocumentWriteAccess(knowledgeBaseId, documentId, session.user.id)
+      const accessCheck = await checkDocumentWriteAccess(knowledgeBaseId, documentId, userId)
 
-    if (!accessCheck.hasAccess) {
-      if (accessCheck.notFound) {
+      if (!accessCheck.hasAccess) {
+        if (accessCheck.notFound) {
+          logger.warn(
+            `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
+          )
+          return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
+        }
         logger.warn(
-          `[${requestId}] ${accessCheck.reason}: KB=${knowledgeBaseId}, Doc=${documentId}`
+          `[${requestId}] User ${userId} attempted unauthorized document deletion: ${accessCheck.reason}`
         )
-        return NextResponse.json({ error: accessCheck.reason }, { status: 404 })
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       }
-      logger.warn(
-        `[${requestId}] User ${session.user.id} attempted unauthorized document deletion: ${accessCheck.reason}`
+
+      const result = await deleteDocument(documentId, requestId)
+
+      logger.info(
+        `[${requestId}] Document deleted: ${documentId} from knowledge base ${knowledgeBaseId}`
       )
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+      recordAudit({
+        workspaceId: accessCheck.knowledgeBase?.workspaceId ?? null,
+        actorId: userId,
+        actorName: auth.userName,
+        actorEmail: auth.userEmail,
+        action: AuditAction.DOCUMENT_DELETED,
+        resourceType: AuditResourceType.DOCUMENT,
+        resourceId: documentId,
+        resourceName: accessCheck.document?.filename,
+        description: `Deleted document "${accessCheck.document?.filename}" from knowledge base "${knowledgeBaseId}"`,
+        metadata: {
+          knowledgeBaseId,
+          knowledgeBaseName: accessCheck.knowledgeBase?.name,
+          fileName: accessCheck.document?.filename,
+          fileSize: accessCheck.document?.fileSize,
+          mimeType: accessCheck.document?.mimeType,
+        },
+        request: req,
+      })
+
+      const kbWorkspaceId = accessCheck.knowledgeBase?.workspaceId ?? ''
+      captureServerEvent(
+        userId,
+        'knowledge_base_document_deleted',
+        { knowledge_base_id: knowledgeBaseId, workspace_id: kbWorkspaceId },
+        kbWorkspaceId ? { groups: { workspace: kbWorkspaceId } } : undefined
+      )
+
+      return NextResponse.json({
+        success: true,
+        data: result,
+      })
+    } catch (error) {
+      logger.error(`[${requestId}] Error deleting document`, error)
+      return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 })
     }
-
-    const result = await deleteDocument(documentId, requestId)
-
-    logger.info(
-      `[${requestId}] Document deleted: ${documentId} from knowledge base ${knowledgeBaseId}`
-    )
-
-    return NextResponse.json({
-      success: true,
-      data: result,
-    })
-  } catch (error) {
-    logger.error(`[${requestId}] Error deleting document`, error)
-    return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 })
   }
-}
+)

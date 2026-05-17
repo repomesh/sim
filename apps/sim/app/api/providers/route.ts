@@ -1,9 +1,28 @@
+import { db } from '@sim/db'
+import { account } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage, toError } from '@sim/utils/errors'
+import { eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
-import { generateRequestId } from '@/lib/utils'
+import { executeProviderContract } from '@/lib/api/contracts/providers'
+import { parseRequest } from '@/lib/api/server'
+import { authorizeCredentialUse } from '@/lib/auth/credential-access'
+import { checkInternalAuth } from '@/lib/auth/hybrid'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { checkWorkspaceAccess } from '@/lib/workspaces/permissions/utils'
+import {
+  getServiceAccountToken,
+  refreshTokenIfNeeded,
+  resolveOAuthAccountId,
+} from '@/app/api/auth/oauth/utils'
+import {
+  assertPermissionsAllowed,
+  IntegrationNotAllowedError,
+  ProviderNotAllowedError,
+} from '@/ee/access-control/utils/permission-check'
 import type { StreamingExecution } from '@/executor/types'
 import { executeProviderRequest } from '@/providers'
-import { getApiKey } from '@/providers/utils'
 
 const logger = createLogger('ProvidersAPI')
 
@@ -12,18 +31,36 @@ export const dynamic = 'force-dynamic'
 /**
  * Server-side proxy for provider requests
  */
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   const requestId = generateRequestId()
   const startTime = Date.now()
 
   try {
+    const auth = await checkInternalAuth(request, { requireWorkflowId: false })
+    if (!auth.success || !auth.userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
     logger.info(`[${requestId}] Provider API request started`, {
       timestamp: new Date().toISOString(),
       userAgent: request.headers.get('User-Agent'),
       contentType: request.headers.get('Content-Type'),
     })
 
-    const body = await request.json()
+    const validation = await parseRequest(
+      executeProviderContract,
+      request,
+      {},
+      {
+        validationErrorResponse: () =>
+          NextResponse.json({ error: 'Invalid request body' }, { status: 400 }),
+        invalidJsonResponse: () =>
+          NextResponse.json({ error: 'Invalid request body' }, { status: 400 }),
+      }
+    )
+    if (!validation.success) return validation.response
+
+    const body = validation.data.body
     const {
       provider,
       model,
@@ -35,6 +72,12 @@ export async function POST(request: NextRequest) {
       apiKey,
       azureEndpoint,
       azureApiVersion,
+      vertexProject,
+      vertexLocation,
+      vertexCredential,
+      bedrockAccessKeyId,
+      bedrockSecretKey,
+      bedrockRegion,
       responseFormat,
       workflowId,
       workspaceId,
@@ -58,6 +101,12 @@ export async function POST(request: NextRequest) {
       hasApiKey: !!apiKey,
       hasAzureEndpoint: !!azureEndpoint,
       hasAzureApiVersion: !!azureApiVersion,
+      hasVertexProject: !!vertexProject,
+      hasVertexLocation: !!vertexLocation,
+      hasVertexCredential: !!vertexCredential,
+      hasBedrockAccessKeyId: !!bedrockAccessKeyId,
+      hasBedrockSecretKey: !!bedrockSecretKey,
+      hasBedrockRegion: !!bedrockRegion,
       hasResponseFormat: !!responseFormat,
       workflowId,
       stream: !!stream,
@@ -70,18 +119,55 @@ export async function POST(request: NextRequest) {
       verbosity,
     })
 
-    let finalApiKey: string
+    if (workspaceId) {
+      const workspaceAccess = await checkWorkspaceAccess(workspaceId, auth.userId)
+      if (!workspaceAccess.hasAccess) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      }
+
+      try {
+        await assertPermissionsAllowed({
+          userId: auth.userId,
+          workspaceId,
+          model,
+        })
+      } catch (err) {
+        if (err instanceof ProviderNotAllowedError || err instanceof IntegrationNotAllowedError) {
+          return NextResponse.json({ error: err.message }, { status: 403 })
+        }
+        throw err
+      }
+    }
+
+    let finalApiKey: string | undefined = apiKey
     try {
-      finalApiKey = getApiKey(provider, model, apiKey)
+      if (provider === 'vertex' && vertexCredential) {
+        const vertexCredAccess = await authorizeCredentialUse(request, {
+          credentialId: vertexCredential,
+          workflowId: workflowId || undefined,
+          requireWorkflowIdForInternal: false,
+        })
+        if (!vertexCredAccess.ok) {
+          logger.warn(`[${requestId}] Vertex credential access denied`, {
+            error: vertexCredAccess.error,
+            credentialId: vertexCredential,
+          })
+          return NextResponse.json(
+            { error: vertexCredAccess.error || 'Unauthorized' },
+            { status: 401 }
+          )
+        }
+        finalApiKey = await resolveVertexCredential(requestId, vertexCredential)
+      }
     } catch (error) {
-      logger.error(`[${requestId}] Failed to get API key:`, {
+      logger.error(`[${requestId}] Failed to resolve Vertex credential:`, {
         provider,
         model,
-        error: error instanceof Error ? error.message : String(error),
-        hasProvidedApiKey: !!apiKey,
+        error: toError(error).message,
+        hasVertexCredential: !!vertexCredential,
       })
       return NextResponse.json(
-        { error: error instanceof Error ? error.message : 'API key error' },
+        { error: getErrorMessage(error, 'Credential error') },
         { status: 400 }
       )
     }
@@ -93,7 +179,6 @@ export async function POST(request: NextRequest) {
       hasApiKey: !!finalApiKey,
     })
 
-    // Execute provider request directly with the managed key
     const response = await executeProviderRequest(provider, {
       model,
       systemPrompt,
@@ -104,6 +189,11 @@ export async function POST(request: NextRequest) {
       apiKey: finalApiKey,
       azureEndpoint,
       azureApiVersion,
+      vertexProject,
+      vertexLocation,
+      bedrockAccessKeyId,
+      bedrockSecretKey,
+      bedrockRegion,
       responseFormat,
       workflowId,
       workspaceId,
@@ -159,8 +249,8 @@ export async function POST(request: NextRequest) {
               : '',
             model: executionData.output?.model,
             tokens: executionData.output?.tokens || {
-              prompt: 0,
-              completion: 0,
+              input: 0,
+              output: 0,
               total: 0,
             },
             // Sanitize any potential Unicode characters in tool calls
@@ -219,19 +309,16 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const executionTime = Date.now() - startTime
     logger.error(`[${requestId}] Provider request failed:`, {
-      error: error instanceof Error ? error.message : String(error),
+      error: toError(error).message,
       errorName: error instanceof Error ? error.name : 'Unknown',
       errorStack: error instanceof Error ? error.stack : undefined,
       executionTime,
       timestamp: new Date().toISOString(),
     })
 
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : String(error) },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: toError(error).message }, { status: 500 })
   }
-}
+})
 
 /**
  * Helper function to sanitize tool calls to remove Unicode characters
@@ -317,4 +404,41 @@ function sanitizeObject(obj: any): any {
   }
 
   return result
+}
+
+/**
+ * Resolves a Vertex AI OAuth credential to an access token
+ */
+async function resolveVertexCredential(requestId: string, credentialId: string): Promise<string> {
+  logger.info(`[${requestId}] Resolving Vertex AI credential: ${credentialId}`)
+
+  const resolved = await resolveOAuthAccountId(credentialId)
+  if (!resolved) {
+    throw new Error(`Vertex AI credential not found: ${credentialId}`)
+  }
+
+  if (resolved.credentialType === 'service_account' && resolved.credentialId) {
+    const accessToken = await getServiceAccountToken(resolved.credentialId, [
+      'https://www.googleapis.com/auth/cloud-platform',
+    ])
+    logger.info(`[${requestId}] Successfully resolved Vertex AI service account credential`)
+    return accessToken
+  }
+
+  const credential = await db.query.account.findFirst({
+    where: eq(account.id, resolved.accountId),
+  })
+
+  if (!credential) {
+    throw new Error(`Vertex AI credential not found: ${credentialId}`)
+  }
+
+  const { accessToken } = await refreshTokenIfNeeded(requestId, credential, resolved.accountId)
+
+  if (!accessToken) {
+    throw new Error('Failed to get Vertex AI access token')
+  }
+
+  logger.info(`[${requestId}] Successfully resolved Vertex AI credential`)
+  return accessToken
 }

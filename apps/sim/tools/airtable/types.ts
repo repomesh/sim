@@ -1,16 +1,89 @@
 import type { ToolResponse } from '@/tools/types'
 
 // Common types
-export interface AirtableRecord {
+interface AirtableRecord {
   id: string
   createdTime: string
   fields: Record<string, any>
+}
+
+interface AirtableBase {
+  id: string
+  name: string
+  permissionLevel: 'none' | 'read' | 'comment' | 'edit' | 'create'
+}
+
+interface AirtableFieldOption {
+  id: string
+  name: string
+  color?: string
+}
+
+export interface AirtableField {
+  id: string
+  name: string
+  type: string
+  description?: string
+  options?: {
+    choices?: AirtableFieldOption[]
+    linkedTableId?: string
+    isReversed?: boolean
+    prefersSingleRecordLink?: boolean
+    inverseLinkFieldId?: string
+    [key: string]: unknown
+  }
+}
+
+export interface AirtableTable {
+  id: string
+  name: string
+  description?: string
+  primaryFieldId: string
+  fields: AirtableField[]
+}
+
+interface AirtableView {
+  id: string
+  name: string
+  type: string
 }
 
 interface AirtableBaseParams {
   accessToken: string
   baseId: string
   tableId: string
+}
+
+// List Bases Types
+export interface AirtableListBasesParams {
+  accessToken: string
+  offset?: string
+}
+
+export interface AirtableListBasesResponse extends ToolResponse {
+  output: {
+    bases: AirtableBase[]
+    metadata: {
+      offset?: string
+      totalBases: number
+    }
+  }
+}
+
+// List Tables Types (Get Base Schema)
+export interface AirtableListTablesParams {
+  accessToken: string
+  baseId: string
+}
+
+export interface AirtableListTablesResponse extends ToolResponse {
+  output: {
+    tables: AirtableTable[]
+    metadata: {
+      baseId: string
+      totalTables: number
+    }
+  }
 }
 
 // List Records Types
@@ -89,8 +162,25 @@ export interface AirtableUpdateMultipleResponse extends ToolResponse {
 }
 
 export type AirtableResponse =
+  | AirtableListBasesResponse
+  | AirtableListTablesResponse
   | AirtableListResponse
   | AirtableGetResponse
   | AirtableCreateResponse
   | AirtableUpdateResponse
   | AirtableUpdateMultipleResponse
+  | AirtableListBasesResponse
+  | AirtableGetBaseSchemaResponse
+
+interface AirtableGetBaseSchemaResponse extends ToolResponse {
+  output: {
+    tables: Array<{
+      id: string
+      name: string
+      description?: string
+      fields: Array<{ id: string; name: string; type: string; description?: string }>
+      views: Array<{ id: string; name: string; type: string }>
+    }>
+    metadata: { totalTables: number }
+  }
+}

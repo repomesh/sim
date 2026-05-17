@@ -1,33 +1,110 @@
-import { NextRequest } from 'next/server'
 /**
  * Tests for file serve API route
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { setupApiTestMocks } from '@/app/api/__test-utils__/utils'
+import { hybridAuthMockFns, storageServiceMock, storageServiceMockFns } from '@sim/testing'
+import { NextRequest } from 'next/server'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const {
+  mockVerifyFileAccess,
+  mockReadFile,
+  mockIsUsingCloudStorage,
+  mockDownloadCopilotFile,
+  mockInferContextFromKey,
+  mockGetContentType,
+  mockFindLocalFile,
+  mockCreateFileResponse,
+  mockCreateErrorResponse,
+  FileNotFoundError,
+} = vi.hoisted(() => {
+  class FileNotFoundErrorClass extends Error {
+    constructor(message: string) {
+      super(message)
+      this.name = 'FileNotFoundError'
+    }
+  }
+  return {
+    mockVerifyFileAccess: vi.fn(),
+    mockReadFile: vi.fn(),
+    mockIsUsingCloudStorage: vi.fn(),
+    mockDownloadCopilotFile: vi.fn(),
+    mockInferContextFromKey: vi.fn(),
+    mockGetContentType: vi.fn(),
+    mockFindLocalFile: vi.fn(),
+    mockCreateFileResponse: vi.fn(),
+    mockCreateErrorResponse: vi.fn(),
+    FileNotFoundError: FileNotFoundErrorClass,
+  }
+})
+
+vi.mock('fs/promises', () => ({
+  readFile: mockReadFile,
+  access: vi.fn().mockResolvedValue(undefined),
+  stat: vi.fn().mockResolvedValue({ isFile: () => true, size: 100 }),
+}))
+
+vi.mock('@/app/api/files/authorization', () => ({
+  verifyFileAccess: mockVerifyFileAccess,
+}))
+
+vi.mock('@/lib/uploads', () => ({
+  CopilotFiles: {
+    downloadCopilotFile: mockDownloadCopilotFile,
+  },
+  isUsingCloudStorage: mockIsUsingCloudStorage,
+}))
+
+vi.mock('@/lib/uploads/core/storage-service', () => storageServiceMock)
+
+vi.mock('@/lib/uploads/utils/file-utils', () => ({
+  inferContextFromKey: mockInferContextFromKey,
+}))
+
+vi.mock('@/lib/uploads/setup.server', () => ({}))
+
+vi.mock('@/lib/execution/sandbox/run-task', () => ({
+  runSandboxTask: vi
+    .fn()
+    .mockImplementation(async (taskId: string) =>
+      taskId === 'pdf-generate' ? Buffer.from('%PDF-compiled') : Buffer.from('PK\x03\x04compiled')
+    ),
+}))
+
+vi.mock('@/lib/uploads/contexts/workspace/workspace-file-manager', () => ({
+  parseWorkspaceFileKey: vi.fn().mockReturnValue(undefined),
+}))
+
+vi.mock('@/app/api/files/utils', () => ({
+  FileNotFoundError,
+  createFileResponse: mockCreateFileResponse,
+  createErrorResponse: mockCreateErrorResponse,
+  getContentType: mockGetContentType,
+  extractStorageKey: vi.fn().mockImplementation((path: string) => path.split('/').pop()),
+  extractFilename: vi.fn().mockImplementation((path: string) => path.split('/').pop()),
+  findLocalFile: mockFindLocalFile,
+}))
+
+import { GET } from '@/app/api/files/serve/[...path]/route'
 
 describe('File Serve API Route', () => {
   beforeEach(() => {
-    vi.resetModules()
+    vi.clearAllMocks()
 
-    setupApiTestMocks({
-      withFileSystem: true,
-      withUploadUtils: true,
+    hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
+      success: true,
+      userId: 'test-user-id',
     })
-
-    vi.doMock('fs', () => ({
-      existsSync: vi.fn().mockReturnValue(true),
-    }))
-
-    vi.doMock('@/app/api/files/utils', () => ({
-      FileNotFoundError: class FileNotFoundError extends Error {
-        constructor(message: string) {
-          super(message)
-          this.name = 'FileNotFoundError'
-        }
-      },
-      createFileResponse: vi.fn().mockImplementation((file) => {
+    mockVerifyFileAccess.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(Buffer.from('test content'))
+    mockIsUsingCloudStorage.mockReturnValue(false)
+    storageServiceMockFns.mockHasCloudStorage.mockReturnValue(true)
+    mockInferContextFromKey.mockReturnValue('workspace')
+    mockGetContentType.mockReturnValue('text/plain')
+    mockFindLocalFile.mockReturnValue('/test/uploads/test-file.txt')
+    mockCreateFileResponse.mockImplementation(
+      (file: { buffer: Buffer; contentType: string; filename: string }) => {
         return new Response(file.buffer, {
           status: 200,
           headers: {
@@ -35,180 +112,78 @@ describe('File Serve API Route', () => {
             'Content-Disposition': `inline; filename="${file.filename}"`,
           },
         })
-      }),
-      createErrorResponse: vi.fn().mockImplementation((error) => {
-        return new Response(JSON.stringify({ error: error.name, message: error.message }), {
-          status: error.name === 'FileNotFoundError' ? 404 : 500,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }),
-      getContentType: vi.fn().mockReturnValue('text/plain'),
-      isS3Path: vi.fn().mockReturnValue(false),
-      isBlobPath: vi.fn().mockReturnValue(false),
-      extractS3Key: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractBlobKey: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractFilename: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      findLocalFile: vi.fn().mockReturnValue('/test/uploads/test-file.txt'),
-    }))
-
-    vi.doMock('@/lib/uploads/setup.server', () => ({}))
-  })
-
-  afterEach(() => {
-    vi.clearAllMocks()
+      }
+    )
+    mockCreateErrorResponse.mockImplementation((error: Error) => {
+      return new Response(JSON.stringify({ error: error.name, message: error.message }), {
+        status: error.name === 'FileNotFoundError' ? 404 : 500,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
   })
 
   it('should serve local file successfully', async () => {
-    const req = new NextRequest('http://localhost:3000/api/files/serve/test-file.txt')
-    const params = { path: ['test-file.txt'] }
-    const { GET } = await import('@/app/api/files/serve/[...path]/route')
+    const req = new NextRequest(
+      'http://localhost:3000/api/files/serve/workspace/test-workspace-id/test-file.txt'
+    )
+    const params = { path: ['workspace', 'test-workspace-id', 'test-file.txt'] }
 
     const response = await GET(req, { params: Promise.resolve(params) })
 
     expect(response.status).toBe(200)
     expect(response.headers.get('Content-Type')).toBe('text/plain')
-    expect(response.headers.get('Content-Disposition')).toBe('inline; filename="test-file.txt"')
+    const disposition = response.headers.get('Content-Disposition')
+    expect(disposition).toContain('inline')
+    expect(disposition).toContain('filename=')
+    expect(disposition).toContain('test-file.txt')
 
-    const fs = await import('fs/promises')
-    expect(fs.readFile).toHaveBeenCalledWith('/test/uploads/test-file.txt')
+    expect(mockReadFile).toHaveBeenCalled()
   })
 
   it('should handle nested paths correctly', async () => {
-    vi.doMock('@/app/api/files/utils', () => ({
-      FileNotFoundError: class FileNotFoundError extends Error {
-        constructor(message: string) {
-          super(message)
-          this.name = 'FileNotFoundError'
-        }
-      },
-      createFileResponse: vi.fn().mockImplementation((file) => {
-        return new Response(file.buffer, {
-          status: 200,
-          headers: {
-            'Content-Type': file.contentType,
-            'Content-Disposition': `inline; filename="${file.filename}"`,
-          },
-        })
-      }),
-      createErrorResponse: vi.fn().mockImplementation((error) => {
-        return new Response(JSON.stringify({ error: error.name, message: error.message }), {
-          status: error.name === 'FileNotFoundError' ? 404 : 500,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }),
-      getContentType: vi.fn().mockReturnValue('text/plain'),
-      isS3Path: vi.fn().mockReturnValue(false),
-      isBlobPath: vi.fn().mockReturnValue(false),
-      extractS3Key: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractBlobKey: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractFilename: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      findLocalFile: vi.fn().mockReturnValue('/test/uploads/nested/path/file.txt'),
-    }))
+    mockFindLocalFile.mockReturnValue('/test/uploads/nested/path/file.txt')
 
-    const req = new NextRequest('http://localhost:3000/api/files/serve/nested/path/file.txt')
-    const params = { path: ['nested', 'path', 'file.txt'] }
-    const { GET } = await import('@/app/api/files/serve/[...path]/route')
+    const req = new NextRequest(
+      'http://localhost:3000/api/files/serve/workspace/test-workspace-id/nested-path-file.txt'
+    )
+    const params = { path: ['workspace', 'test-workspace-id', 'nested-path-file.txt'] }
 
     const response = await GET(req, { params: Promise.resolve(params) })
 
     expect(response.status).toBe(200)
 
-    const fs = await import('fs/promises')
-    expect(fs.readFile).toHaveBeenCalledWith('/test/uploads/nested/path/file.txt')
+    expect(mockReadFile).toHaveBeenCalledWith('/test/uploads/nested/path/file.txt')
   })
 
   it('should serve cloud file by downloading and proxying', async () => {
-    vi.doMock('@/lib/uploads', () => ({
-      downloadFile: vi.fn().mockResolvedValue(Buffer.from('test cloud file content')),
-      getPresignedUrl: vi.fn().mockResolvedValue('https://example-s3.com/presigned-url'),
-      isUsingCloudStorage: vi.fn().mockReturnValue(true),
-    }))
+    mockIsUsingCloudStorage.mockReturnValue(true)
+    storageServiceMockFns.mockDownloadFile.mockResolvedValue(Buffer.from('test cloud file content'))
+    mockGetContentType.mockReturnValue('image/png')
 
-    vi.doMock('@/lib/uploads/setup', () => ({
-      UPLOAD_DIR: '/test/uploads',
-      USE_S3_STORAGE: true,
-      USE_BLOB_STORAGE: false,
-    }))
-
-    vi.doMock('@/app/api/files/utils', () => ({
-      FileNotFoundError: class FileNotFoundError extends Error {
-        constructor(message: string) {
-          super(message)
-          this.name = 'FileNotFoundError'
-        }
-      },
-      createFileResponse: vi.fn().mockImplementation((file) => {
-        return new Response(file.buffer, {
-          status: 200,
-          headers: {
-            'Content-Type': file.contentType,
-            'Content-Disposition': `inline; filename="${file.filename}"`,
-          },
-        })
-      }),
-      createErrorResponse: vi.fn().mockImplementation((error) => {
-        return new Response(JSON.stringify({ error: error.name, message: error.message }), {
-          status: error.name === 'FileNotFoundError' ? 404 : 500,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }),
-      getContentType: vi.fn().mockReturnValue('image/png'),
-      isS3Path: vi.fn().mockReturnValue(false),
-      isBlobPath: vi.fn().mockReturnValue(false),
-      extractS3Key: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractBlobKey: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      extractFilename: vi.fn().mockImplementation((path) => path.split('/').pop()),
-      findLocalFile: vi.fn().mockReturnValue('/test/uploads/test-file.txt'),
-    }))
-
-    const req = new NextRequest('http://localhost:3000/api/files/serve/s3/1234567890-image.png')
-    const params = { path: ['s3', '1234567890-image.png'] }
-    const { GET } = await import('@/app/api/files/serve/[...path]/route')
+    const req = new NextRequest(
+      'http://localhost:3000/api/files/serve/workspace/test-workspace-id/1234567890-image.png'
+    )
+    const params = { path: ['workspace', 'test-workspace-id', '1234567890-image.png'] }
 
     const response = await GET(req, { params: Promise.resolve(params) })
 
     expect(response.status).toBe(200)
     expect(response.headers.get('Content-Type')).toBe('image/png')
 
-    const uploads = await import('@/lib/uploads')
-    expect(uploads.downloadFile).toHaveBeenCalledWith('1234567890-image.png')
+    expect(storageServiceMockFns.mockDownloadFile).toHaveBeenCalledWith({
+      key: 'workspace/test-workspace-id/1234567890-image.png',
+      context: 'workspace',
+    })
   })
 
   it('should return 404 when file not found', async () => {
-    vi.doMock('fs', () => ({
-      existsSync: vi.fn().mockReturnValue(false),
-    }))
+    mockVerifyFileAccess.mockResolvedValue(false)
+    mockFindLocalFile.mockReturnValue(null)
 
-    vi.doMock('fs/promises', () => ({
-      readFile: vi.fn().mockRejectedValue(new Error('ENOENT: no such file or directory')),
-    }))
-
-    vi.doMock('@/app/api/files/utils', () => ({
-      FileNotFoundError: class FileNotFoundError extends Error {
-        constructor(message: string) {
-          super(message)
-          this.name = 'FileNotFoundError'
-        }
-      },
-      createFileResponse: vi.fn(),
-      createErrorResponse: vi.fn().mockImplementation((error) => {
-        return new Response(JSON.stringify({ error: error.name, message: error.message }), {
-          status: error.name === 'FileNotFoundError' ? 404 : 500,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }),
-      getContentType: vi.fn().mockReturnValue('text/plain'),
-      isS3Path: vi.fn().mockReturnValue(false),
-      isBlobPath: vi.fn().mockReturnValue(false),
-      extractS3Key: vi.fn(),
-      extractBlobKey: vi.fn(),
-      extractFilename: vi.fn(),
-      findLocalFile: vi.fn().mockReturnValue(null),
-    }))
-
-    const req = new NextRequest('http://localhost:3000/api/files/serve/nonexistent.txt')
-    const params = { path: ['nonexistent.txt'] }
-    const { GET } = await import('@/app/api/files/serve/[...path]/route')
+    const req = new NextRequest(
+      'http://localhost:3000/api/files/serve/workspace/test-workspace-id/nonexistent.txt'
+    )
+    const params = { path: ['workspace', 'test-workspace-id', 'nonexistent.txt'] }
 
     const response = await GET(req, { params: Promise.resolve(params) })
 
@@ -232,10 +207,10 @@ describe('File Serve API Route', () => {
 
     for (const test of contentTypeTests) {
       it(`should serve ${test.ext} file with correct content type`, async () => {
-        vi.doMock('@/app/api/files/utils', () => ({
-          getContentType: () => test.contentType,
-          findLocalFile: () => `/test/uploads/file.${test.ext}`,
-          createFileResponse: (obj: { buffer: Buffer; contentType: string; filename: string }) =>
+        mockGetContentType.mockReturnValue(test.contentType)
+        mockFindLocalFile.mockReturnValue(`/test/uploads/file.${test.ext}`)
+        mockCreateFileResponse.mockImplementation(
+          (obj: { buffer: Buffer; contentType: string; filename: string }) =>
             new Response(obj.buffer, {
               status: 200,
               headers: {
@@ -243,13 +218,13 @@ describe('File Serve API Route', () => {
                 'Content-Disposition': `inline; filename="${obj.filename}"`,
                 'Cache-Control': 'public, max-age=31536000',
               },
-            }),
-          createErrorResponse: () => new Response(null, { status: 404 }),
-        }))
+            })
+        )
 
-        const req = new NextRequest(`http://localhost:3000/api/files/serve/file.${test.ext}`)
-        const params = { path: [`file.${test.ext}`] }
-        const { GET } = await import('@/app/api/files/serve/[...path]/route')
+        const req = new NextRequest(
+          `http://localhost:3000/api/files/serve/workspace/test-workspace-id/file.${test.ext}`
+        )
+        const params = { path: ['workspace', 'test-workspace-id', `file.${test.ext}`] }
 
         const response = await GET(req, { params: Promise.resolve(params) })
 

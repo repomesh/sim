@@ -1,17 +1,55 @@
-import { db, ssoProvider } from '@sim/db'
-import { eq } from 'drizzle-orm'
+import { db, member, ssoProvider } from '@sim/db'
+import { createLogger } from '@sim/logger'
+import { and, eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
+import { listSsoProvidersContract } from '@/lib/api/contracts/auth'
+import { parseRequest } from '@/lib/api/server'
+import { getSession } from '@/lib/auth'
+import { enforceIpRateLimit } from '@/lib/core/rate-limiter'
+import { REDACTED_MARKER } from '@/lib/core/security/redaction'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
-const logger = createLogger('SSO-Providers')
+const logger = createLogger('SSOProvidersRoute')
 
-export async function GET(req: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   try {
-    const session = await auth.api.getSession({ headers: req.headers })
+    const session = await getSession()
+    if (!session?.user?.id) {
+      const rateLimited = await enforceIpRateLimit('sso-providers', request, {
+        maxTokens: 20,
+        refillRate: 20,
+        refillIntervalMs: 60_000,
+      })
+      if (rateLimited) return rateLimited
+    }
+    const parsed = await parseRequest(listSsoProvidersContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { organizationId } = parsed.data.query
 
     let providers
     if (session?.user?.id) {
+      const userId = session.user.id
+
+      let verifiedOrganizationId: string | null = null
+      if (organizationId) {
+        const [membership] = await db
+          .select({ organizationId: member.organizationId, role: member.role })
+          .from(member)
+          .where(and(eq(member.userId, userId), eq(member.organizationId, organizationId)))
+          .limit(1)
+        if (!membership) {
+          return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+        }
+        if (membership.role !== 'owner' && membership.role !== 'admin') {
+          return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+        }
+        verifiedOrganizationId = membership.organizationId
+      }
+
+      const whereClause = verifiedOrganizationId
+        ? eq(ssoProvider.organizationId, verifiedOrganizationId)
+        : eq(ssoProvider.userId, userId)
+
       const results = await db
         .select({
           id: ssoProvider.id,
@@ -24,22 +62,26 @@ export async function GET(req: NextRequest) {
           organizationId: ssoProvider.organizationId,
         })
         .from(ssoProvider)
-        .where(eq(ssoProvider.userId, session.user.id))
+        .where(whereClause)
 
-      providers = results.map((provider) => ({
-        ...provider,
-        providerType:
-          provider.oidcConfig && provider.samlConfig
-            ? 'oidc'
-            : provider.oidcConfig
-              ? 'oidc'
-              : provider.samlConfig
-                ? 'saml'
-                : ('oidc' as 'oidc' | 'saml'),
-      }))
+      providers = results.map((provider) => {
+        let oidcConfig = provider.oidcConfig
+        if (oidcConfig) {
+          try {
+            const parsed = JSON.parse(oidcConfig)
+            parsed.clientSecret = REDACTED_MARKER
+            oidcConfig = JSON.stringify(parsed)
+          } catch {
+            oidcConfig = null
+          }
+        }
+        return {
+          ...provider,
+          oidcConfig,
+          providerType: (provider.samlConfig ? 'saml' : 'oidc') as 'oidc' | 'saml',
+        }
+      })
     } else {
-      // Unauthenticated users can only see basic info (domain only)
-      // This is needed for SSO login flow to check if a domain has SSO enabled
       const results = await db
         .select({
           domain: ssoProvider.domain,
@@ -62,4 +104,4 @@ export async function GET(req: NextRequest) {
     logger.error('Failed to fetch SSO providers', { error })
     return NextResponse.json({ error: 'Failed to fetch SSO providers' }, { status: 500 })
   }
-}
+})

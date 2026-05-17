@@ -1,68 +1,58 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
+import { createLogger } from '@sim/logger'
 import { useParams, useRouter } from 'next/navigation'
-import { LoadingAgent } from '@/components/ui/loading-agent'
-import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
+import { ReactFlowProvider } from 'reactflow'
+import { Panel, Terminal } from '@/app/workspace/[workspaceId]/w/[workflowId]/components'
+import { useWorkflows } from '@/hooks/queries/workflows'
+
+const logger = createLogger('WorkflowsPage')
 
 export default function WorkflowsPage() {
   const router = useRouter()
-  const { workflows, isLoading, loadWorkflows, setActiveWorkflow } = useWorkflowRegistry()
-  const [hasInitialized, setHasInitialized] = useState(false)
-
   const params = useParams()
   const workspaceId = params.workspaceId as string
 
-  // Initialize workspace workflows
+  const { data: workflows = [], isLoading, isError, isPlaceholderData } = useWorkflows(workspaceId)
+
   useEffect(() => {
-    const initializeWorkspace = async () => {
-      try {
-        await loadWorkflows(workspaceId)
-        setHasInitialized(true)
-      } catch (error) {
-        console.error('Failed to load workflows for workspace:', error)
-        setHasInitialized(true) // Still mark as initialized to show error state
-      }
+    if (isLoading || isPlaceholderData) return
+
+    if (isError) {
+      logger.error('Failed to load workflows for workspace')
+      return
     }
 
-    if (!hasInitialized) {
-      initializeWorkspace()
-    }
-  }, [workspaceId, loadWorkflows, hasInitialized])
+    const workspaceWorkflows = workflows.filter((w) => w.workspaceId === workspaceId)
 
-  // Handle redirection once workflows are loaded
-  useEffect(() => {
-    // Only proceed if we've initialized and workflows are not loading
-    if (!hasInitialized || isLoading) return
-
-    const workflowIds = Object.keys(workflows)
-
-    // Validate that workflows belong to the current workspace
-    const workspaceWorkflows = workflowIds.filter((id) => {
-      const workflow = workflows[id]
-      return workflow.workspaceId === workspaceId
-    })
-
-    // If we have valid workspace workflows, redirect to the first one
     if (workspaceWorkflows.length > 0) {
-      // Ensure the workflow is set as active before redirecting
-      // This prevents the empty canvas issue on first login
-      const firstWorkflowId = workspaceWorkflows[0]
-      setActiveWorkflow(firstWorkflowId).then(() => {
-        router.replace(`/workspace/${workspaceId}/w/${firstWorkflowId}`)
-      })
+      router.replace(`/workspace/${workspaceId}/w/${workspaceWorkflows[0].id}`)
     }
-  }, [hasInitialized, isLoading, workflows, workspaceId, router, setActiveWorkflow])
+  }, [isLoading, isPlaceholderData, workflows, workspaceId, router, isError])
 
   // Always show loading state until redirect happens
   // There should always be a default workflow, so we never show "no workflows found"
   return (
-    <div className='flex h-screen items-center justify-center'>
-      <div className='text-center'>
-        <div className='mx-auto mb-4'>
-          <LoadingAgent size='lg' />
+    <div className='flex h-full w-full flex-col overflow-hidden bg-[var(--bg)]'>
+      <div className='relative h-full w-full flex-1 bg-[var(--bg)]'>
+        <div className='workflow-container flex h-full items-center justify-center bg-[var(--bg)]'>
+          <div
+            className='size-[18px] animate-spin rounded-full'
+            style={{
+              background:
+                'conic-gradient(from 0deg, hsl(var(--muted-foreground)) 0deg 120deg, transparent 120deg 180deg, hsl(var(--muted-foreground)) 180deg 300deg, transparent 300deg 360deg)',
+              mask: 'radial-gradient(farthest-side, transparent calc(100% - 1.5px), black calc(100% - 1.5px))',
+              WebkitMask:
+                'radial-gradient(farthest-side, transparent calc(100% - 1.5px), black calc(100% - 1.5px))',
+            }}
+          />
         </div>
+        <ReactFlowProvider>
+          <Panel />
+        </ReactFlowProvider>
       </div>
+      <Terminal />
     </div>
   )
 }

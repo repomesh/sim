@@ -1,28 +1,38 @@
-import { db } from '@sim/db'
-import * as schema from '@sim/db/schema'
-import { and, eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { hasPaidSubscription } from '@/lib/billing'
+import { isOrganizationOwnerOrAdmin } from '@/lib/billing/core/organization'
+import { isOrgScopedSubscription } from '@/lib/billing/subscriptions/utils'
+
+const logger = createLogger('BillingAuthorization')
 
 /**
- * Check if a user is authorized to manage billing for a given reference ID
- * Reference ID can be either a user ID (individual subscription) or organization ID (team subscription)
+ * Check if a user is authorized to manage billing for a given reference ID.
+ * Reference ID can be either a user ID (personal subscription) or an
+ * organization ID (org-scoped subscription — team, enterprise, or a
+ * `pro_*` plan transferred to an org).
+ *
+ * This function also performs duplicate subscription validation for
+ * organizations:
+ * - Rejects if an organization already has an active subscription (prevents
+ *   duplicates).
+ * - Personal subscriptions skip this check to allow upgrades.
  */
 export async function authorizeSubscriptionReference(
   userId: string,
-  referenceId: string
+  referenceId: string,
+  action?: string
 ): Promise<boolean> {
-  // User can always manage their own subscriptions
-  if (referenceId === userId) {
+  if (!isOrgScopedSubscription({ referenceId }, userId)) {
     return true
   }
 
-  // Check if referenceId is an organizationId the user has admin rights to
-  const members = await db
-    .select()
-    .from(schema.member)
-    .where(and(eq(schema.member.userId, userId), eq(schema.member.organizationId, referenceId)))
+  if (action === 'upgrade-subscription' && (await hasPaidSubscription(referenceId))) {
+    logger.warn('Blocking checkout - active subscription already exists for organization', {
+      userId,
+      referenceId,
+    })
+    return false
+  }
 
-  const member = members[0]
-
-  // Allow if the user is an owner or admin of the organization
-  return member?.role === 'owner' || member?.role === 'admin'
+  return isOrganizationOwnerOrAdmin(userId, referenceId)
 }

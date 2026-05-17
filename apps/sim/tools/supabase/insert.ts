@@ -1,4 +1,6 @@
+import { validateDatabaseIdentifier } from '@/lib/core/security/input-validation'
 import type { SupabaseInsertParams, SupabaseInsertResponse } from '@/tools/supabase/types'
+import { supabaseBaseUrl } from '@/tools/supabase/utils'
 import type { ToolConfig } from '@/tools/types'
 
 export const insertTool: ToolConfig<SupabaseInsertParams, SupabaseInsertResponse> = {
@@ -20,11 +22,18 @@ export const insertTool: ToolConfig<SupabaseInsertParams, SupabaseInsertResponse
       visibility: 'user-or-llm',
       description: 'The name of the Supabase table to insert data into',
     },
+    schema: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description:
+        'Database schema to insert into (default: public). Use this to access tables in other schemas.',
+    },
     data: {
-      type: 'any',
+      type: 'array',
       required: true,
       visibility: 'user-or-llm',
-      description: 'The data to insert',
+      description: 'The data to insert (array of objects or a single object)',
     },
     apiKey: {
       type: 'string',
@@ -35,14 +44,24 @@ export const insertTool: ToolConfig<SupabaseInsertParams, SupabaseInsertResponse
   },
 
   request: {
-    url: (params) => `https://${params.projectId}.supabase.co/rest/v1/${params.table}?select=*`,
+    url: (params) => {
+      const tableValidation = validateDatabaseIdentifier(params.table, 'table')
+      if (!tableValidation.isValid) throw new Error(tableValidation.error)
+      return `${supabaseBaseUrl(params.projectId)}/rest/v1/${encodeURIComponent(params.table)}?select=*`
+    },
     method: 'POST',
-    headers: (params) => ({
-      apikey: params.apiKey,
-      Authorization: `Bearer ${params.apiKey}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-    }),
+    headers: (params) => {
+      const headers: Record<string, string> = {
+        apikey: params.apiKey,
+        Authorization: `Bearer ${params.apiKey}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      }
+      if (params.schema) {
+        headers['Content-Profile'] = params.schema
+      }
+      return headers
+    },
     body: (params) => {
       // Prepare the data - if it's an object but not an array, wrap it in an array
       const dataToSend =

@@ -2,8 +2,8 @@
 
 import { useState } from 'react'
 import NextImage, { type ImageProps as NextImageProps } from 'next/image'
+import { Lightbox } from '@/components/ui/lightbox'
 import { cn } from '@/lib/utils'
-import { Lightbox } from './lightbox'
 
 interface ImageProps extends Omit<NextImageProps, 'className'> {
   className?: string
@@ -19,25 +19,35 @@ export function Image({
 }: ImageProps) {
   const [isLightboxOpen, setIsLightboxOpen] = useState(false)
 
-  const handleImageClick = () => {
-    if (enableLightbox) {
-      setIsLightboxOpen(true)
-    }
-  }
+  const openLightbox = () => setIsLightboxOpen(true)
+
+  const image = (
+    <NextImage
+      className={cn(
+        'overflow-hidden rounded-xl border border-border object-cover',
+        enableLightbox && 'cursor-pointer transition-opacity group-hover:opacity-95',
+        className
+      )}
+      alt={alt}
+      src={src}
+      {...props}
+    />
+  )
 
   return (
     <>
-      <NextImage
-        className={cn(
-          'overflow-hidden rounded-xl border border-border object-cover shadow-sm',
-          enableLightbox && 'cursor-pointer transition-opacity hover:opacity-90',
-          className
-        )}
-        alt={alt}
-        src={src}
-        onClick={handleImageClick}
-        {...props}
-      />
+      {enableLightbox ? (
+        <button
+          type='button'
+          onClick={openLightbox}
+          aria-label={`Open ${alt} in media viewer`}
+          className='group contents'
+        >
+          {image}
+        </button>
+      ) : (
+        image
+      )}
 
       {enableLightbox && (
         <Lightbox

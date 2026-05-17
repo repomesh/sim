@@ -1,3 +1,102 @@
+// All available file metadata fields from Google Drive API v3
+export const ALL_FILE_FIELDS = [
+  // Basic Info
+  'id',
+  'name',
+  'mimeType',
+  'kind',
+  'description',
+  'originalFilename',
+  'fullFileExtension',
+  'fileExtension',
+  // Ownership & Sharing
+  'owners',
+  'permissions',
+  'permissionIds',
+  'shared',
+  'ownedByMe',
+  'writersCanShare',
+  'viewersCanCopyContent',
+  'copyRequiresWriterPermission',
+  'sharingUser',
+  // Labels/Tags
+  'starred',
+  'trashed',
+  'explicitlyTrashed',
+  'properties',
+  'appProperties',
+  'folderColorRgb',
+  // Timestamps
+  'createdTime',
+  'modifiedTime',
+  'modifiedByMeTime',
+  'viewedByMeTime',
+  'sharedWithMeTime',
+  'trashedTime',
+  // User Info
+  'lastModifyingUser',
+  'trashingUser',
+  'viewedByMe',
+  'modifiedByMe',
+  // Links
+  'webViewLink',
+  'webContentLink',
+  'iconLink',
+  'thumbnailLink',
+  'exportLinks',
+  // Size & Storage
+  'size',
+  'quotaBytesUsed',
+  // Checksums
+  'md5Checksum',
+  'sha1Checksum',
+  'sha256Checksum',
+  // Hierarchy & Location
+  'parents',
+  'spaces',
+  'driveId',
+  'teamDriveId',
+  // Capabilities
+  'capabilities',
+  // Versions
+  'version',
+  'headRevisionId',
+  // Media Metadata
+  'hasThumbnail',
+  'thumbnailVersion',
+  'imageMediaMetadata',
+  'videoMediaMetadata',
+  'contentHints',
+  // Other
+  'isAppAuthorized',
+  'contentRestrictions',
+  'resourceKey',
+  'shortcutDetails',
+  'linkShareMetadata',
+  'labelInfo',
+  'hasAugmentedPermissions',
+  'inheritedPermissionsDisabled',
+  'downloadRestrictions',
+].join(',')
+
+// All revision fields from Google Drive API v3
+export const ALL_REVISION_FIELDS = [
+  'id',
+  'mimeType',
+  'modifiedTime',
+  'keepForever',
+  'published',
+  'publishAuto',
+  'publishedLink',
+  'publishedOutsideDomain',
+  'lastModifyingUser',
+  'originalFilename',
+  'md5Checksum',
+  'size',
+  'exportLinks',
+  'kind',
+].join(',')
+
 export const GOOGLE_WORKSPACE_MIME_TYPES = [
   'application/vnd.google-apps.document', // Google Docs
   'application/vnd.google-apps.spreadsheet', // Google Sheets
@@ -12,8 +111,50 @@ export const DEFAULT_EXPORT_FORMATS: Record<string, string> = {
   'application/vnd.google-apps.spreadsheet': 'text/csv',
   'application/vnd.google-apps.presentation': 'text/plain',
   'application/vnd.google-apps.drawing': 'image/png',
-  'application/vnd.google-apps.form': 'application/pdf',
-  'application/vnd.google-apps.script': 'application/json',
+  'application/vnd.google-apps.form': 'application/zip',
+  'application/vnd.google-apps.script': 'application/vnd.google-apps.script+json',
+}
+
+/**
+ * Valid export formats per Google Workspace file type.
+ * See: https://developers.google.com/drive/api/guides/ref-export-formats
+ */
+export const VALID_EXPORT_FORMATS: Record<string, string[]> = {
+  'application/vnd.google-apps.document': [
+    'text/plain',
+    'text/html',
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.oasis.opendocument.text',
+    'application/rtf',
+    'application/epub+zip',
+    'text/markdown',
+  ],
+  'application/vnd.google-apps.spreadsheet': [
+    'text/csv',
+    'text/tab-separated-values',
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.oasis.opendocument.spreadsheet',
+    'application/zip',
+  ],
+  'application/vnd.google-apps.presentation': [
+    'text/plain',
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.oasis.opendocument.presentation',
+    'image/jpeg',
+    'image/png',
+    'image/svg+xml',
+  ],
+  'application/vnd.google-apps.drawing': [
+    'application/pdf',
+    'image/jpeg',
+    'image/png',
+    'image/svg+xml',
+  ],
+  'application/vnd.google-apps.form': ['application/zip'],
+  'application/vnd.google-apps.script': ['application/vnd.google-apps.script+json'],
 }
 
 export const SOURCE_MIME_TYPES: Record<string, string> = {

@@ -1,6 +1,6 @@
 import { GoogleIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
-import { AuthMode } from '@/blocks/types'
+import { AuthMode, IntegrationType } from '@/blocks/types'
 import type { GoogleSearchResponse } from '@/tools/google/types'
 
 export const GoogleSearchBlock: BlockConfig<GoogleSearchResponse> = {
@@ -11,6 +11,8 @@ export const GoogleSearchBlock: BlockConfig<GoogleSearchResponse> = {
   longDescription: 'Integrate Google Search into the workflow. Can search the web.',
   docsLink: 'https://docs.sim.ai/tools/google_search',
   category: 'tools',
+  integrationType: IntegrationType.Search,
+  tags: ['google-workspace', 'web-scraping', 'seo'],
   bgColor: '#E0E0E0',
   icon: GoogleIcon,
 
@@ -19,15 +21,32 @@ export const GoogleSearchBlock: BlockConfig<GoogleSearchResponse> = {
       id: 'query',
       title: 'Search Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter your search query',
       required: true,
+      wandConfig: {
+        enabled: true,
+        prompt: `Generate a Google search query based on the user's description.
+Create an effective search query that will find relevant results.
+Use search operators when appropriate:
+- "exact phrase" for exact matches
+- site:domain.com to search within a site
+- -word to exclude terms
+- OR for alternatives
+- filetype:pdf for specific file types
+
+Examples:
+- "latest AI news" -> latest artificial intelligence news 2024
+- "python tutorials on youtube" -> site:youtube.com python tutorial
+- "PDF reports about climate change" -> climate change report filetype:pdf
+
+Return ONLY the search query - no explanations, no quotes around the whole thing, no extra text.`,
+        placeholder: 'Describe what you want to search for...',
+      },
     },
     {
       id: 'searchEngineId',
       title: 'Custom Search Engine ID',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter your Custom Search Engine ID',
       required: true,
     },
@@ -35,7 +54,6 @@ export const GoogleSearchBlock: BlockConfig<GoogleSearchResponse> = {
       id: 'apiKey',
       title: 'API Key',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter your Google API key',
       password: true,
       required: true,
@@ -44,7 +62,6 @@ export const GoogleSearchBlock: BlockConfig<GoogleSearchResponse> = {
       id: 'num',
       title: 'Number of Results',
       type: 'short-input',
-      layout: 'half',
       placeholder: '10',
       required: true,
     },

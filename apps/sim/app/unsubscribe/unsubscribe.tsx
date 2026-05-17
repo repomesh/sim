@@ -1,24 +1,16 @@
 'use client'
 
 import { Suspense, useEffect, useState } from 'react'
-import { CheckCircle, Heart, Info, Loader2, XCircle } from 'lucide-react'
+import { getErrorMessage } from '@sim/utils/errors'
 import { useSearchParams } from 'next/navigation'
-import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui'
-import { useBrandConfig } from '@/lib/branding/branding'
+import { Loader } from '@/components/emcn'
+import { requestJson } from '@/lib/api/client/request'
+import type { ContractJsonResponse } from '@/lib/api/contracts'
+import { unsubscribeGetContract, unsubscribePostContract } from '@/lib/api/contracts/user'
+import { AUTH_SUBMIT_BTN } from '@/app/(auth)/components/auth-button-classes'
+import { InviteLayout } from '@/app/invite/components'
 
-interface UnsubscribeData {
-  success: boolean
-  email: string
-  token: string
-  emailType: string
-  isTransactional: boolean
-  currentPreferences: {
-    unsubscribeAll?: boolean
-    unsubscribeMarketing?: boolean
-    unsubscribeUpdates?: boolean
-    unsubscribeNotifications?: boolean
-  }
-}
+type UnsubscribeData = ContractJsonResponse<typeof unsubscribeGetContract>
 
 function UnsubscribeContent() {
   const searchParams = useSearchParams()
@@ -27,7 +19,6 @@ function UnsubscribeContent() {
   const [error, setError] = useState<string | null>(null)
   const [processing, setProcessing] = useState(false)
   const [unsubscribed, setUnsubscribed] = useState(false)
-  const brand = useBrandConfig()
 
   const email = searchParams.get('email')
   const token = searchParams.get('token')
@@ -39,20 +30,13 @@ function UnsubscribeContent() {
       return
     }
 
-    // Validate the unsubscribe link
-    fetch(
-      `/api/users/me/settings/unsubscribe?email=${encodeURIComponent(email)}&token=${encodeURIComponent(token)}`
-    )
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success) {
-          setData(data)
-        } else {
-          setError(data.error || 'Invalid unsubscribe link')
-        }
+    requestJson(unsubscribeGetContract, { query: { email, token } })
+      .then((response) => {
+        setData(response)
       })
-      .catch(() => {
-        setError('Failed to validate unsubscribe link')
+      .catch((err: unknown) => {
+        const message = getErrorMessage(err, 'Failed to validate unsubscribe link')
+        setError(message)
       })
       .finally(() => {
         setLoading(false)
@@ -65,55 +49,40 @@ function UnsubscribeContent() {
     setProcessing(true)
 
     try {
-      const response = await fetch('/api/users/me/settings/unsubscribe', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          email,
-          token,
-          type,
-        }),
+      await requestJson(unsubscribePostContract, {
+        body: { email, token, type },
       })
 
-      const result = await response.json()
-
-      if (result.success) {
-        setUnsubscribed(true)
-        // Update the data to reflect the change
-        if (data) {
-          // Type-safe property construction with validation
-          const validTypes = ['all', 'marketing', 'updates', 'notifications'] as const
-          if (validTypes.includes(type)) {
-            if (type === 'all') {
-              setData({
-                ...data,
-                currentPreferences: {
-                  ...data.currentPreferences,
-                  unsubscribeAll: true,
-                },
-              })
-            } else {
-              const propertyKey = `unsubscribe${type.charAt(0).toUpperCase()}${type.slice(1)}` as
-                | 'unsubscribeMarketing'
-                | 'unsubscribeUpdates'
-                | 'unsubscribeNotifications'
-              setData({
-                ...data,
-                currentPreferences: {
-                  ...data.currentPreferences,
-                  [propertyKey]: true,
-                },
-              })
-            }
+      setUnsubscribed(true)
+      if (data) {
+        const validTypes = ['all', 'marketing', 'updates', 'notifications'] as const
+        if (validTypes.includes(type)) {
+          if (type === 'all') {
+            setData({
+              ...data,
+              currentPreferences: {
+                ...data.currentPreferences,
+                unsubscribeAll: true,
+              },
+            })
+          } else {
+            const propertyKey = `unsubscribe${type.charAt(0).toUpperCase()}${type.slice(1)}` as
+              | 'unsubscribeMarketing'
+              | 'unsubscribeUpdates'
+              | 'unsubscribeNotifications'
+            setData({
+              ...data,
+              currentPreferences: {
+                ...data.currentPreferences,
+                [propertyKey]: true,
+              },
+            })
           }
         }
-      } else {
-        setError(result.error || 'Failed to unsubscribe')
       }
-    } catch (error) {
-      setError('Failed to process unsubscribe request')
+    } catch (err: unknown) {
+      const message = getErrorMessage(err, 'Failed to process unsubscribe request')
+      setError(message)
     } finally {
       setProcessing(false)
     }
@@ -121,273 +90,173 @@ function UnsubscribeContent() {
 
   if (loading) {
     return (
-      <div className='flex min-h-screen items-center justify-center bg-background'>
-        <Card className='w-full max-w-md border shadow-sm'>
-          <CardContent className='flex items-center justify-center p-8'>
-            <Loader2 className='h-8 w-8 animate-spin text-muted-foreground' />
-          </CardContent>
-        </Card>
-      </div>
+      <InviteLayout>
+        <div className='space-y-1 text-center'>
+          <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+            Loading
+          </h1>
+          <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>
+            Validating your unsubscribe link…
+          </p>
+        </div>
+        <div className={'mt-8 flex w-full items-center justify-center py-8'}>
+          <Loader className='size-8 text-[var(--landing-text-muted)]' animate />
+        </div>
+      </InviteLayout>
     )
   }
 
   if (error) {
     return (
-      <div className='flex min-h-screen items-center justify-center bg-background p-4'>
-        <Card className='w-full max-w-md border shadow-sm'>
-          <CardHeader className='text-center'>
-            <XCircle className='mx-auto mb-2 h-12 w-12 text-red-500' />
-            <CardTitle className='text-foreground'>Invalid Unsubscribe Link</CardTitle>
-            <CardDescription className='text-muted-foreground'>
-              This unsubscribe link is invalid or has expired
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='space-y-4'>
-            <div className='rounded-lg border bg-red-50 p-4'>
-              <p className='text-red-800 text-sm'>
-                <strong>Error:</strong> {error}
-              </p>
-            </div>
+      <InviteLayout>
+        <div className='space-y-1 text-center'>
+          <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+            Invalid Unsubscribe Link
+          </h1>
+          <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>{error}</p>
+        </div>
 
-            <div className='space-y-3'>
-              <p className='text-muted-foreground text-sm'>This could happen if:</p>
-              <ul className='ml-4 list-inside list-disc space-y-1 text-muted-foreground text-sm'>
-                <li>The link is missing required parameters</li>
-                <li>The link has expired or been used already</li>
-                <li>The link was copied incorrectly</li>
-              </ul>
-            </div>
-
-            <div className='mt-6 flex flex-col gap-3'>
-              <Button
-                onClick={() =>
-                  window.open(
-                    `mailto:${brand.supportEmail}?subject=Unsubscribe%20Help&body=Hi%2C%20I%20need%20help%20unsubscribing%20from%20emails.%20My%20unsubscribe%20link%20is%20not%20working.`,
-                    '_blank'
-                  )
-                }
-                className='w-full bg-[var(--brand-primary-hex)] font-medium text-white shadow-sm transition-colors duration-200 hover:bg-[var(--brand-primary-hover-hex)]'
-              >
-                Contact Support
-              </Button>
-              <Button onClick={() => window.history.back()} variant='outline' className='w-full'>
-                Go Back
-              </Button>
-            </div>
-
-            <div className='mt-4 text-center'>
-              <p className='text-muted-foreground text-xs'>
-                Need immediate help? Email us at{' '}
-                <a
-                  href={`mailto:${brand.supportEmail}`}
-                  className='text-muted-foreground hover:underline'
-                >
-                  {brand.supportEmail}
-                </a>
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+        <div className={'mt-8 w-full max-w-[410px] space-y-3'}>
+          <button onClick={() => window.history.back()} className={AUTH_SUBMIT_BTN}>
+            Go Back
+          </button>
+        </div>
+      </InviteLayout>
     )
   }
 
-  // Handle transactional emails
   if (data?.isTransactional) {
     return (
-      <div className='flex min-h-screen items-center justify-center bg-background p-4'>
-        <Card className='w-full max-w-md border shadow-sm'>
-          <CardHeader className='text-center'>
-            <Info className='mx-auto mb-2 h-12 w-12 text-blue-500' />
-            <CardTitle className='text-foreground'>Important Account Emails</CardTitle>
-            <CardDescription className='text-muted-foreground'>
-              This email contains important information about your account
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='space-y-4'>
-            <div className='rounded-lg border bg-blue-50 p-4'>
-              <p className='text-blue-800 text-sm'>
-                <strong>Transactional emails</strong> like password resets, account confirmations,
-                and security alerts cannot be unsubscribed from as they contain essential
-                information for your account security and functionality.
-              </p>
-            </div>
+      <InviteLayout>
+        <div className='space-y-1 text-center'>
+          <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+            Important Account Emails
+          </h1>
+          <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>
+            Transactional emails like password resets, account confirmations, and security alerts
+            cannot be unsubscribed from as they contain essential information for your account.
+          </p>
+        </div>
 
-            <div className='space-y-3'>
-              <p className='text-foreground text-sm'>
-                If you no longer wish to receive these emails, you can:
-              </p>
-              <ul className='ml-4 list-inside list-disc space-y-1 text-muted-foreground text-sm'>
-                <li>Close your account entirely</li>
-                <li>Contact our support team for assistance</li>
-              </ul>
-            </div>
-
-            <div className='mt-6 flex flex-col gap-3'>
-              <Button
-                onClick={() =>
-                  window.open(
-                    `mailto:${brand.supportEmail}?subject=Account%20Help&body=Hi%2C%20I%20need%20help%20with%20my%20account%20emails.`,
-                    '_blank'
-                  )
-                }
-                className='w-full bg-blue-600 text-white hover:bg-blue-700'
-              >
-                Contact Support
-              </Button>
-              <Button onClick={() => window.close()} variant='outline' className='w-full'>
-                Close
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+        <div className={'mt-8 w-full max-w-[410px] space-y-3'}>
+          <button onClick={() => window.close()} className={AUTH_SUBMIT_BTN}>
+            Close
+          </button>
+        </div>
+      </InviteLayout>
     )
   }
 
   if (unsubscribed) {
     return (
-      <div className='flex min-h-screen items-center justify-center bg-background'>
-        <Card className='w-full max-w-md border shadow-sm'>
-          <CardHeader className='text-center'>
-            <CheckCircle className='mx-auto mb-2 h-12 w-12 text-green-500' />
-            <CardTitle className='text-foreground'>Successfully Unsubscribed</CardTitle>
-            <CardDescription className='text-muted-foreground'>
-              You have been unsubscribed from our emails. You will stop receiving emails within 48
-              hours.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className='text-center'>
-            <p className='text-muted-foreground text-sm'>
-              If you change your mind, you can always update your email preferences in your account
-              settings or contact us at{' '}
-              <a
-                href={`mailto:${brand.supportEmail}`}
-                className='text-muted-foreground hover:underline'
-              >
-                {brand.supportEmail}
-              </a>
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+      <InviteLayout>
+        <div className='space-y-1 text-center'>
+          <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+            Successfully Unsubscribed
+          </h1>
+          <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>
+            You have been unsubscribed from our emails. You will stop receiving emails within 48
+            hours.
+          </p>
+        </div>
+
+        <div className={'mt-8 w-full max-w-[410px] space-y-3'}>
+          <button onClick={() => window.close()} className={AUTH_SUBMIT_BTN}>
+            Close
+          </button>
+        </div>
+      </InviteLayout>
     )
   }
 
+  const isAlreadyUnsubscribedFromAll = data?.currentPreferences.unsubscribeAll
+
   return (
-    <div className='flex min-h-screen items-center justify-center bg-background p-4'>
-      <Card className='w-full max-w-md border shadow-sm'>
-        <CardHeader className='text-center'>
-          <Heart className='mx-auto mb-2 h-12 w-12 text-red-500' />
-          <CardTitle className='text-foreground'>We&apos;re sorry to see you go!</CardTitle>
-          <CardDescription className='text-muted-foreground'>
-            We understand email preferences are personal. Choose which emails you&apos;d like to
-            stop receiving from Sim.
-          </CardDescription>
-          <div className='mt-2 rounded-lg border bg-muted/50 p-3'>
-            <p className='text-muted-foreground text-xs'>
-              Email: <span className='font-medium text-foreground'>{data?.email}</span>
-            </p>
-          </div>
-        </CardHeader>
-        <CardContent className='space-y-4'>
-          <div className='space-y-3'>
-            <Button
-              onClick={() => handleUnsubscribe('all')}
-              disabled={processing || data?.currentPreferences.unsubscribeAll}
-              variant='destructive'
-              className='w-full'
-            >
-              {processing ? (
-                <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-              ) : data?.currentPreferences.unsubscribeAll ? (
-                <CheckCircle className='mr-2 h-4 w-4' />
-              ) : null}
-              {data?.currentPreferences.unsubscribeAll
-                ? 'Unsubscribed from All Emails'
-                : 'Unsubscribe from All Marketing Emails'}
-            </Button>
+    <InviteLayout>
+      <div className='space-y-1 text-center'>
+        <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+          Email Preferences
+        </h1>
+        <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>
+          Choose which emails you'd like to stop receiving.
+        </p>
+        <p className={'mt-2 font-[380] text-[var(--landing-text-muted)] text-sm'}>{data?.email}</p>
+      </div>
 
-            <div className='text-center text-muted-foreground text-sm'>
-              or choose specific types:
-            </div>
+      <div className={'mt-8 w-full max-w-[410px] space-y-3'}>
+        <button
+          onClick={() => handleUnsubscribe('all')}
+          disabled={processing || isAlreadyUnsubscribedFromAll}
+          className={AUTH_SUBMIT_BTN}
+        >
+          {processing ? (
+            <span className='flex items-center gap-2'>
+              <Loader className='size-4' animate />
+              Unsubscribing…
+            </span>
+          ) : isAlreadyUnsubscribedFromAll ? (
+            'Unsubscribed from All Emails'
+          ) : (
+            'Unsubscribe from All Marketing Emails'
+          )}
+        </button>
 
-            <Button
-              onClick={() => handleUnsubscribe('marketing')}
-              disabled={
-                processing ||
-                data?.currentPreferences.unsubscribeAll ||
-                data?.currentPreferences.unsubscribeMarketing
-              }
-              variant='outline'
-              className='w-full'
-            >
-              {data?.currentPreferences.unsubscribeMarketing ? (
-                <CheckCircle className='mr-2 h-4 w-4' />
-              ) : null}
-              {data?.currentPreferences.unsubscribeMarketing
-                ? 'Unsubscribed from Marketing'
-                : 'Unsubscribe from Marketing Emails'}
-            </Button>
+        <div className='py-2 text-center'>
+          <span className={'font-[380] text-[var(--landing-text-muted)] text-sm'}>
+            or choose specific types
+          </span>
+        </div>
 
-            <Button
-              onClick={() => handleUnsubscribe('updates')}
-              disabled={
-                processing ||
-                data?.currentPreferences.unsubscribeAll ||
-                data?.currentPreferences.unsubscribeUpdates
-              }
-              variant='outline'
-              className='w-full'
-            >
-              {data?.currentPreferences.unsubscribeUpdates ? (
-                <CheckCircle className='mr-2 h-4 w-4' />
-              ) : null}
-              {data?.currentPreferences.unsubscribeUpdates
-                ? 'Unsubscribed from Updates'
-                : 'Unsubscribe from Product Updates'}
-            </Button>
+        <button
+          onClick={() => handleUnsubscribe('marketing')}
+          disabled={
+            processing ||
+            isAlreadyUnsubscribedFromAll ||
+            data?.currentPreferences.unsubscribeMarketing
+          }
+          className={AUTH_SUBMIT_BTN}
+        >
+          {data?.currentPreferences.unsubscribeMarketing
+            ? 'Unsubscribed from Marketing'
+            : 'Unsubscribe from Marketing Emails'}
+        </button>
 
-            <Button
-              onClick={() => handleUnsubscribe('notifications')}
-              disabled={
-                processing ||
-                data?.currentPreferences.unsubscribeAll ||
-                data?.currentPreferences.unsubscribeNotifications
-              }
-              variant='outline'
-              className='w-full'
-            >
-              {data?.currentPreferences.unsubscribeNotifications ? (
-                <CheckCircle className='mr-2 h-4 w-4' />
-              ) : null}
-              {data?.currentPreferences.unsubscribeNotifications
-                ? 'Unsubscribed from Notifications'
-                : 'Unsubscribe from Notifications'}
-            </Button>
-          </div>
+        <button
+          onClick={() => handleUnsubscribe('updates')}
+          disabled={
+            processing ||
+            isAlreadyUnsubscribedFromAll ||
+            data?.currentPreferences.unsubscribeUpdates
+          }
+          className={AUTH_SUBMIT_BTN}
+        >
+          {data?.currentPreferences.unsubscribeUpdates
+            ? 'Unsubscribed from Updates'
+            : 'Unsubscribe from Product Updates'}
+        </button>
 
-          <div className='mt-6 space-y-3'>
-            <div className='rounded-lg border bg-muted/50 p-3'>
-              <p className='text-center text-muted-foreground text-xs'>
-                <strong>Note:</strong> You&apos;ll continue receiving important account emails like
-                password resets and security alerts.
-              </p>
-            </div>
+        <button
+          onClick={() => handleUnsubscribe('notifications')}
+          disabled={
+            processing ||
+            isAlreadyUnsubscribedFromAll ||
+            data?.currentPreferences.unsubscribeNotifications
+          }
+          className={AUTH_SUBMIT_BTN}
+        >
+          {data?.currentPreferences.unsubscribeNotifications
+            ? 'Unsubscribed from Notifications'
+            : 'Unsubscribe from Notifications'}
+        </button>
+      </div>
 
-            <p className='text-center text-muted-foreground text-xs'>
-              Questions? Contact us at{' '}
-              <a
-                href={`mailto:${brand.supportEmail}`}
-                className='text-muted-foreground hover:underline'
-              >
-                {brand.supportEmail}
-              </a>
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+      <div className={'mt-6 max-w-[410px] text-center'}>
+        <p className='font-[380] text-[var(--landing-text-muted)] text-small'>
+          You'll continue receiving important account emails like password resets and security
+          alerts.
+        </p>
+      </div>
+    </InviteLayout>
   )
 }
 
@@ -395,13 +264,19 @@ export default function Unsubscribe() {
   return (
     <Suspense
       fallback={
-        <div className='flex min-h-screen items-center justify-center bg-background'>
-          <Card className='w-full max-w-md border shadow-sm'>
-            <CardContent className='flex items-center justify-center p-8'>
-              <Loader2 className='h-8 w-8 animate-spin text-muted-foreground' />
-            </CardContent>
-          </Card>
-        </div>
+        <InviteLayout>
+          <div className='space-y-1 text-center'>
+            <h1 className={'font-medium text-[32px] text-[var(--landing-text)] tracking-tight'}>
+              Loading
+            </h1>
+            <p className={'font-[380] text-[var(--landing-text-muted)] text-md'}>
+              Validating your unsubscribe link…
+            </p>
+          </div>
+          <div className={'mt-8 flex w-full items-center justify-center py-8'}>
+            <Loader className='size-8 text-[var(--landing-text-muted)]' animate />
+          </div>
+        </InviteLayout>
       }
     >
       <UnsubscribeContent />

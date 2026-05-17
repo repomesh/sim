@@ -1,9 +1,10 @@
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
 import type {
   SharepointGetListResponse,
   SharepointList,
   SharepointToolParams,
 } from '@/tools/sharepoint/types'
+import { assertGraphNextPageUrl, getGraphNextPageUrl, optionalTrim } from '@/tools/sharepoint/utils'
 import type { ToolConfig } from '@/tools/types'
 
 const logger = createLogger('SharePointGetList')
@@ -12,12 +13,11 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
   id: 'sharepoint_get_list',
   name: 'Get SharePoint List',
   description: 'Get metadata (and optionally columns/items) for a SharePoint list',
-  version: '1.0',
+  version: '1.0.0',
 
   oauth: {
     required: true,
     provider: 'sharepoint',
-    additionalScopes: ['openid', 'profile', 'email', 'Sites.Read.All', 'offline_access'],
   },
 
   params: {
@@ -42,29 +42,53 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
     listId: {
       type: 'string',
       required: false,
+      visibility: 'user-or-llm',
+      description:
+        'The ID of the list to retrieve. Example: b!abc123def456 or a GUID like 12345678-1234-1234-1234-123456789012',
+    },
+    includeColumns: {
+      type: 'boolean',
+      required: false,
       visibility: 'user-only',
-      description: 'The ID of the list to retrieve',
+      description: 'Whether to include column definitions when retrieving a specific list',
+    },
+    includeItems: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-only',
+      description: 'Whether to include list items when retrieving a specific list',
+    },
+    nextPageUrl: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Full @odata.nextLink URL from a previous Microsoft Graph page response',
     },
   },
 
   request: {
     url: (params) => {
-      const siteId = params.siteId || params.siteSelector || 'root'
+      if (params.nextPageUrl) {
+        return assertGraphNextPageUrl(params.nextPageUrl)
+      }
 
-      // If neither listId nor listTitle provided, list all lists in the site
-      if (!params.listId) {
+      const siteId = optionalTrim(params.siteId) || optionalTrim(params.siteSelector) || 'root'
+      const listId = optionalTrim(params.listId)
+
+      if (!listId) {
         const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists`
         const url = new URL(baseUrl)
         const finalUrl = url.toString()
-        logger.info('SharePoint List All Lists URL', { finalUrl, siteId })
+        logger.info('SharePoint List All Lists URL', {
+          finalUrl,
+          siteId,
+        })
         return finalUrl
       }
 
-      const listSegment = params.listId
-      // Default to returning items when targeting a specific list unless explicitly disabled
+      const listSegment = encodeURIComponent(listId)
       const wantsItems = typeof params.includeItems === 'boolean' ? params.includeItems : true
 
-      // If caller wants items for a specific list, prefer the items endpoint (no columns)
       if (wantsItems && !params.includeColumns) {
         const itemsUrl = new URL(
           `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listSegment}/items`
@@ -74,12 +98,11 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
         logger.info('SharePoint Get List Items URL', {
           finalUrl: finalItemsUrl,
           siteId,
-          listId: params.listId,
+          listId,
         })
         return finalItemsUrl
       }
 
-      // Otherwise, fetch list metadata (optionally with columns/items via $expand)
       const baseUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listSegment}`
       const url = new URL(baseUrl)
       const expandParts: string[] = []
@@ -91,7 +114,7 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
       logger.info('SharePoint Get List URL', {
         finalUrl,
         siteId,
-        listId: params.listId,
+        listId,
         includeColumns: !!params.includeColumns,
         includeItems: wantsItems,
       })
@@ -104,7 +127,7 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
     }),
   },
 
-  transformResponse: async (response: Response) => {
+  transformResponse: async (response: Response, params) => {
     const data = await response.json()
 
     // If the response is a collection of items (from the items endpoint)
@@ -119,25 +142,18 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
         fields: i.fields as Record<string, unknown>,
       }))
 
-      const nextLink: string | undefined = (data as any)['@odata.nextLink']
-      const nextPageToken = nextLink
-        ? (() => {
-            try {
-              const u = new URL(nextLink)
-              return u.searchParams.get('$skiptoken') || u.searchParams.get('$skip') || undefined
-            } catch {
-              return undefined
-            }
-          })()
-        : undefined
+      const nextPageUrl = getGraphNextPageUrl(data as Record<string, unknown>)
 
       return {
         success: true,
-        output: { list: { items } as SharepointList, nextPageToken },
+        output: {
+          list: { id: optionalTrim(params?.listId) || '', items } as SharepointList,
+          items,
+          nextPageUrl,
+        },
       }
     }
 
-    // If this is a collection of lists (site-level)
     if (Array.isArray((data as any).value)) {
       const lists: SharepointList[] = (data as any).value.map((l: any) => ({
         id: l.id,
@@ -149,25 +165,14 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
         list: l.list,
       }))
 
-      const nextLink: string | undefined = (data as any)['@odata.nextLink']
-      const nextPageToken = nextLink
-        ? (() => {
-            try {
-              const u = new URL(nextLink)
-              return u.searchParams.get('$skiptoken') || u.searchParams.get('$skip') || undefined
-            } catch {
-              return undefined
-            }
-          })()
-        : undefined
+      const nextPageUrl = getGraphNextPageUrl(data as Record<string, unknown>)
 
       return {
         success: true,
-        output: { lists, nextPageToken },
+        output: { lists, nextPageUrl },
       }
     }
 
-    // Single list response (with optional expands)
     const list: SharepointList = {
       id: data.id,
       displayName: data.displayName ?? data.name,
@@ -238,6 +243,22 @@ export const getListTool: ToolConfig<SharepointToolParams, SharepointGetListResp
       type: 'array',
       description: 'All lists in the site when no listId/title provided',
       items: { type: 'object' },
+    },
+    items: {
+      type: 'array',
+      description: 'List items with expanded fields when reading list items',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Item ID' },
+          fields: { type: 'object', description: 'Field values for the item' },
+        },
+      },
+    },
+    nextPageUrl: {
+      type: 'string',
+      description: 'Full Microsoft Graph @odata.nextLink URL for the next page of results',
+      optional: true,
     },
   },
 }

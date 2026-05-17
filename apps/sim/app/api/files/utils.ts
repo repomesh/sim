@@ -1,8 +1,6 @@
-import { existsSync } from 'fs'
-import { join, resolve, sep } from 'path'
+import { createLogger } from '@sim/logger'
 import { NextResponse } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
-import { UPLOAD_DIR } from '@/lib/uploads/setup'
+import { sanitizeFileKey } from '@/lib/uploads/utils/file-utils'
 
 const logger = createLogger('FilesUtils')
 
@@ -11,7 +9,7 @@ export interface ApiSuccessResponse {
   [key: string]: any
 }
 
-export interface ApiErrorResponse {
+interface ApiErrorResponse {
   error: string
   message?: string
 }
@@ -20,6 +18,7 @@ export interface FileResponse {
   buffer: Buffer
   contentType: string
   filename: string
+  cacheControl?: string
 }
 
 export class FileNotFoundError extends Error {
@@ -37,7 +36,6 @@ export class InvalidRequestError extends Error {
 }
 
 export const contentTypeMap: Record<string, string> = {
-  // Text formats
   txt: 'text/plain',
   csv: 'text/csv',
   json: 'application/json',
@@ -47,26 +45,22 @@ export const contentTypeMap: Record<string, string> = {
   css: 'text/css',
   js: 'application/javascript',
   ts: 'application/typescript',
-  // Document formats
   pdf: 'application/pdf',
   googleDoc: 'application/vnd.google-apps.document',
   doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  // Spreadsheet formats
   xls: 'application/vnd.ms-excel',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   googleSheet: 'application/vnd.google-apps.spreadsheet',
-  // Presentation formats
   ppt: 'application/vnd.ms-powerpoint',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  // Image formats
   png: 'image/png',
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
   gif: 'image/gif',
-  // Archive formats
+  svg: 'image/svg+xml',
+  webp: 'image/webp',
   zip: 'application/zip',
-  // Folder format
   googleFolder: 'application/vnd.google-apps.folder',
 }
 
@@ -82,40 +76,13 @@ export const binaryExtensions = [
   'jpg',
   'jpeg',
   'gif',
+  'webp',
   'pdf',
 ]
 
 export function getContentType(filename: string): string {
   const extension = filename.split('.').pop()?.toLowerCase() || ''
   return contentTypeMap[extension] || 'application/octet-stream'
-}
-
-export function isS3Path(path: string): boolean {
-  return path.includes('/api/files/serve/s3/')
-}
-
-export function isBlobPath(path: string): boolean {
-  return path.includes('/api/files/serve/blob/')
-}
-
-export function isCloudPath(path: string): boolean {
-  return isS3Path(path) || isBlobPath(path)
-}
-
-export function extractStorageKey(path: string, storageType: 's3' | 'blob'): string {
-  const prefix = `/api/files/serve/${storageType}/`
-  if (path.includes(prefix)) {
-    return decodeURIComponent(path.split(prefix)[1])
-  }
-  return path
-}
-
-export function extractS3Key(path: string): string {
-  return extractStorageKey(path, 's3')
-}
-
-export function extractBlobKey(path: string): string {
-  return extractStorageKey(path, 'blob')
 }
 
 export function extractFilename(path: string): string {
@@ -153,55 +120,29 @@ export function extractFilename(path: string): string {
   return filename
 }
 
-function sanitizeFilename(filename: string): string {
-  if (!filename || typeof filename !== 'string') {
-    throw new Error('Invalid filename provided')
-  }
-
-  const sanitized = filename.replace(/\.\./g, '').replace(/[/\\]/g, '').replace(/^\./g, '').trim()
-
-  if (!sanitized || sanitized.length === 0) {
-    throw new Error('Invalid or empty filename after sanitization')
-  }
-
-  if (
-    sanitized.includes(':') ||
-    sanitized.includes('|') ||
-    sanitized.includes('?') ||
-    sanitized.includes('*') ||
-    sanitized.includes('\x00') ||
-    /[\x00-\x1F\x7F]/.test(sanitized)
-  ) {
-    throw new Error('Filename contains invalid characters')
-  }
-
-  return sanitized
-}
-
-export function findLocalFile(filename: string): string | null {
+export async function findLocalFile(filename: string): Promise<string | null> {
   try {
-    const sanitizedFilename = sanitizeFilename(filename)
+    const sanitizedFilename = sanitizeFileKey(filename)
 
-    const possiblePaths = [
-      join(UPLOAD_DIR, sanitizedFilename),
-      join(process.cwd(), 'uploads', sanitizedFilename),
-    ]
+    if (!sanitizedFilename || !sanitizedFilename.trim() || /^[/\\.\s]+$/.test(sanitizedFilename)) {
+      return null
+    }
 
-    for (const path of possiblePaths) {
-      const resolvedPath = resolve(path)
-      const allowedDirs = [resolve(UPLOAD_DIR), resolve(process.cwd(), 'uploads')]
+    const { existsSync } = await import('fs')
+    const path = await import('path')
+    const { UPLOAD_DIR_SERVER } = await import('@/lib/uploads/core/setup.server')
 
-      const isWithinAllowedDir = allowedDirs.some(
-        (allowedDir) => resolvedPath.startsWith(allowedDir + sep) || resolvedPath === allowedDir
-      )
+    const resolvedPath = path.join(UPLOAD_DIR_SERVER, sanitizedFilename)
 
-      if (!isWithinAllowedDir) {
-        continue
-      }
+    if (
+      !resolvedPath.startsWith(UPLOAD_DIR_SERVER + path.sep) ||
+      resolvedPath === UPLOAD_DIR_SERVER
+    ) {
+      return null
+    }
 
-      if (existsSync(resolvedPath)) {
-        return resolvedPath
-      }
+    if (existsSync(resolvedPath)) {
+      return resolvedPath
     }
 
     return null
@@ -216,13 +157,15 @@ const SAFE_INLINE_TYPES = new Set([
   'image/jpeg',
   'image/jpg',
   'image/gif',
+  'image/svg+xml',
+  'image/webp',
   'application/pdf',
   'text/plain',
   'text/csv',
   'application/json',
 ])
 
-const FORCE_ATTACHMENT_EXTENSIONS = new Set(['html', 'htm', 'svg', 'js', 'css', 'xml'])
+const FORCE_ATTACHMENT_EXTENSIONS = new Set(['html', 'htm', 'js', 'css', 'xml'])
 
 function getSecureFileHeaders(filename: string, originalContentType: string) {
   const extension = filename.split('.').pop()?.toLowerCase() || ''
@@ -236,7 +179,7 @@ function getSecureFileHeaders(filename: string, originalContentType: string) {
 
   let safeContentType = originalContentType
 
-  if (originalContentType === 'text/html' || originalContentType === 'image/svg+xml') {
+  if (originalContentType === 'text/html') {
     safeContentType = 'text/plain'
   }
 
@@ -248,7 +191,9 @@ function getSecureFileHeaders(filename: string, originalContentType: string) {
   }
 }
 
-function encodeFilenameForHeader(filename: string): string {
+function encodeFilenameForHeader(storageKey: string): string {
+  const filename = storageKey.split('/').pop() || storageKey
+
   const hasNonAscii = /[^\x00-\x7F]/.test(filename)
 
   if (!hasNonAscii) {
@@ -263,16 +208,18 @@ function encodeFilenameForHeader(filename: string): string {
 export function createFileResponse(file: FileResponse): NextResponse {
   const { contentType, disposition } = getSecureFileHeaders(file.filename, file.contentType)
 
-  return new NextResponse(file.buffer as BodyInit, {
-    status: 200,
-    headers: {
-      'Content-Type': contentType,
-      'Content-Disposition': `${disposition}; ${encodeFilenameForHeader(file.filename)}`,
-      'Cache-Control': 'public, max-age=31536000',
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox;",
-    },
-  })
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Content-Disposition': `${disposition}; ${encodeFilenameForHeader(file.filename)}`,
+    'Cache-Control': file.cacheControl || 'public, max-age=31536000',
+    'X-Content-Type-Options': 'nosniff',
+  }
+
+  if (contentType === 'image/svg+xml') {
+    headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; sandbox;"
+  }
+
+  return new NextResponse(file.buffer as BodyInit, { status: 200, headers })
 }
 
 export function createErrorResponse(error: Error, status = 500): NextResponse {

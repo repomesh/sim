@@ -3,63 +3,55 @@
  *
  * @vitest-environment node
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockRequest } from '@/app/api/__test-utils__/utils'
+import {
+  authMockFns,
+  createMockRequest,
+  dbChainMock,
+  dbChainMockFns,
+  resetDbChainMock,
+} from '@sim/testing'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { mockParseProvider, mockJwtDecode, mockEq } = vi.hoisted(() => ({
+  mockParseProvider: vi.fn(),
+  mockJwtDecode: vi.fn(),
+  mockEq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
+}))
+
+vi.mock('@sim/db', () => ({
+  ...dbChainMock,
+  account: { userId: 'userId', providerId: 'providerId' },
+  user: { email: 'email', id: 'id' },
+  eq: mockEq,
+}))
+
+vi.mock('drizzle-orm', () => ({
+  eq: mockEq,
+}))
+
+vi.mock('jwt-decode', () => ({
+  jwtDecode: mockJwtDecode,
+}))
+
+vi.mock('@/lib/oauth/utils', () => ({
+  parseProvider: mockParseProvider,
+}))
+
+import { GET } from '@/app/api/auth/oauth/connections/route'
 
 describe('OAuth Connections API Route', () => {
-  const mockGetSession = vi.fn()
-  const mockDb = {
-    select: vi.fn().mockReturnThis(),
-    from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    limit: vi.fn(),
-  }
-  const mockLogger = {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }
-
-  const mockUUID = 'mock-uuid-12345678-90ab-cdef-1234-567890abcdef'
-
   beforeEach(() => {
-    vi.resetModules()
-
-    vi.stubGlobal('crypto', {
-      randomUUID: vi.fn().mockReturnValue(mockUUID),
-    })
-
-    vi.doMock('@/lib/auth', () => ({
-      getSession: mockGetSession,
-    }))
-
-    vi.doMock('@sim/db', () => ({
-      db: mockDb,
-      account: { userId: 'userId', providerId: 'providerId' },
-      user: { email: 'email', id: 'id' },
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-    }))
-
-    vi.doMock('drizzle-orm', () => ({
-      eq: vi.fn((field, value) => ({ field, value, type: 'eq' })),
-    }))
-
-    vi.doMock('jwt-decode', () => ({
-      jwtDecode: vi.fn(),
-    }))
-
-    vi.doMock('@/lib/logs/console/logger', () => ({
-      createLogger: vi.fn().mockReturnValue(mockLogger),
-    }))
-  })
-
-  afterEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
+
+    mockParseProvider.mockImplementation((providerId: string) => ({
+      baseProvider: providerId.split('-')[0] || providerId,
+      featureType: providerId.split('-')[1] || 'default',
+    }))
   })
 
   it('should return connections successfully', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
@@ -84,17 +76,10 @@ describe('OAuth Connections API Route', () => {
 
     const mockUserRecord = [{ email: 'user@example.com' }]
 
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockResolvedValueOnce(mockAccounts)
-
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockReturnValueOnce(mockDb)
-    mockDb.limit.mockResolvedValueOnce(mockUserRecord)
+    dbChainMockFns.where.mockResolvedValueOnce(mockAccounts)
+    dbChainMockFns.limit.mockResolvedValueOnce(mockUserRecord)
 
     const req = createMockRequest('GET')
-    const { GET } = await import('@/app/api/auth/oauth/connections/route')
 
     const response = await GET(req)
     const data = await response.json()
@@ -116,35 +101,26 @@ describe('OAuth Connections API Route', () => {
   })
 
   it('should handle unauthenticated user', async () => {
-    mockGetSession.mockResolvedValueOnce(null)
+    authMockFns.mockGetSession.mockResolvedValueOnce(null)
 
     const req = createMockRequest('GET')
-    const { GET } = await import('@/app/api/auth/oauth/connections/route')
 
     const response = await GET(req)
     const data = await response.json()
 
     expect(response.status).toBe(401)
     expect(data.error).toBe('User not authenticated')
-    expect(mockLogger.warn).toHaveBeenCalled()
   })
 
   it('should handle user with no connections', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockResolvedValueOnce([])
-
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockReturnValueOnce(mockDb)
-    mockDb.limit.mockResolvedValueOnce([])
+    dbChainMockFns.where.mockResolvedValueOnce([])
+    dbChainMockFns.limit.mockResolvedValueOnce([])
 
     const req = createMockRequest('GET')
-    const { GET } = await import('@/app/api/auth/oauth/connections/route')
 
     const response = await GET(req)
     const data = await response.json()
@@ -154,30 +130,23 @@ describe('OAuth Connections API Route', () => {
   })
 
   it('should handle database error', async () => {
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockRejectedValueOnce(new Error('Database error'))
+    dbChainMockFns.where.mockRejectedValueOnce(new Error('Database error'))
 
     const req = createMockRequest('GET')
-    const { GET } = await import('@/app/api/auth/oauth/connections/route')
 
     const response = await GET(req)
     const data = await response.json()
 
     expect(response.status).toBe(500)
     expect(data.error).toBe('Internal server error')
-    expect(mockLogger.error).toHaveBeenCalled()
   })
 
   it('should decode ID token for display name', async () => {
-    const { jwtDecode } = await import('jwt-decode')
-    const mockJwtDecode = jwtDecode as any
-
-    mockGetSession.mockResolvedValueOnce({
+    authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
     })
 
@@ -197,17 +166,10 @@ describe('OAuth Connections API Route', () => {
       name: 'Decoded User',
     })
 
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockResolvedValueOnce(mockAccounts)
-
-    mockDb.select.mockReturnValueOnce(mockDb)
-    mockDb.from.mockReturnValueOnce(mockDb)
-    mockDb.where.mockReturnValueOnce(mockDb)
-    mockDb.limit.mockResolvedValueOnce([])
+    dbChainMockFns.where.mockResolvedValueOnce(mockAccounts)
+    dbChainMockFns.limit.mockResolvedValueOnce([])
 
     const req = createMockRequest('GET')
-    const { GET } = await import('@/app/api/auth/oauth/connections/route')
 
     const response = await GET(req)
     const data = await response.json()

@@ -1,5 +1,6 @@
 import { ArxivIcon } from '@/components/icons'
 import type { BlockConfig } from '@/blocks/types'
+import { IntegrationType } from '@/blocks/types'
 import type { ArxivResponse } from '@/tools/arxiv/types'
 
 export const ArxivBlock: BlockConfig<ArxivResponse> = {
@@ -10,6 +11,8 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
     'Integrates ArXiv into the workflow. Can search for papers, get paper details, and get author papers. Does not require OAuth or an API key.',
   docsLink: 'https://docs.sim.ai/tools/arxiv',
   category: 'tools',
+  integrationType: IntegrationType.Search,
+  tags: ['document-processing', 'knowledge-base'],
   bgColor: '#E0E0E0',
   icon: ArxivIcon,
   subBlocks: [
@@ -17,7 +20,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'operation',
       title: 'Operation',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Search Papers', id: 'arxiv_search' },
         { label: 'Get Paper Details', id: 'arxiv_get_paper' },
@@ -30,7 +32,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'searchQuery',
       title: 'Search Query',
       type: 'long-input',
-      layout: 'full',
       placeholder: 'Enter search terms (e.g., "machine learning", "quantum physics")...',
       condition: { field: 'operation', value: 'arxiv_search' },
       required: true,
@@ -39,7 +40,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'searchField',
       title: 'Search Field',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'All Fields', id: 'all' },
         { label: 'Title', id: 'ti' },
@@ -57,7 +57,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'maxResults',
       title: 'Max Results',
       type: 'short-input',
-      layout: 'full',
       placeholder: '10',
       condition: { field: 'operation', value: 'arxiv_search' },
     },
@@ -65,7 +64,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'sortBy',
       title: 'Sort By',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Relevance', id: 'relevance' },
         { label: 'Last Updated Date', id: 'lastUpdatedDate' },
@@ -78,7 +76,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'sortOrder',
       title: 'Sort Order',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Descending', id: 'descending' },
         { label: 'Ascending', id: 'ascending' },
@@ -91,7 +88,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'paperId',
       title: 'Paper ID',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter ArXiv paper ID (e.g., 1706.03762, cs.AI/0001001)',
       condition: { field: 'operation', value: 'arxiv_get_paper' },
       required: true,
@@ -101,7 +97,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'authorName',
       title: 'Author Name',
       type: 'short-input',
-      layout: 'full',
       placeholder: 'Enter author name (e.g., "John Smith")...',
       condition: { field: 'operation', value: 'arxiv_get_author_papers' },
       required: true,
@@ -110,7 +105,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
       id: 'maxResults',
       title: 'Max Results',
       type: 'short-input',
-      layout: 'full',
       placeholder: '10',
       condition: { field: 'operation', value: 'arxiv_get_author_papers' },
     },
@@ -119,11 +113,6 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
     access: ['arxiv_search', 'arxiv_get_paper', 'arxiv_get_author_papers'],
     config: {
       tool: (params) => {
-        // Convert maxResults to a number for operations that use it
-        if (params.maxResults) {
-          params.maxResults = Number(params.maxResults)
-        }
-
         switch (params.operation) {
           case 'arxiv_search':
             return 'arxiv_search'
@@ -134,6 +123,11 @@ export const ArxivBlock: BlockConfig<ArxivResponse> = {
           default:
             return 'arxiv_search'
         }
+      },
+      params: (params) => {
+        const result: Record<string, unknown> = {}
+        if (params.maxResults) result.maxResults = Number(params.maxResults)
+        return result
       },
     },
   },

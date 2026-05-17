@@ -8,34 +8,6 @@ import { BlockInfoCard } from "@/components/ui/block-info-card"
 <BlockInfoCard 
   type="google_forms"
   color="#E0E0E0"
-  icon={true}
-  iconSvg={`<svg className="block-icon"  xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 65' fill='none'>
-      <path
-        d='M29.583 0H4.438C1.997 0 0 1.997 0 4.438v56.208C0 63.086 1.997 65.083 4.438 65.083h38.458c2.44 0 4.437-1.997 4.437-4.437V17.75L36.979 10.354 29.583 0Z'
-        fill='#673AB7'
-      />
-      <path
-        d='M29.583 0v10.354c0 2.45 1.986 4.438 4.438 4.438h13.312L36.979 10.354 29.583 0Z'
-        fill='#B39DDB'
-      />
-      <path
-        d='M19.229 50.292h16.271v-2.959H19.229v2.959Zm0-17.75v2.958h16.271v-2.958H19.229Zm-3.698 1.479c0 1.224-0.995 2.219-2.219 2.219s-2.219-0.995-2.219-2.219c0-1.224 0.995-2.219 2.219-2.219s2.219 0.995 2.219 2.219Zm0 7.396c0 1.224-0.995 2.219-2.219 2.219s-2.219-0.995-2.219-2.219c0-1.224 0.995-2.219 2.219-2.219s2.219 0.995 2.219 2.219Zm0 7.396c0 1.224-0.995 2.219-2.219 2.219s-2.219-0.995-2.219-2.219c0-1.224 0.995-2.219 2.219-2.219s2.219 0.995 2.219 2.219Zm3.698-5.917h16.271v-2.959H19.229v2.959Z'
-        fill='#F1F1F1'
-      />
-      <defs>
-        <linearGradient
-          id='gf-gradient'
-          x1='30.881'
-          y1='16.452'
-          x2='47.333'
-          y2='32.9'
-          gradientUnits='userSpaceOnUse'
-        >
-          <stop stopColor='#9575CD' />
-          <stop offset='1' stopColor='#7E57C2' />
-        </linearGradient>
-      </defs>
-    </svg>`}
 />
 
 {/* MANUAL-CONTENT-START:intro */}
@@ -80,3 +52,193 @@ Intégrez Google Forms dans votre flux de travail. Fournissez un ID de formulair
 
 - Catégorie : `tools`
 - Type : `google_forms`
+
+Récupérer la structure d'un formulaire incluant ses éléments, paramètres et métadonnées
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ------------ | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms à récupérer |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `formId` | string | L'ID du formulaire |
+| `title` | string | Le titre du formulaire visible par les répondants |
+| `description` | string | La description du formulaire |
+| `documentTitle` | string | Le titre du document visible dans Drive |
+| `responderUri` | string | L'URI à partager avec les répondants |
+| `linkedSheetId` | string | L'ID de la feuille Google Sheets liée |
+| `revisionId` | string | L'ID de révision du formulaire |
+| `items` | array | Les éléments du formulaire (questions, sections, etc.) |
+|   ↳ `itemId` | string | ID de l'élément |
+|   ↳ `title` | string | Titre de l'élément |
+|   ↳ `description` | string | Description de l'élément |
+| `settings` | json | Paramètres du formulaire |
+| `publishSettings` | json | Paramètres de publication du formulaire |
+
+### `google_forms_create_form`
+
+Créer un nouveau formulaire Google avec un titre
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ------------ | ----------- |
+| `title` | string | Oui | Le titre du formulaire visible par les répondants |
+| `documentTitle` | string | Non | Le titre du document visible dans Drive (par défaut le titre du formulaire) |
+| `unpublished` | boolean | Non | Si vrai, créer un formulaire non publié qui n'accepte pas de réponses |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `formId` | string | L'ID du formulaire créé |
+| `title` | string | Le titre du formulaire |
+| `documentTitle` | string | Le titre du document dans Drive |
+| `responderUri` | string | L'URI à partager avec les répondants |
+| `revisionId` | string | L'ID de révision du formulaire |
+
+### `google_forms_batch_update`
+
+Appliquer plusieurs mises à jour à un formulaire (ajouter des éléments, mettre à jour les informations, modifier les paramètres, etc.)
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms |
+| `requests` | json | Oui | Tableau de requêtes de mise à jour (updateFormInfo, updateSettings, createItem, updateItem, moveItem, deleteItem) |
+| `includeFormInResponse` | boolean | Non | Indique s'il faut retourner le formulaire mis à jour dans la réponse |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `replies` | array | Les réponses de chaque requête de mise à jour |
+| `writeControl` | object | Informations de contrôle d'écriture avec les ID de révision |
+|   ↳ `requiredRevisionId` | string | ID de révision requis pour la détection de conflits |
+|   ↳ `targetRevisionId` | string | ID de révision cible |
+| `form` | object | Le formulaire mis à jour (si includeFormInResponse était true) |
+|   ↳ `formId` | string | L'ID du formulaire |
+|   ↳ `info` | object | Informations du formulaire contenant le titre et la description |
+|     ↳ `title` | string | Le titre du formulaire visible par les répondants |
+|     ↳ `description` | string | La description du formulaire |
+|     ↳ `documentTitle` | string | Le titre du document visible dans Drive |
+|   ↳ `settings` | object | Paramètres du formulaire |
+|     ↳ `quizSettings` | object | Paramètres du quiz |
+|       ↳ `isQuiz` | boolean | Indique si le formulaire est un quiz |
+|     ↳ `emailCollectionType` | string | Type de collecte d'e-mail |
+|   ↳ `revisionId` | string | L'ID de révision du formulaire |
+|   ↳ `responderUri` | string | L'URI à partager avec les répondants |
+|   ↳ `linkedSheetId` | string | L'ID de la feuille Google liée |
+|   ↳ `publishSettings` | object | Paramètres de publication du formulaire |
+|     ↳ `publishState` | object | État de publication actuel |
+|       ↳ `isPublished` | boolean | Indique si le formulaire est publié |
+|       ↳ `isAcceptingResponses` | boolean | Indique si le formulaire accepte des réponses |
+
+### `google_forms_set_publish_settings`
+
+Mettre à jour les paramètres de publication d'un formulaire (publier/dépublier, accepter les réponses)
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms |
+| `isPublished` | boolean | Oui | Indique si le formulaire est publié et visible par les autres |
+| `isAcceptingResponses` | boolean | Non | Indique si le formulaire accepte les réponses \(forcé à false si isPublished est false\) |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `formId` | string | L'ID du formulaire |
+| `publishSettings` | json | Les paramètres de publication mis à jour |
+|   ↳ `publishState` | object | L'état de publication |
+|     ↳ `isPublished` | boolean | Indique si le formulaire est publié |
+|     ↳ `isAcceptingResponses` | boolean | Indique si le formulaire accepte les réponses |
+
+### `google_forms_create_watch`
+
+Créer une surveillance de notification pour les modifications du formulaire (modifications du schéma ou nouvelles réponses)
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms à surveiller |
+| `eventType` | string | Oui | Type d'événement à surveiller : SCHEMA \(modifications du formulaire\) ou RESPONSES \(nouvelles soumissions\) |
+| `topicName` | string | Oui | Le nom du sujet Cloud Pub/Sub \(format : projects/\{project\}/topics/\{topic\}\) |
+| `watchId` | string | Non | ID de surveillance personnalisé \(4-63 caractères, lettres minuscules, chiffres, traits d'union\) |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `id` | string | L'ID de la surveillance |
+| `eventType` | string | Le type d'événement surveillé |
+| `topicName` | string | Le sujet Cloud Pub/Sub |
+| `createTime` | string | Date de création de la surveillance |
+| `expireTime` | string | Date d'expiration de la surveillance (7 jours après la création) |
+| `state` | string | L'état de la surveillance (ACTIVE, SUSPENDED) |
+
+### `google_forms_list_watches`
+
+Lister toutes les surveillances de notification pour un formulaire
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `watches` | array | Liste des surveillances pour le formulaire |
+|   ↳ `id` | string | ID de la surveillance |
+|   ↳ `eventType` | string | Type d'événement (SCHEMA ou RESPONSES) |
+|   ↳ `createTime` | string | Date de création de la surveillance |
+|   ↳ `expireTime` | string | Date d'expiration de la surveillance |
+|   ↳ `state` | string | État de la surveillance |
+
+### `google_forms_delete_watch`
+
+Supprimer une surveillance de notification d'un formulaire
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms |
+| `watchId` | string | Oui | ID de la surveillance à supprimer |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `deleted` | boolean | Indique si la surveillance a été supprimée avec succès |
+
+### `google_forms_renew_watch`
+
+Renouveler une surveillance de notification pour 7 jours supplémentaires
+
+#### Entrée
+
+| Paramètre | Type | Obligatoire | Description |
+| --------- | ---- | ----------- | ----------- |
+| `formId` | string | Oui | ID du formulaire Google Forms |
+| `watchId` | string | Oui | ID de la surveillance à renouveler |
+
+#### Sortie
+
+| Paramètre | Type | Description |
+| --------- | ---- | ----------- |
+| `id` | string | L'ID de la surveillance |
+| `eventType` | string | Le type d'événement surveillé |
+| `expireTime` | string | La nouvelle date d'expiration |
+| `state` | string | L'état de la surveillance |

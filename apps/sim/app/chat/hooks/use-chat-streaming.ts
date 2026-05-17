@@ -1,13 +1,54 @@
 'use client'
 
 import { useRef, useState } from 'react'
-import { createLogger } from '@/lib/logs/console/logger'
-import type { ChatMessage } from '@/app/chat/components/message/message'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
+import { isUserFileWithMetadata } from '@/lib/core/utils/user-file'
+import type { ChatFile, ChatMessage } from '@/app/chat/components/message/message'
 import { CHAT_ERROR_MESSAGES } from '@/app/chat/constants'
 
 const logger = createLogger('UseChatStreaming')
 
-export interface VoiceSettings {
+function extractFilesFromData(
+  data: any,
+  files: ChatFile[] = [],
+  seenIds = new Set<string>()
+): ChatFile[] {
+  if (!data || typeof data !== 'object') {
+    return files
+  }
+
+  if (isUserFileWithMetadata(data)) {
+    if (!seenIds.has(data.id)) {
+      seenIds.add(data.id)
+      files.push({
+        id: data.id,
+        name: data.name,
+        url: data.url,
+        key: data.key,
+        size: data.size,
+        type: data.type,
+        context: data.context,
+      })
+    }
+    return files
+  }
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      extractFilesFromData(item, files, seenIds)
+    }
+    return files
+  }
+
+  for (const value of Object.values(data)) {
+    extractFilesFromData(value, files, seenIds)
+  }
+
+  return files
+}
+
+interface VoiceSettings {
   isVoiceEnabled: boolean
   voiceId: string
   autoPlayResponses: boolean
@@ -21,6 +62,7 @@ export interface StreamingOptions {
   onAudioStart?: () => void
   onAudioEnd?: () => void
   audioStreamHandler?: (text: string) => Promise<void>
+  outputConfigs?: Array<{ blockId: string; path?: string }>
 }
 
 export function useChatStreaming() {
@@ -37,18 +79,15 @@ export function useChatStreaming() {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
 
-      // Add a message indicating the response was stopped
+      const latestContent = accumulatedTextRef.current
+
       setMessages((prev) => {
         const lastMessage = prev[prev.length - 1]
 
-        // Only modify if the last message is from the assistant (as expected)
         if (lastMessage && lastMessage.type === 'assistant') {
-          // Append a note that the response was stopped
+          const content = latestContent || lastMessage.content
           const updatedContent =
-            lastMessage.content +
-            (lastMessage.content
-              ? '\n\n_Response stopped by user._'
-              : '_Response stopped by user._')
+            content + (content ? '\n\n_Response stopped by user._' : '_Response stopped by user._')
 
           return [
             ...prev.slice(0, -1),
@@ -59,7 +98,6 @@ export function useChatStreaming() {
         return prev
       })
 
-      // Reset streaming state immediately
       setIsStreamingResponse(false)
       accumulatedTextRef.current = ''
       lastStreamedPositionRef.current = 0
@@ -76,6 +114,7 @@ export function useChatStreaming() {
     userHasScrolled?: boolean,
     streamingOptions?: StreamingOptions
   ) => {
+    logger.info('[useChatStreaming] handleStreamedResponse called')
     // Set streaming state
     setIsStreamingResponse(true)
     abortControllerRef.current = new AbortController()
@@ -97,9 +136,49 @@ export function useChatStreaming() {
     let accumulatedText = ''
     let lastAudioPosition = 0
 
-    // Track which blocks have streamed content (like chat panel)
     const messageIdMap = new Map<string, string>()
-    const messageId = crypto.randomUUID()
+    const messageId = generateId()
+
+    const UI_BATCH_MAX_MS = 50
+    let uiDirty = false
+    let uiRAF: number | null = null
+    let uiTimer: ReturnType<typeof setTimeout> | null = null
+    let lastUIFlush = 0
+
+    const flushUI = () => {
+      if (uiRAF !== null) {
+        cancelAnimationFrame(uiRAF)
+        uiRAF = null
+      }
+      if (uiTimer !== null) {
+        clearTimeout(uiTimer)
+        uiTimer = null
+      }
+      if (!uiDirty) return
+      uiDirty = false
+      lastUIFlush = performance.now()
+      const snapshot = accumulatedText
+      setMessages((prev) =>
+        prev.map((msg) => {
+          if (msg.id !== messageId) return msg
+          if (!msg.isStreaming) return msg
+          return { ...msg, content: snapshot }
+        })
+      )
+    }
+
+    const scheduleUIFlush = () => {
+      if (uiRAF !== null) return
+      const elapsed = performance.now() - lastUIFlush
+      if (elapsed >= UI_BATCH_MAX_MS) {
+        flushUI()
+        return
+      }
+      uiRAF = requestAnimationFrame(flushUI)
+      if (uiTimer === null) {
+        uiTimer = setTimeout(flushUI, Math.max(0, UI_BATCH_MAX_MS - elapsed))
+      }
+    }
     setMessages((prev) => [
       ...prev,
       {
@@ -123,6 +202,7 @@ export function useChatStreaming() {
         const { done, value } = await reader.read()
 
         if (done) {
+          flushUI()
           // Stream any remaining text for TTS
           if (
             shouldPlayAudio &&
@@ -175,16 +255,147 @@ export function useChatStreaming() {
               }
 
               if (eventType === 'final' && json.data) {
+                flushUI()
+                const finalData = json.data as {
+                  success: boolean
+                  error?: string | { message?: string }
+                  output?: Record<string, Record<string, any>>
+                }
+
+                const outputConfigs = streamingOptions?.outputConfigs
+                const formattedOutputs: string[] = []
+                let extractedFiles: ChatFile[] = []
+
+                const formatValue = (value: any): string | null => {
+                  if (value === null || value === undefined) {
+                    return null
+                  }
+
+                  if (isUserFileWithMetadata(value)) {
+                    return null
+                  }
+
+                  if (Array.isArray(value) && value.length === 0) {
+                    return null
+                  }
+
+                  if (typeof value === 'string') {
+                    return value
+                  }
+
+                  if (typeof value === 'object') {
+                    try {
+                      return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``
+                    } catch {
+                      return String(value)
+                    }
+                  }
+
+                  return String(value)
+                }
+
+                const getOutputValue = (blockOutputs: Record<string, any>, path?: string) => {
+                  if (!path || path === 'content') {
+                    if (blockOutputs.content !== undefined) return blockOutputs.content
+                    if (blockOutputs.result !== undefined) return blockOutputs.result
+                    return blockOutputs
+                  }
+
+                  if (blockOutputs[path] !== undefined) {
+                    return blockOutputs[path]
+                  }
+
+                  if (path.includes('.')) {
+                    return path.split('.').reduce<any>((current, segment) => {
+                      if (current && typeof current === 'object' && segment in current) {
+                        return current[segment]
+                      }
+                      return undefined
+                    }, blockOutputs)
+                  }
+
+                  return undefined
+                }
+
+                if (outputConfigs?.length && finalData.output) {
+                  for (const config of outputConfigs) {
+                    const blockOutputs = finalData.output[config.blockId]
+                    if (!blockOutputs) continue
+
+                    const value = getOutputValue(blockOutputs, config.path)
+
+                    if (isUserFileWithMetadata(value)) {
+                      extractedFiles.push({
+                        id: value.id,
+                        name: value.name,
+                        url: value.url,
+                        key: value.key,
+                        size: value.size,
+                        type: value.type,
+                        context: value.context,
+                      })
+                      continue
+                    }
+
+                    const nestedFiles = extractFilesFromData(value)
+                    if (nestedFiles.length > 0) {
+                      extractedFiles = [...extractedFiles, ...nestedFiles]
+                      continue
+                    }
+
+                    const formatted = formatValue(value)
+                    if (formatted) {
+                      formattedOutputs.push(formatted)
+                    }
+                  }
+                }
+
+                let finalContent = accumulatedText
+
+                if (formattedOutputs.length > 0) {
+                  const nonEmptyOutputs = formattedOutputs.filter((output) => output.trim())
+                  if (nonEmptyOutputs.length > 0) {
+                    const combinedOutputs = nonEmptyOutputs.join('\n\n')
+                    finalContent = finalContent
+                      ? `${finalContent.trim()}\n\n${combinedOutputs}`
+                      : combinedOutputs
+                  }
+                }
+
+                if (!finalContent && extractedFiles.length === 0) {
+                  if (finalData.error) {
+                    if (typeof finalData.error === 'string') {
+                      finalContent = finalData.error
+                    } else if (typeof finalData.error?.message === 'string') {
+                      finalContent = finalData.error.message
+                    }
+                  } else if (finalData.success && finalData.output) {
+                    const fallbackOutput = Object.values(finalData.output)
+                      .map((block) => formatValue(block)?.trim())
+                      .filter(Boolean)[0]
+                    if (fallbackOutput) {
+                      finalContent = fallbackOutput
+                    }
+                  }
+                }
+
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === messageId
                       ? {
                           ...msg,
                           isStreaming: false,
+                          content: finalContent ?? msg.content,
+                          files: extractedFiles.length > 0 ? extractedFiles : undefined,
                         }
                       : msg
                   )
                 )
+
+                accumulatedTextRef.current = ''
+                lastStreamedPositionRef.current = 0
+                lastDisplayedPositionRef.current = 0
+                audioStreamingActiveRef.current = false
 
                 return
               }
@@ -195,11 +406,16 @@ export function useChatStreaming() {
                 }
 
                 accumulatedText += contentChunk
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === messageId ? { ...msg, content: accumulatedText } : msg
-                  )
-                )
+                accumulatedTextRef.current = accumulatedText
+                logger.debug('[useChatStreaming] Received chunk', {
+                  blockId,
+                  chunkLength: contentChunk.length,
+                  totalLength: accumulatedText.length,
+                  messageId,
+                  chunk: contentChunk.substring(0, 20),
+                })
+                uiDirty = true
+                scheduleUIFlush()
 
                 // Real-time TTS for voice mode
                 if (shouldPlayAudio && streamingOptions?.audioStreamHandler) {
@@ -240,10 +456,13 @@ export function useChatStreaming() {
       }
     } catch (error) {
       logger.error('Error processing stream:', error)
+      flushUI()
       setMessages((prev) =>
         prev.map((msg) => (msg.id === messageId ? { ...msg, isStreaming: false } : msg))
       )
     } finally {
+      if (uiRAF !== null) cancelAnimationFrame(uiRAF)
+      if (uiTimer !== null) clearTimeout(uiTimer)
       setIsStreamingResponse(false)
       abortControllerRef.current = null
 

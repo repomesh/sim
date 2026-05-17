@@ -1,4 +1,5 @@
 import type { HunterEmailFinderParams, HunterEmailFinderResponse } from '@/tools/hunter/types'
+import { SOURCES_OUTPUT, VERIFICATION_OUTPUT } from '@/tools/hunter/types'
 import type { ToolConfig } from '@/tools/types'
 
 export const emailFinderTool: ToolConfig<HunterEmailFinderParams, HunterEmailFinderResponse> = {
@@ -13,25 +14,25 @@ export const emailFinderTool: ToolConfig<HunterEmailFinderParams, HunterEmailFin
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Company domain name',
+      description: 'Company domain name (e.g., "stripe.com", "company.io")',
     },
     first_name: {
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: "Person's first name",
+      description: 'Person\'s first name (e.g., "John", "Sarah")',
     },
     last_name: {
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: "Person's last name",
+      description: 'Person\'s last name (e.g., "Smith", "Johnson")',
     },
     company: {
       type: 'string',
       required: false,
       visibility: 'user-or-llm',
-      description: 'Company name',
+      description: 'Company name (e.g., "Stripe", "Acme Inc")',
     },
     apiKey: {
       type: 'string',
@@ -61,35 +62,47 @@ export const emailFinderTool: ToolConfig<HunterEmailFinderParams, HunterEmailFin
 
   transformResponse: async (response: Response) => {
     const data = await response.json()
+    const d = data.data ?? {}
 
     return {
       success: true,
       output: {
-        email: data.data?.email || '',
-        score: data.data?.score || 0,
-        sources: data.data?.sources || [],
-        verification: data.data?.verification || {},
+        first_name: d.first_name ?? '',
+        last_name: d.last_name ?? '',
+        email: d.email ?? '',
+        score: d.score ?? 0,
+        domain: d.domain ?? '',
+        accept_all: d.accept_all ?? false,
+        position: d.position ?? null,
+        twitter: d.twitter ?? null,
+        linkedin_url: d.linkedin_url ?? null,
+        phone_number: d.phone_number ?? null,
+        company: d.company ?? null,
+        sources: d.sources ?? [],
+        verification: d.verification ?? { date: null, status: 'unknown' },
       },
     }
   },
 
   outputs: {
-    email: {
-      type: 'string',
-      description: 'The found email address',
-    },
+    first_name: { type: 'string', description: "Person's first name" },
+    last_name: { type: 'string', description: "Person's last name" },
+    email: { type: 'string', description: 'The found email address' },
     score: {
       type: 'number',
-      description: 'Confidence score for the found email address',
+      description: 'Confidence score (0-100) for the found email address',
     },
-    sources: {
-      type: 'array',
-      description:
-        'Array of sources where the email was found, each containing domain, uri, extracted_on, last_seen_on, and still_on_page',
+    domain: { type: 'string', description: 'Domain that was searched' },
+    accept_all: {
+      type: 'boolean',
+      description: 'Whether the server accepts all email addresses (may cause false positives)',
     },
-    verification: {
-      type: 'object',
-      description: 'Verification information containing date and status',
-    },
+    position: { type: 'string', description: 'Job title/position', optional: true },
+    twitter: { type: 'string', description: 'Twitter handle', optional: true },
+    linkedin_url: { type: 'string', description: 'LinkedIn profile URL', optional: true },
+    phone_number: { type: 'string', description: 'Phone number', optional: true },
+    company: { type: 'string', description: 'Company name', optional: true },
+    sources: SOURCES_OUTPUT,
+    verification: VERIFICATION_OUTPUT,
   },
 }

@@ -1,212 +1,185 @@
 import { db } from '@sim/db'
-import { workflow, workflowFolder } from '@sim/db/schema'
-import { and, eq } from 'drizzle-orm'
+import { workflowFolder } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { assertFolderMutable, FolderLockedError } from '@sim/workflow-authz'
+import { eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { updateFolderContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { captureServerEvent } from '@/lib/posthog/server'
+import { performDeleteFolder, performUpdateFolder } from '@/lib/workflows/orchestration'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('FoldersIDAPI')
 
 // PUT - Update a folder
-export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+export const PUT = withRouteHandler(
+  async (request: NextRequest, context: { params: Promise<{ id: string }> }) => {
+    try {
+      const session = await getSession()
+      if (!session?.user?.id) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
 
-    const { id } = await params
-    const body = await request.json()
-    const { name, color, isExpanded, parentId } = body
+      const parsed = await parseRequest(updateFolderContract, request, context, {
+        validationErrorResponse: (error) => {
+          logger.error('Folder update validation failed:', { errors: error.issues })
+          const errorMessages = error.issues
+            .map((err) => `${err.path.join('.')}: ${err.message}`)
+            .join(', ')
+          return NextResponse.json(
+            { error: `Validation failed: ${errorMessages}` },
+            { status: 400 }
+          )
+        },
+      })
+      if (!parsed.success) return parsed.response
 
-    // Verify the folder exists
-    const existingFolder = await db
-      .select()
-      .from(workflowFolder)
-      .where(eq(workflowFolder.id, id))
-      .then((rows) => rows[0])
+      const { id } = parsed.data.params
+      const { name, color, isExpanded, locked, parentId, sortOrder } = parsed.data.body
 
-    if (!existingFolder) {
-      return NextResponse.json({ error: 'Folder not found' }, { status: 404 })
-    }
+      // Verify the folder exists
+      const existingFolder = await db
+        .select()
+        .from(workflowFolder)
+        .where(eq(workflowFolder.id, id))
+        .then((rows) => rows[0])
 
-    // Check if user has write permissions for the workspace
-    const workspacePermission = await getUserEntityPermissions(
-      session.user.id,
-      'workspace',
-      existingFolder.workspaceId
-    )
+      if (!existingFolder) {
+        return NextResponse.json({ error: 'Folder not found' }, { status: 404 })
+      }
 
-    if (!workspacePermission || workspacePermission === 'read') {
-      return NextResponse.json(
-        { error: 'Write access required to update folders' },
-        { status: 403 }
+      // Check if user has write permissions for the workspace
+      const workspacePermission = await getUserEntityPermissions(
+        session.user.id,
+        'workspace',
+        existingFolder.workspaceId
       )
-    }
 
-    // Prevent setting a folder as its own parent or creating circular references
-    if (parentId && parentId === id) {
-      return NextResponse.json({ error: 'Folder cannot be its own parent' }, { status: 400 })
-    }
-
-    // Check for circular references if parentId is provided
-    if (parentId) {
-      const wouldCreateCycle = await checkForCircularReference(id, parentId)
-      if (wouldCreateCycle) {
+      if (!workspacePermission || workspacePermission === 'read') {
         return NextResponse.json(
-          { error: 'Cannot create circular folder reference' },
-          { status: 400 }
+          { error: 'Write access required to update folders' },
+          { status: 403 }
         )
       }
+
+      if (locked !== undefined && workspacePermission !== 'admin') {
+        return NextResponse.json(
+          { error: 'Admin access required to lock folders' },
+          { status: 403 }
+        )
+      }
+
+      const hasNonLockUpdate = Object.keys(parsed.data.body).some((key) => key !== 'locked')
+      if (hasNonLockUpdate) {
+        await assertFolderMutable(id)
+      }
+      if (parentId !== undefined) {
+        await assertFolderMutable(parentId)
+      }
+
+      const result = await performUpdateFolder({
+        folderId: id,
+        workspaceId: existingFolder.workspaceId,
+        userId: session.user.id,
+        name,
+        color,
+        isExpanded,
+        locked,
+        parentId,
+        sortOrder,
+      })
+
+      if (!result.success || !result.folder) {
+        const status =
+          result.errorCode === 'not_found' ? 404 : result.errorCode === 'validation' ? 400 : 500
+        return NextResponse.json({ error: result.error }, { status })
+      }
+
+      logger.info('Updated folder:', { id, updates: parsed.data.body })
+
+      return NextResponse.json({ folder: result.folder })
+    } catch (error) {
+      if (error instanceof FolderLockedError) {
+        return NextResponse.json({ error: error.message }, { status: error.status })
+      }
+
+      logger.error('Error updating folder:', { error })
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     }
-
-    // Update the folder
-    const updates: any = { updatedAt: new Date() }
-    if (name !== undefined) updates.name = name.trim()
-    if (color !== undefined) updates.color = color
-    if (isExpanded !== undefined) updates.isExpanded = isExpanded
-    if (parentId !== undefined) updates.parentId = parentId || null
-
-    const [updatedFolder] = await db
-      .update(workflowFolder)
-      .set(updates)
-      .where(eq(workflowFolder.id, id))
-      .returning()
-
-    logger.info('Updated folder:', { id, updates })
-
-    return NextResponse.json({ folder: updatedFolder })
-  } catch (error) {
-    logger.error('Error updating folder:', { error })
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+)
 
 // DELETE - Delete a folder and all its contents
-export async function DELETE(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  try {
-    const session = await getSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+export const DELETE = withRouteHandler(
+  async (request: NextRequest, { params }: { params: Promise<{ id: string }> }) => {
+    try {
+      const session = await getSession()
+      if (!session?.user?.id) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
 
-    const { id } = await params
+      const { id } = await params
 
-    // Verify the folder exists
-    const existingFolder = await db
-      .select()
-      .from(workflowFolder)
-      .where(eq(workflowFolder.id, id))
-      .then((rows) => rows[0])
+      // Verify the folder exists
+      const existingFolder = await db
+        .select()
+        .from(workflowFolder)
+        .where(eq(workflowFolder.id, id))
+        .then((rows) => rows[0])
 
-    if (!existingFolder) {
-      return NextResponse.json({ error: 'Folder not found' }, { status: 404 })
-    }
+      if (!existingFolder) {
+        return NextResponse.json({ error: 'Folder not found' }, { status: 404 })
+      }
 
-    // Check if user has admin permissions for the workspace (admin-only for deletions)
-    const workspacePermission = await getUserEntityPermissions(
-      session.user.id,
-      'workspace',
-      existingFolder.workspaceId
-    )
-
-    if (workspacePermission !== 'admin') {
-      return NextResponse.json(
-        { error: 'Admin access required to delete folders' },
-        { status: 403 }
+      const workspacePermission = await getUserEntityPermissions(
+        session.user.id,
+        'workspace',
+        existingFolder.workspaceId
       )
+
+      if (workspacePermission !== 'admin') {
+        return NextResponse.json(
+          { error: 'Admin access required to delete folders' },
+          { status: 403 }
+        )
+      }
+
+      await assertFolderMutable(id)
+
+      const result = await performDeleteFolder({
+        folderId: id,
+        workspaceId: existingFolder.workspaceId,
+        userId: session.user.id,
+        folderName: existingFolder.name,
+      })
+
+      if (!result.success) {
+        const status =
+          result.errorCode === 'not_found' ? 404 : result.errorCode === 'validation' ? 400 : 500
+        return NextResponse.json({ error: result.error }, { status })
+      }
+
+      captureServerEvent(
+        session.user.id,
+        'folder_deleted',
+        { workspace_id: existingFolder.workspaceId },
+        { groups: { workspace: existingFolder.workspaceId } }
+      )
+
+      return NextResponse.json({
+        success: true,
+        deletedItems: result.deletedItems,
+      })
+    } catch (error) {
+      if (error instanceof FolderLockedError) {
+        return NextResponse.json({ error: error.message }, { status: error.status })
+      }
+
+      logger.error('Error deleting folder:', { error })
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     }
-
-    // Recursively delete folder and all its contents
-    const deletionStats = await deleteFolderRecursively(id, existingFolder.workspaceId)
-
-    logger.info('Deleted folder and all contents:', {
-      id,
-      deletionStats,
-    })
-
-    return NextResponse.json({
-      success: true,
-      deletedItems: deletionStats,
-    })
-  } catch (error) {
-    logger.error('Error deleting folder:', { error })
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
-
-// Helper function to recursively delete a folder and all its contents
-async function deleteFolderRecursively(
-  folderId: string,
-  workspaceId: string
-): Promise<{ folders: number; workflows: number }> {
-  const stats = { folders: 0, workflows: 0 }
-
-  // Get all child folders first (workspace-scoped, not user-scoped)
-  const childFolders = await db
-    .select({ id: workflowFolder.id })
-    .from(workflowFolder)
-    .where(and(eq(workflowFolder.parentId, folderId), eq(workflowFolder.workspaceId, workspaceId)))
-
-  // Recursively delete child folders
-  for (const childFolder of childFolders) {
-    const childStats = await deleteFolderRecursively(childFolder.id, workspaceId)
-    stats.folders += childStats.folders
-    stats.workflows += childStats.workflows
-  }
-
-  // Delete all workflows in this folder (workspace-scoped, not user-scoped)
-  // The database cascade will handle deleting related workflow_blocks, workflow_edges, workflow_subflows
-  const workflowsInFolder = await db
-    .select({ id: workflow.id })
-    .from(workflow)
-    .where(and(eq(workflow.folderId, folderId), eq(workflow.workspaceId, workspaceId)))
-
-  if (workflowsInFolder.length > 0) {
-    await db
-      .delete(workflow)
-      .where(and(eq(workflow.folderId, folderId), eq(workflow.workspaceId, workspaceId)))
-
-    stats.workflows += workflowsInFolder.length
-  }
-
-  // Delete this folder
-  await db.delete(workflowFolder).where(eq(workflowFolder.id, folderId))
-
-  stats.folders += 1
-
-  return stats
-}
-
-// Helper function to check for circular references
-async function checkForCircularReference(folderId: string, parentId: string): Promise<boolean> {
-  let currentParentId: string | null = parentId
-  const visited = new Set<string>()
-
-  while (currentParentId) {
-    if (visited.has(currentParentId)) {
-      return true // Circular reference detected
-    }
-
-    if (currentParentId === folderId) {
-      return true // Would create a cycle
-    }
-
-    visited.add(currentParentId)
-
-    // Get the parent of the current parent
-    const parent: { parentId: string | null } | undefined = await db
-      .select({ parentId: workflowFolder.parentId })
-      .from(workflowFolder)
-      .where(eq(workflowFolder.id, currentParentId))
-      .then((rows) => rows[0])
-
-    currentParentId = parent?.parentId || null
-  }
-
-  return false
-}
+)

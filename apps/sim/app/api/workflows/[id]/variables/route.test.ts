@@ -4,46 +4,37 @@
  *
  * @vitest-environment node
  */
-
-import { NextRequest } from 'next/server'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  createMockDatabase,
-  mockAuth,
-  mockCryptoUuid,
-  mockUser,
-  setupCommonApiMocks,
-} from '@/app/api/__test-utils__/utils'
+  auditMock,
+  hybridAuthMockFns,
+  workflowAuthzMockFns,
+  workflowsUtilsMock,
+} from '@sim/testing'
+import { NextRequest } from 'next/server'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { getWorkflowVariablesContract } from '@/lib/api/contracts/workflows'
+
+vi.mock('@sim/audit', () => auditMock)
+
+vi.mock('@/lib/workflows/utils', () => workflowsUtilsMock)
+
+import { GET, POST } from '@/app/api/workflows/[id]/variables/route'
 
 describe('Workflow Variables API Route', () => {
-  let authMocks: ReturnType<typeof mockAuth>
-  let databaseMocks: ReturnType<typeof createMockDatabase>
-  const mockGetWorkflowAccessContext = vi.fn()
-
   beforeEach(() => {
-    vi.resetModules()
-    setupCommonApiMocks()
-    mockCryptoUuid('mock-request-id-12345678')
-    authMocks = mockAuth(mockUser)
-    mockGetWorkflowAccessContext.mockReset()
-
-    vi.doMock('@/lib/workflows/utils', () => ({
-      getWorkflowAccessContext: mockGetWorkflowAccessContext,
-    }))
-  })
-
-  afterEach(() => {
     vi.clearAllMocks()
   })
 
   describe('GET /api/workflows/[id]/variables', () => {
     it('should return 401 when user is not authenticated', async () => {
-      authMocks.setUnauthenticated()
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: false,
+        error: 'Authentication required',
+      })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(401)
@@ -52,13 +43,22 @@ describe('Workflow Variables API Route', () => {
     })
 
     it('should return 404 when workflow does not exist', async () => {
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce(null)
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: false,
+        status: 404,
+        message: 'Workflow not found',
+        workflow: null,
+        workspacePermission: null,
+      })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/nonexistent/variables')
       const params = Promise.resolve({ id: 'nonexistent' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(404)
@@ -66,34 +66,46 @@ describe('Workflow Variables API Route', () => {
       expect(data.error).toBe('Workflow not found')
     })
 
-    it('should allow access when user owns the workflow', async () => {
+    it('should allow access when user has workspace permission', async () => {
       const mockWorkflow = {
         id: 'workflow-123',
         userId: 'user-123',
-        workspaceId: null,
+        workspaceId: 'workspace-456',
         variables: {
           'var-1': { id: 'var-1', name: 'test', type: 'string', value: 'hello' },
         },
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: true,
+        status: 200,
         workflow: mockWorkflow,
-        workspaceOwnerId: null,
-        workspacePermission: null,
-        isOwner: true,
-        isWorkspaceOwner: false,
+        workspacePermission: 'admin',
       })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(200)
       const data = await response.json()
-      expect(data.data).toEqual(mockWorkflow.variables)
+      expect(data.data).toEqual({
+        'var-1': {
+          id: 'var-1',
+          name: 'test',
+          type: 'string',
+          value: 'hello',
+          workflowId: 'workflow-123',
+        },
+      })
+      const parsed = getWorkflowVariablesContract.response.schema.parse(data)
+      expect(parsed.data['var-1'].workflowId).toBe('workflow-123')
     })
 
     it('should allow access when user has workspace permissions', async () => {
@@ -106,24 +118,35 @@ describe('Workflow Variables API Route', () => {
         },
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: true,
+        status: 200,
         workflow: mockWorkflow,
-        workspaceOwnerId: 'workspace-owner',
         workspacePermission: 'read',
-        isOwner: false,
-        isWorkspaceOwner: false,
       })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(200)
       const data = await response.json()
-      expect(data.data).toEqual(mockWorkflow.variables)
+      // GET stamps `workflowId` from the path param on each variable.
+      expect(data.data).toEqual({
+        'var-1': {
+          id: 'var-1',
+          name: 'test',
+          type: 'string',
+          value: 'hello',
+          workflowId: 'workflow-123',
+        },
+      })
     })
 
     it('should deny access when user has no workspace permissions', async () => {
@@ -134,49 +157,54 @@ describe('Workflow Variables API Route', () => {
         variables: {},
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: false,
+        status: 403,
+        message: 'Unauthorized: Access denied to read this workflow',
         workflow: mockWorkflow,
-        workspaceOwnerId: 'workspace-owner',
         workspacePermission: null,
-        isOwner: false,
-        isWorkspaceOwner: false,
       })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
-      expect(response.status).toBe(401)
+      expect(response.status).toBe(403)
       const data = await response.json()
-      expect(data.error).toBe('Unauthorized')
+      expect(data.error).toBe('Unauthorized: Access denied to read this workflow')
     })
 
-    it.concurrent('should include proper cache headers', async () => {
+    it('should include proper cache headers', async () => {
       const mockWorkflow = {
         id: 'workflow-123',
         userId: 'user-123',
-        workspaceId: null,
+        workspaceId: 'workspace-456',
         variables: {
           'var-1': { id: 'var-1', name: 'test', type: 'string', value: 'hello' },
         },
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: true,
+        status: 200,
         workflow: mockWorkflow,
-        workspaceOwnerId: null,
-        workspacePermission: null,
-        isOwner: true,
-        isWorkspaceOwner: false,
+        workspacePermission: 'admin',
       })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(200)
@@ -186,30 +214,35 @@ describe('Workflow Variables API Route', () => {
   })
 
   describe('POST /api/workflows/[id]/variables', () => {
-    it('should allow owner to update variables', async () => {
+    it('should allow user with write permission to update variables', async () => {
       const mockWorkflow = {
         id: 'workflow-123',
         userId: 'user-123',
-        workspaceId: null,
+        workspaceId: 'workspace-456',
         variables: {},
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: true,
+        status: 200,
         workflow: mockWorkflow,
-        workspaceOwnerId: null,
-        workspacePermission: null,
-        isOwner: true,
-        isWorkspaceOwner: false,
+        workspacePermission: 'write',
       })
 
-      databaseMocks = createMockDatabase({
-        update: { results: [{}] },
-      })
-
-      const variables = [
-        { id: 'var-1', workflowId: 'workflow-123', name: 'test', type: 'string', value: 'hello' },
-      ]
+      const variables = {
+        'var-1': {
+          id: 'var-1',
+          workflowId: 'workflow-123',
+          name: 'test',
+          type: 'string',
+          value: 'hello',
+        },
+      }
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables', {
         method: 'POST',
@@ -217,7 +250,6 @@ describe('Workflow Variables API Route', () => {
       })
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { POST } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await POST(req, { params })
 
       expect(response.status).toBe(200)
@@ -233,18 +265,28 @@ describe('Workflow Variables API Route', () => {
         variables: {},
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: false,
+        status: 403,
+        message: 'Unauthorized: Access denied to write this workflow',
         workflow: mockWorkflow,
-        workspaceOwnerId: 'workspace-owner',
         workspacePermission: null,
-        isOwner: false,
-        isWorkspaceOwner: false,
       })
 
-      const variables = [
-        { id: 'var-1', workflowId: 'workflow-123', name: 'test', type: 'string', value: 'hello' },
-      ]
+      const variables = {
+        'var-1': {
+          id: 'var-1',
+          workflowId: 'workflow-123',
+          name: 'test',
+          type: 'string',
+          value: 'hello',
+        },
+      }
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables', {
         method: 'POST',
@@ -252,32 +294,33 @@ describe('Workflow Variables API Route', () => {
       })
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { POST } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await POST(req, { params })
 
-      expect(response.status).toBe(401)
+      expect(response.status).toBe(403)
       const data = await response.json()
-      expect(data.error).toBe('Unauthorized')
+      expect(data.error).toBe('Unauthorized: Access denied to write this workflow')
     })
 
-    it.concurrent('should validate request data schema', async () => {
+    it('should validate request data schema', async () => {
       const mockWorkflow = {
         id: 'workflow-123',
         userId: 'user-123',
-        workspaceId: null,
+        workspaceId: 'workspace-456',
         variables: {},
       }
 
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockResolvedValueOnce({
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValueOnce({
+        allowed: true,
+        status: 200,
         workflow: mockWorkflow,
-        workspaceOwnerId: null,
-        workspacePermission: null,
-        isOwner: true,
-        isWorkspaceOwner: false,
+        workspacePermission: 'write',
       })
 
-      // Invalid data - missing required fields
       const invalidData = { variables: [{ name: 'test' }] }
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables', {
@@ -286,24 +329,28 @@ describe('Workflow Variables API Route', () => {
       })
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { POST } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await POST(req, { params })
 
       expect(response.status).toBe(400)
       const data = await response.json()
-      expect(data.error).toBe('Invalid request data')
+      expect(data.error).toBe('Validation error')
     })
   })
 
   describe('Error handling', () => {
-    it.concurrent('should handle database errors gracefully', async () => {
-      authMocks.setAuthenticated({ id: 'user-123', email: 'test@example.com' })
-      mockGetWorkflowAccessContext.mockRejectedValueOnce(new Error('Database connection failed'))
+    it('should handle database errors gracefully', async () => {
+      hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValueOnce({
+        success: true,
+        userId: 'user-123',
+        authType: 'session',
+      })
+      workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission.mockRejectedValueOnce(
+        new Error('Database connection failed')
+      )
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123/variables')
       const params = Promise.resolve({ id: 'workflow-123' })
 
-      const { GET } = await import('@/app/api/workflows/[id]/variables/route')
       const response = await GET(req, { params })
 
       expect(response.status).toBe(500)

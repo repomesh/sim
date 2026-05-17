@@ -1,74 +1,210 @@
-import { findNeighbour } from 'fumadocs-core/server'
+import type React from 'react'
+import type { Root } from 'fumadocs-core/page-tree'
+import { findNeighbour } from 'fumadocs-core/page-tree'
+import type { ApiPageProps } from 'fumadocs-openapi/ui'
+import { createAPIPage } from 'fumadocs-openapi/ui'
+import { Pre } from 'fumadocs-ui/components/codeblock'
 import defaultMdxComponents from 'fumadocs-ui/mdx'
 import { DocsBody, DocsDescription, DocsPage, DocsTitle } from 'fumadocs-ui/page'
-import { ChevronLeft, ChevronRight } from 'lucide-react'
-import Link from 'next/link'
 import { notFound } from 'next/navigation'
+import { PageFooter } from '@/components/docs-layout/page-footer'
+import { PageNavigationArrows } from '@/components/docs-layout/page-navigation-arrows'
+import { LLMCopyButton } from '@/components/page-actions'
 import { StructuredData } from '@/components/structured-data'
-import { source } from '@/lib/source'
+import { CodeBlock } from '@/components/ui/code-block'
+import { Heading } from '@/components/ui/heading'
+import { ResponseSection } from '@/components/ui/response-section'
+import { i18n } from '@/lib/i18n'
+import { getApiSpecContent, openapi } from '@/lib/openapi'
+import { type PageData, source } from '@/lib/source'
+import { DOCS_BASE_URL } from '@/lib/urls'
 
-export const dynamic = 'force-dynamic'
+const SUPPORTED_LANGUAGES: Set<string> = new Set(i18n.languages)
+const BASE_URL = DOCS_BASE_URL
+
+const OG_LOCALE_MAP: Record<string, string> = {
+  en: 'en_US',
+  es: 'es_ES',
+  fr: 'fr_FR',
+  de: 'de_DE',
+  ja: 'ja_JP',
+  zh: 'zh_CN',
+}
+
+function resolveLangAndSlug(params: { slug?: string[]; lang: string }) {
+  const isValidLang = SUPPORTED_LANGUAGES.has(params.lang)
+  const lang = isValidLang ? params.lang : 'en'
+  const slug = isValidLang ? params.slug : [params.lang, ...(params.slug ?? [])]
+  return { lang, slug }
+}
+
+const APIPage = createAPIPage(openapi, {
+  playground: { enabled: false },
+  content: {
+    renderOperationLayout: async (slots) => {
+      return (
+        <div className='flex @4xl:flex-row flex-col @4xl:items-start gap-x-6 gap-y-4'>
+          <div className='min-w-0 flex-1'>
+            {slots.header}
+            {slots.apiPlayground}
+            {slots.authSchemes && <div className='api-section-divider'>{slots.authSchemes}</div>}
+            {slots.parameters}
+            {slots.body && <div className='api-section-divider'>{slots.body}</div>}
+            <ResponseSection>{slots.responses}</ResponseSection>
+            {slots.callbacks}
+          </div>
+          <div className='@4xl:sticky @4xl:top-[calc(var(--fd-docs-row-1,2rem)+1rem)] @4xl:w-[400px]'>
+            {slots.apiExample}
+          </div>
+        </div>
+      )
+    },
+  },
+})
 
 export default async function Page(props: { params: Promise<{ slug?: string[]; lang: string }> }) {
   const params = await props.params
-  const page = source.getPage(params.slug, params.lang)
+  const { lang, slug } = resolveLangAndSlug(params)
+  const page = source.getPage(slug, lang)
   if (!page) notFound()
 
-  const MDX = page.data.body
-  const baseUrl = 'https://docs.sim.ai'
+  const data = page.data as unknown as PageData & {
+    _openapi?: { method?: string }
+    getAPIPageProps?: () => ApiPageProps
+  }
+  const isOpenAPI = '_openapi' in data && data._openapi != null
+  const isApiReference = slug?.some((s) => s === 'api-reference') ?? false
 
-  const pageTreeRecord = source.pageTree as Record<string, any>
-  const pageTree =
-    pageTreeRecord[params.lang] ?? pageTreeRecord.en ?? Object.values(pageTreeRecord)[0]
-  const neighbours = pageTree ? findNeighbour(pageTree, page.url) : null
+  const pageTreeRecord = source.pageTree as Record<string, Root>
+  const pageTree = pageTreeRecord[lang] ?? pageTreeRecord.en ?? Object.values(pageTreeRecord)[0]
+  const rawNeighbours = pageTree ? findNeighbour(pageTree, page.url) : null
+  const neighbours = isApiReference
+    ? {
+        previous: rawNeighbours?.previous?.url.includes('/api-reference/')
+          ? rawNeighbours.previous
+          : undefined,
+        next: rawNeighbours?.next?.url.includes('/api-reference/') ? rawNeighbours.next : undefined,
+      }
+    : rawNeighbours
 
-  const CustomFooter = () => (
-    <div className='mt-12 flex items-center justify-between border-border border-t py-8'>
-      {neighbours?.previous ? (
-        <Link
-          href={neighbours.previous.url}
-          className='group flex items-center gap-2 text-muted-foreground transition-colors hover:text-foreground'
+  const generateBreadcrumbs = () => {
+    const breadcrumbs: Array<{ name: string; url: string }> = [
+      {
+        name: 'Home',
+        url: BASE_URL,
+      },
+    ]
+
+    const urlParts = page.url.split('/').filter(Boolean)
+    let currentPath = ''
+
+    urlParts.forEach((part, index) => {
+      if (index === 0 && SUPPORTED_LANGUAGES.has(part)) {
+        currentPath = `/${part}`
+        return
+      }
+
+      currentPath += `/${part}`
+
+      const name = part
+        .split('-')
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ')
+
+      if (index === urlParts.length - 1) {
+        breadcrumbs.push({
+          name: data.title,
+          url: `${BASE_URL}${page.url}`,
+        })
+      } else {
+        breadcrumbs.push({
+          name: name,
+          url: `${BASE_URL}${currentPath}`,
+        })
+      }
+    })
+
+    return breadcrumbs
+  }
+
+  const breadcrumbs = generateBreadcrumbs()
+  const footer = <PageFooter previous={neighbours?.previous} next={neighbours?.next} />
+
+  if (isOpenAPI && data.getAPIPageProps) {
+    const apiProps = data.getAPIPageProps()
+    const apiPageContent = getApiSpecContent(
+      data.title,
+      data.description,
+      apiProps.operations ?? []
+    )
+
+    return (
+      <>
+        <StructuredData
+          title={data.title}
+          description={data.description || ''}
+          url={`${BASE_URL}${page.url}`}
+          lang={lang}
+          breadcrumb={breadcrumbs}
+        />
+        <DocsPage
+          toc={data.toc}
+          breadcrumb={{
+            enabled: false,
+          }}
+          tableOfContent={{
+            style: 'clerk',
+            enabled: false,
+          }}
+          tableOfContentPopover={{
+            style: 'clerk',
+            enabled: false,
+          }}
+          footer={{
+            enabled: true,
+            component: footer,
+          }}
         >
-          <ChevronLeft className='group-hover:-translate-x-1 h-4 w-4 transition-transform' />
-          <span className='font-medium'>{neighbours.previous.name}</span>
-        </Link>
-      ) : (
-        <div />
-      )}
+          <div className='api-page-header relative mt-6 sm:mt-0'>
+            <div className='absolute top-1 right-0 flex items-center gap-2'>
+              <div className='hidden sm:flex'>
+                <LLMCopyButton content={apiPageContent} />
+              </div>
+              <PageNavigationArrows previous={neighbours?.previous} next={neighbours?.next} />
+            </div>
+            <DocsTitle className='mb-2'>{data.title}</DocsTitle>
+            <DocsDescription>{data.description}</DocsDescription>
+          </div>
+          <DocsBody>
+            <APIPage {...apiProps} />
+          </DocsBody>
+        </DocsPage>
+      </>
+    )
+  }
 
-      {neighbours?.next ? (
-        <Link
-          href={neighbours.next.url}
-          className='group flex items-center gap-2 text-muted-foreground transition-colors hover:text-foreground'
-        >
-          <span className='font-medium'>{neighbours.next.name}</span>
-          <ChevronRight className='h-4 w-4 transition-transform group-hover:translate-x-1' />
-        </Link>
-      ) : (
-        <div />
-      )}
-    </div>
-  )
+  const MDX = data.body
+  const markdownContent = await data.getText('processed')
 
   return (
     <>
       <StructuredData
-        title={page.data.title}
-        description={page.data.description || ''}
-        url={`${baseUrl}${page.url}`}
-        lang={params.lang}
+        title={data.title}
+        description={data.description || ''}
+        url={`${BASE_URL}${page.url}`}
+        lang={lang}
+        breadcrumb={breadcrumbs}
       />
       <DocsPage
-        toc={page.data.toc}
-        full={page.data.full}
+        toc={data.toc}
+        full={data.full}
+        breadcrumb={{
+          enabled: false,
+        }}
         tableOfContent={{
           style: 'clerk',
           enabled: true,
-          header: <div className='mb-2 font-medium text-sm'>On this page</div>,
           single: false,
-        }}
-        article={{
-          className: 'scroll-smooth max-sm:pb-16',
         }}
         tableOfContentPopover={{
           style: 'clerk',
@@ -76,13 +212,48 @@ export default async function Page(props: { params: Promise<{ slug?: string[]; l
         }}
         footer={{
           enabled: true,
-          component: <CustomFooter />,
+          component: footer,
         }}
       >
-        <DocsTitle>{page.data.title}</DocsTitle>
-        <DocsDescription>{page.data.description}</DocsDescription>
+        <div className='relative mt-6 sm:mt-0'>
+          <div className='absolute top-1 right-0 flex items-center gap-2'>
+            <div className='hidden sm:flex'>
+              <LLMCopyButton content={markdownContent} />
+            </div>
+            <PageNavigationArrows previous={neighbours?.previous} next={neighbours?.next} />
+          </div>
+          <DocsTitle className='mb-2'>{data.title}</DocsTitle>
+          <DocsDescription>{data.description}</DocsDescription>
+        </div>
         <DocsBody>
-          <MDX components={defaultMdxComponents} />
+          <MDX
+            components={{
+              ...defaultMdxComponents,
+              pre: (props: React.HTMLAttributes<HTMLPreElement>) => (
+                <CodeBlock {...props}>
+                  <Pre>{props.children}</Pre>
+                </CodeBlock>
+              ),
+              h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h1' {...props} />
+              ),
+              h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h2' {...props} />
+              ),
+              h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h3' {...props} />
+              ),
+              h4: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h4' {...props} />
+              ),
+              h5: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h5' {...props} />
+              ),
+              h6: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+                <Heading as='h6' {...props} />
+              ),
+            }}
+          />
         </DocsBody>
       </DocsPage>
     </>
@@ -97,64 +268,80 @@ export async function generateMetadata(props: {
   params: Promise<{ slug?: string[]; lang: string }>
 }) {
   const params = await props.params
-  const page = source.getPage(params.slug, params.lang)
+  const { lang, slug } = resolveLangAndSlug(params)
+  const page = source.getPage(slug, lang)
   if (!page) notFound()
 
-  const baseUrl = 'https://docs.sim.ai'
-  const fullUrl = `${baseUrl}${page.url}`
+  const data = page.data as unknown as PageData
+  const fullUrl = `${BASE_URL}${page.url}`
+
+  const ogImageUrl = `${BASE_URL}/api/og?title=${encodeURIComponent(data.title)}`
 
   return {
-    title: page.data.title,
+    title: data.title,
     description:
-      page.data.description || 'Sim visual workflow builder for AI applications documentation',
+      data.description ||
+      'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents.',
     keywords: [
-      'AI workflow builder',
-      'visual workflow editor',
-      'AI automation',
-      'workflow automation',
       'AI agents',
-      'no-code AI',
-      'drag and drop workflows',
-      page.data.title?.toLowerCase().split(' '),
+      'AI workspace',
+      'AI agent builder',
+      'build AI agents',
+      'LLM orchestration',
+      'AI automation',
+      'knowledge base',
+      'AI integrations',
+      data.title?.toLowerCase().split(' '),
     ]
       .flat()
       .filter(Boolean),
     authors: [{ name: 'Sim Team' }],
     category: 'Developer Tools',
     openGraph: {
-      title: page.data.title,
+      title: data.title,
       description:
-        page.data.description || 'Sim visual workflow builder for AI applications documentation',
+        data.description ||
+        'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents.',
       url: fullUrl,
       siteName: 'Sim Documentation',
       type: 'article',
-      locale: params.lang,
-      alternateLocale: ['en', 'fr', 'zh'].filter((lang) => lang !== params.lang),
+      locale: OG_LOCALE_MAP[lang] ?? 'en_US',
+      alternateLocale: i18n.languages.reduce<string[]>((locales, l) => {
+        if (l !== lang) {
+          locales.push(OG_LOCALE_MAP[l] ?? 'en_US')
+        }
+        return locales
+      }, []),
+      images: [
+        {
+          url: ogImageUrl,
+          width: 1200,
+          height: 630,
+          alt: data.title,
+        },
+      ],
     },
     twitter: {
-      card: 'summary',
-      title: page.data.title,
+      card: 'summary_large_image',
+      title: data.title,
       description:
-        page.data.description || 'Sim visual workflow builder for AI applications documentation',
-    },
-    robots: {
-      index: true,
-      follow: true,
-      googleBot: {
-        index: true,
-        follow: true,
-        'max-video-preview': -1,
-        'max-image-preview': 'large',
-        'max-snippet': -1,
-      },
+        data.description ||
+        'Documentation for Sim — the open-source AI workspace where teams build, deploy, and manage AI agents.',
+      images: [ogImageUrl],
+      creator: '@simdotai',
+      site: '@simdotai',
     },
     canonical: fullUrl,
     alternates: {
       canonical: fullUrl,
       languages: {
-        en: `${baseUrl}/en${page.url.replace(`/${params.lang}`, '')}`,
-        fr: `${baseUrl}/fr${page.url.replace(`/${params.lang}`, '')}`,
-        zh: `${baseUrl}/zh${page.url.replace(`/${params.lang}`, '')}`,
+        'x-default': `${BASE_URL}${page.url.replace(`/${lang}`, '')}`,
+        en: `${BASE_URL}${page.url.replace(`/${lang}`, '')}`,
+        es: `${BASE_URL}/es${page.url.replace(`/${lang}`, '')}`,
+        fr: `${BASE_URL}/fr${page.url.replace(`/${lang}`, '')}`,
+        de: `${BASE_URL}/de${page.url.replace(`/${lang}`, '')}`,
+        ja: `${BASE_URL}/ja${page.url.replace(`/${lang}`, '')}`,
+        zh: `${BASE_URL}/zh${page.url.replace(`/${lang}`, '')}`,
       },
     },
   }

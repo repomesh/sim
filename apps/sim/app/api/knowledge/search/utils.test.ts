@@ -4,44 +4,23 @@
  *
  * @vitest-environment node
  */
+import { createEnvMock } from '@sim/testing'
+import { mockNextFetchResponse } from '@sim/testing/mocks'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('drizzle-orm')
-vi.mock('@/lib/logs/console/logger', () => ({
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  })),
-}))
-vi.mock('@sim/db')
 vi.mock('@/lib/knowledge/documents/utils', () => ({
   retryWithExponentialBackoff: (fn: any) => fn(),
 }))
 
-vi.stubGlobal(
-  'fetch',
-  vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => ({
-      data: [{ embedding: [0.1, 0.2, 0.3] }],
-    }),
-  })
-)
-
-vi.mock('@/lib/env', () => ({
-  env: {},
-  isTruthy: (value: string | boolean | number | undefined) =>
-    typeof value === 'string' ? value === 'true' || value === '1' : Boolean(value),
-}))
+vi.mock('@/lib/core/config/env', () => createEnvMock())
 
 import {
   generateSearchEmbedding,
   handleTagAndVectorSearch,
   handleTagOnlySearch,
   handleVectorOnlySearch,
-} from './utils'
+} from '@/app/api/knowledge/search/utils'
 
 describe('Knowledge Search Utils', () => {
   beforeEach(() => {
@@ -53,7 +32,7 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: {},
+        structuredFilters: [],
       }
 
       await expect(handleTagOnlySearch(params)).rejects.toThrow(
@@ -65,14 +44,14 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: { tag1: 'api' },
+        structuredFilters: [{ tagSlot: 'tag1', fieldType: 'text', operator: 'eq', value: 'api' }],
       }
 
       // This test validates the function accepts the right parameters
       // The actual database interaction is tested via route tests
       expect(params.knowledgeBaseIds).toEqual(['kb-123'])
       expect(params.topK).toBe(10)
-      expect(params.filters).toEqual({ tag1: 'api' })
+      expect(params.structuredFilters).toHaveLength(1)
     })
   })
 
@@ -122,7 +101,7 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: {},
+        structuredFilters: [],
         queryVector: JSON.stringify([0.1, 0.2, 0.3]),
         distanceThreshold: 0.8,
       }
@@ -136,7 +115,7 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: { tag1: 'api' },
+        structuredFilters: [{ tagSlot: 'tag1', fieldType: 'text', operator: 'eq', value: 'api' }],
         distanceThreshold: 0.8,
       }
 
@@ -149,7 +128,7 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: { tag1: 'api' },
+        structuredFilters: [{ tagSlot: 'tag1', fieldType: 'text', operator: 'eq', value: 'api' }],
         queryVector: JSON.stringify([0.1, 0.2, 0.3]),
       }
 
@@ -162,7 +141,7 @@ describe('Knowledge Search Utils', () => {
       const params = {
         knowledgeBaseIds: ['kb-123'],
         topK: 10,
-        filters: { tag1: 'api' },
+        structuredFilters: [{ tagSlot: 'tag1', fieldType: 'text', operator: 'eq', value: 'api' }],
         queryVector: JSON.stringify([0.1, 0.2, 0.3]),
         distanceThreshold: 0.8,
       }
@@ -170,7 +149,7 @@ describe('Knowledge Search Utils', () => {
       // This test validates the function accepts the right parameters
       expect(params.knowledgeBaseIds).toEqual(['kb-123'])
       expect(params.topK).toBe(10)
-      expect(params.filters).toEqual({ tag1: 'api' })
+      expect(params.structuredFilters).toHaveLength(1)
       expect(params.queryVector).toBe(JSON.stringify([0.1, 0.2, 0.3]))
       expect(params.distanceThreshold).toBe(0.8)
     })
@@ -178,7 +157,7 @@ describe('Knowledge Search Utils', () => {
 
   describe('generateSearchEmbedding', () => {
     it('should use Azure OpenAI when KB-specific config is provided', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         AZURE_OPENAI_API_KEY: 'test-azure-key',
@@ -188,17 +167,16 @@ describe('Knowledge Search Utils', () => {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       const result = await generateSearchEmbedding('test query')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
         'https://test.openai.azure.com/openai/deployments/text-embedding-ada-002/embeddings?api-version=2024-12-01-preview',
         expect.objectContaining({
           headers: expect.objectContaining({
@@ -213,23 +191,22 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should fallback to OpenAI when no KB Azure config provided', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       const result = await generateSearchEmbedding('test query')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
         'https://api.openai.com/v1/embeddings',
         expect.objectContaining({
           headers: expect.objectContaining({
@@ -243,8 +220,8 @@ describe('Knowledge Search Utils', () => {
       Object.keys(env).forEach((key) => delete (env as any)[key])
     })
 
-    it('should use default API version when not provided in Azure config', async () => {
-      const { env } = await import('@/lib/env')
+    it('falls back to OpenAI when AZURE_OPENAI_API_VERSION is not set', async () => {
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         AZURE_OPENAI_API_KEY: 'test-azure-key',
@@ -253,18 +230,17 @@ describe('Knowledge Search Utils', () => {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       await generateSearchEmbedding('test query')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
-        expect.stringContaining('api-version='),
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        'https://api.openai.com/v1/embeddings',
         expect.any(Object)
       )
 
@@ -273,7 +249,7 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should use custom model name when provided in Azure config', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         AZURE_OPENAI_API_KEY: 'test-azure-key',
@@ -283,17 +259,16 @@ describe('Knowledge Search Utils', () => {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       await generateSearchEmbedding('test query', 'text-embedding-3-small')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
         'https://test.openai.azure.com/openai/deployments/custom-embedding-model/embeddings?api-version=2024-12-01-preview',
         expect.any(Object)
       )
@@ -303,16 +278,16 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should throw error when no API configuration provided', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
 
       await expect(generateSearchEmbedding('test query')).rejects.toThrow(
-        'Either OPENAI_API_KEY or Azure OpenAI configuration (AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT) must be configured'
+        'OPENAI_API_KEY is not configured'
       )
     })
 
     it('should handle Azure OpenAI API errors properly', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         AZURE_OPENAI_API_KEY: 'test-azure-key',
@@ -321,13 +296,12 @@ describe('Knowledge Search Utils', () => {
         KB_OPENAI_MODEL_NAME: 'text-embedding-ada-002',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
+      mockNextFetchResponse({
         ok: false,
         status: 404,
         statusText: 'Not Found',
-        text: async () => 'Deployment not found',
-      } as any)
+        text: 'Deployment not found',
+      })
 
       await expect(generateSearchEmbedding('test query')).rejects.toThrow('Embedding API failed')
 
@@ -336,19 +310,18 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should handle OpenAI API errors properly', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
+      mockNextFetchResponse({
         ok: false,
         status: 429,
         statusText: 'Too Many Requests',
-        text: async () => 'Rate limit exceeded',
-      } as any)
+        text: 'Rate limit exceeded',
+      })
 
       await expect(generateSearchEmbedding('test query')).rejects.toThrow('Embedding API failed')
 
@@ -357,7 +330,7 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should include correct request body for Azure OpenAI', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         AZURE_OPENAI_API_KEY: 'test-azure-key',
@@ -366,22 +339,22 @@ describe('Knowledge Search Utils', () => {
         KB_OPENAI_MODEL_NAME: 'text-embedding-ada-002',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       await generateSearchEmbedding('test query')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
         expect.any(String),
         expect.objectContaining({
           body: JSON.stringify({
             input: ['test query'],
             encoding_format: 'float',
+            dimensions: 1536,
           }),
         })
       )
@@ -391,29 +364,29 @@ describe('Knowledge Search Utils', () => {
     })
 
     it('should include correct request body for OpenAI', async () => {
-      const { env } = await import('@/lib/env')
+      const { env } = await import('@/lib/core/config/env')
       Object.keys(env).forEach((key) => delete (env as any)[key])
       Object.assign(env, {
         OPENAI_API_KEY: 'test-openai-key',
       })
 
-      const fetchSpy = vi.mocked(fetch)
-      fetchSpy.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
+      mockNextFetchResponse({
+        json: {
           data: [{ embedding: [0.1, 0.2, 0.3] }],
-        }),
-      } as any)
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        },
+      })
 
       await generateSearchEmbedding('test query', 'text-embedding-3-small')
 
-      expect(fetchSpy).toHaveBeenCalledWith(
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
         expect.any(String),
         expect.objectContaining({
           body: JSON.stringify({
             input: ['test query'],
             model: 'text-embedding-3-small',
             encoding_format: 'float',
+            dimensions: 1536,
           }),
         })
       )
@@ -423,11 +396,11 @@ describe('Knowledge Search Utils', () => {
     })
   })
 
-  describe('getDocumentNamesByIds', () => {
+  describe('getDocumentMetadataByIds', () => {
     it('should handle empty input gracefully', async () => {
-      const { getDocumentNamesByIds } = await import('./utils')
+      const { getDocumentMetadataByIds } = await import('./utils')
 
-      const result = await getDocumentNamesByIds([])
+      const result = await getDocumentMetadataByIds([])
 
       expect(result).toEqual({})
     })

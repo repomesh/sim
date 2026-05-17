@@ -1,7 +1,8 @@
-import '@/executor/__test-utils__/mock-dependencies'
+import '@sim/testing/mocks/executor'
 
+import { inputValidationMock, inputValidationMockFns } from '@sim/testing'
 import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest'
-import { BlockType } from '@/executor/consts'
+import { BlockType } from '@/executor/constants'
 import { ApiBlockHandler } from '@/executor/handlers/api/api-handler'
 import type { ExecutionContext } from '@/executor/types'
 import type { SerializedBlock } from '@/serializer/types'
@@ -9,8 +10,11 @@ import { executeTool } from '@/tools'
 import type { ToolConfig } from '@/tools/types'
 import { getTool } from '@/tools/utils'
 
+vi.mock('@/lib/core/security/input-validation.server', () => inputValidationMock)
+
 const mockGetTool = vi.mocked(getTool)
 const mockExecuteTool = executeTool as Mock
+const mockValidateUrlWithDNS = inputValidationMockFns.mockValidateUrlWithDNS
 
 describe('ApiBlockHandler', () => {
   let handler: ApiBlockHandler
@@ -36,8 +40,7 @@ describe('ApiBlockHandler', () => {
       metadata: { duration: 0 },
       environmentVariables: {},
       decisions: { router: new Map(), condition: new Map() },
-      loopIterations: new Map(),
-      loopItems: new Map(),
+      loopExecutions: new Map(),
       executedBlocks: new Set(),
       activeExecutionPath: new Set(),
       completedLoops: new Set(),
@@ -63,6 +66,12 @@ describe('ApiBlockHandler', () => {
 
     // Reset mocks using vi
     vi.clearAllMocks()
+
+    mockValidateUrlWithDNS.mockResolvedValue({
+      isValid: true,
+      resolvedIP: '93.184.216.34',
+      originalHostname: 'example.com',
+    })
 
     // Set up mockGetTool to return the mockApiTool
     mockGetTool.mockImplementation((toolId) => {
@@ -97,7 +106,7 @@ describe('ApiBlockHandler', () => {
 
     mockExecuteTool.mockResolvedValue({ success: true, output: { data: 'Success' } })
 
-    const result = await handler.execute(mockBlock, inputs, mockContext)
+    const result = await handler.execute(mockContext, mockBlock, inputs)
 
     expect(mockGetTool).toHaveBeenCalledWith('http_request')
     expect(mockExecuteTool).toHaveBeenCalledWith(
@@ -107,9 +116,7 @@ describe('ApiBlockHandler', () => {
         body: { key: 'value' }, // Expect parsed body
         _context: { workflowId: 'test-workflow-id' },
       },
-      false, // skipProxy
-      false, // skipPostProcess
-      mockContext // execution context
+      { executionContext: mockContext }
     )
     expect(result).toEqual(expectedOutput)
   })
@@ -122,7 +129,7 @@ describe('ApiBlockHandler', () => {
 
     const expectedOutput = { data: null, status: 200, headers: {} }
 
-    const result = await handler.execute(mockBlock, inputs, mockContext)
+    const result = await handler.execute(mockContext, mockBlock, inputs)
 
     expect(mockGetTool).toHaveBeenCalledWith('http_request')
     expect(mockExecuteTool).not.toHaveBeenCalled()
@@ -132,8 +139,13 @@ describe('ApiBlockHandler', () => {
   it('should throw error for invalid URL format (no protocol)', async () => {
     const inputs = { url: 'example.com/api' }
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
-      'Invalid URL: "example.com/api" - URL must include protocol (try "https://example.com/api")'
+    mockValidateUrlWithDNS.mockResolvedValueOnce({
+      isValid: false,
+      error: 'url must be a valid URL',
+    })
+
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
+      'url must be a valid URL'
     )
     expect(mockExecuteTool).not.toHaveBeenCalled()
   })
@@ -141,8 +153,13 @@ describe('ApiBlockHandler', () => {
   it('should throw error for generally invalid URL format', async () => {
     const inputs = { url: 'htp:/invalid-url' }
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
-      /^Invalid URL: "htp:\/invalid-url" - URL must include protocol/
+    mockValidateUrlWithDNS.mockResolvedValueOnce({
+      isValid: false,
+      error: 'url must use https:// protocol',
+    })
+
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
+      'url must use https:// protocol'
     )
     expect(mockExecuteTool).not.toHaveBeenCalled()
   })
@@ -154,14 +171,12 @@ describe('ApiBlockHandler', () => {
     }
     const expectedParsedBody = { key: 'value', nested: { num: 1 } }
 
-    await handler.execute(mockBlock, inputs, mockContext)
+    await handler.execute(mockContext, mockBlock, inputs)
 
     expect(mockExecuteTool).toHaveBeenCalledWith(
       'http_request',
       expect.objectContaining({ body: expectedParsedBody }),
-      false, // skipProxy
-      false, // skipPostProcess
-      mockContext // execution context
+      { executionContext: mockContext }
     )
   })
 
@@ -171,14 +186,12 @@ describe('ApiBlockHandler', () => {
       body: 'This is plain text',
     }
 
-    await handler.execute(mockBlock, inputs, mockContext)
+    await handler.execute(mockContext, mockBlock, inputs)
 
     expect(mockExecuteTool).toHaveBeenCalledWith(
       'http_request',
       expect.objectContaining({ body: 'This is plain text' }),
-      false, // skipProxy
-      false, // skipPostProcess
-      mockContext // execution context
+      { executionContext: mockContext }
     )
   })
 
@@ -188,14 +201,12 @@ describe('ApiBlockHandler', () => {
       body: null,
     }
 
-    await handler.execute(mockBlock, inputs, mockContext)
+    await handler.execute(mockContext, mockBlock, inputs)
 
     expect(mockExecuteTool).toHaveBeenCalledWith(
       'http_request',
       expect.objectContaining({ body: undefined }),
-      false, // skipProxy
-      false, // skipPostProcess
-      mockContext // execution context
+      { executionContext: mockContext }
     )
   })
 
@@ -211,7 +222,7 @@ describe('ApiBlockHandler', () => {
       error: 'Resource not found',
     })
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
       'HTTP Request failed: URL: https://example.com/notfound | Method: GET | Error: Resource not found | Status: 404 | Status text: Not Found - The requested resource was not found'
     )
     expect(mockExecuteTool).toHaveBeenCalled()
@@ -223,7 +234,7 @@ describe('ApiBlockHandler', () => {
     // Override mock to return undefined for this test
     mockGetTool.mockImplementation(() => undefined)
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
       'Tool not found: http_request'
     )
     expect(mockExecuteTool).not.toHaveBeenCalled()
@@ -236,7 +247,7 @@ describe('ApiBlockHandler', () => {
       error: 'Request failed due to CORS policy',
     })
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
       /CORS policy prevented the request, try using a proxy or server-side request/
     )
   })
@@ -245,7 +256,7 @@ describe('ApiBlockHandler', () => {
     const inputs = { url: 'https://unreachable.local' }
     mockExecuteTool.mockResolvedValue({ success: false, error: 'Failed to fetch' })
 
-    await expect(handler.execute(mockBlock, inputs, mockContext)).rejects.toThrow(
+    await expect(handler.execute(mockContext, mockBlock, inputs)).rejects.toThrow(
       /Network error, check if the URL is accessible and if you have internet connectivity/
     )
   })

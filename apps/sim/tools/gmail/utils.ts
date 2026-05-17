@@ -1,3 +1,5 @@
+import { generateRandomString } from '@sim/utils/random'
+import { convert } from 'html-to-text'
 import type {
   GmailAttachment,
   GmailMessage,
@@ -6,6 +8,47 @@ import type {
 } from '@/tools/gmail/types'
 
 export const GMAIL_API_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
+
+/**
+ * Fetch original message headers for threading
+ * @param messageId Gmail message ID to fetch headers from
+ * @param accessToken Gmail access token
+ * @returns Object containing threading headers (messageId, references, subject)
+ */
+export async function fetchThreadingHeaders(
+  messageId: string,
+  accessToken: string
+): Promise<{
+  messageId?: string
+  references?: string
+  subject?: string
+}> {
+  try {
+    const messageResponse = await fetch(
+      `${GMAIL_API_BASE}/messages/${messageId}?format=metadata&metadataHeaders=Message-ID&metadataHeaders=References&metadataHeaders=Subject`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    )
+
+    if (messageResponse.ok) {
+      const messageData = await messageResponse.json()
+      const headers = messageData.payload?.headers || []
+
+      return {
+        messageId: headers.find((h: any) => h.name.toLowerCase() === 'message-id')?.value,
+        references: headers.find((h: any) => h.name.toLowerCase() === 'references')?.value,
+        subject: headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value,
+      }
+    }
+  } catch (error) {
+    // Continue without threading headers rather than failing
+  }
+
+  return {}
+}
 
 // Helper function to process a Gmail message
 export async function processMessage(
@@ -81,6 +124,7 @@ export function processMessageForSummary(message: GmailMessage): any {
       threadId: message?.threadId || '',
       subject: 'Unknown Subject',
       from: 'Unknown Sender',
+      to: '',
       date: '',
       snippet: message?.snippet || '',
     }
@@ -89,6 +133,7 @@ export function processMessageForSummary(message: GmailMessage): any {
   const headers = message.payload.headers || []
   const subject = headers.find((h) => h.name.toLowerCase() === 'subject')?.value || 'No Subject'
   const from = headers.find((h) => h.name.toLowerCase() === 'from')?.value || 'Unknown Sender'
+  const to = headers.find((h) => h.name.toLowerCase() === 'to')?.value || ''
   const date = headers.find((h) => h.name.toLowerCase() === 'date')?.value || ''
 
   return {
@@ -96,6 +141,7 @@ export function processMessageForSummary(message: GmailMessage): any {
     threadId: message.threadId,
     subject,
     from,
+    to,
     date,
     snippet: message.snippet || '',
   }
@@ -195,6 +241,7 @@ export async function downloadAttachments(
       )
 
       if (!attachmentResponse.ok) {
+        await attachmentResponse.body?.cancel().catch(() => {})
         continue
       }
 
@@ -207,7 +254,7 @@ export async function downloadAttachments(
 
       downloadedAttachments.push({
         name: attachment.filename,
-        data: buffer,
+        data: buffer.toString('base64'),
         mimeType: attachment.mimeType,
         size: attachment.size,
       })
@@ -230,11 +277,265 @@ export function createMessagesSummary(messages: any[]): string {
   messages.forEach((msg, index) => {
     summary += `${index + 1}. Subject: ${msg.subject}\n`
     summary += `   From: ${msg.from}\n`
+    summary += `   To: ${msg.to}\n`
     summary += `   Date: ${msg.date}\n`
+    summary += `   ID: ${msg.id}\n`
+    summary += `   Thread ID: ${msg.threadId}\n`
     summary += `   Preview: ${msg.snippet}\n\n`
   })
 
   summary += `To read full content of a specific message, use the gmail_read tool with messageId: ${messages.map((m) => m.id).join(', ')}`
 
   return summary
+}
+
+/**
+ * Generate a unique MIME boundary string
+ */
+function generateBoundary(): string {
+  return `----=_Part_${Date.now()}_${generateRandomString(13)}`
+}
+
+/**
+ * Encode a header value using RFC 2047 Base64 encoding if it contains non-ASCII characters.
+ * This matches Google's own Gmail API sample: `=?utf-8?B?${Buffer.from(subject).toString('base64')}?=`
+ * @see https://github.com/googleapis/google-api-nodejs-client/blob/main/samples/gmail/send.js
+ */
+export function encodeRfc2047(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(value)) {
+    return value
+  }
+  return `=?UTF-8?B?${Buffer.from(value, 'utf-8').toString('base64')}?=`
+}
+
+/**
+ * Encode string or buffer to base64url format (URL-safe base64)
+ * Gmail API requires base64url encoding for the raw message field
+ */
+export function base64UrlEncode(data: string | Buffer): string {
+  const base64 = Buffer.from(data).toString('base64')
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/**
+ * Escape HTML special characters so user-supplied text renders safely inside an HTML body.
+ */
+export function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+/**
+ * Convert a plain-text body to an HTML body that flows naturally in Gmail.
+ * Blank lines become paragraph breaks; single newlines become `<br>`.
+ * This avoids the narrow hard-wrapped rendering Gmail uses for `text/plain`.
+ */
+export function plainTextToHtml(body: string): string {
+  const normalized = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const paragraphs = normalized.split(/\n{2,}/)
+  const htmlParagraphs = paragraphs.map((paragraph) => {
+    const escaped = escapeHtml(paragraph).replace(/\n/g, '<br>')
+    return `<p>${escaped}</p>`
+  })
+  return `<!DOCTYPE html><html><body>${htmlParagraphs.join('')}</body></html>`
+}
+
+/**
+ * Best-effort conversion of an HTML body to a plain-text fallback. Used so we
+ * always include a plain-text part alongside HTML for clients that don't render
+ * HTML. Delegates to the `html-to-text` library for robust tag stripping and
+ * entity decoding (also used elsewhere in the repo for the same purpose).
+ */
+export function htmlToPlainText(html: string): string {
+  return convert(html, {
+    wordwrap: false,
+    selectors: [
+      { selector: 'a', options: { hideLinkHrefIfSameAsText: true, noAnchorUrl: true } },
+      { selector: 'img', format: 'skip' },
+      { selector: 'script', format: 'skip' },
+      { selector: 'style', format: 'skip' },
+    ],
+  })
+}
+
+/**
+ * Produce the plain-text and HTML representations of a body so we can emit a
+ * `multipart/alternative` section. Gmail renders the HTML version full-width
+ * (matching how a manually-composed email looks); the plain-text part is the
+ * fallback for clients that don't render HTML.
+ */
+export function buildBodyAlternatives(
+  body: string,
+  contentType: 'text' | 'html' | undefined
+): { plain: string; html: string } {
+  if (contentType === 'html') {
+    return { plain: htmlToPlainText(body) || body, html: body }
+  }
+  return { plain: body, html: plainTextToHtml(body) }
+}
+
+/**
+ * Encode a text body as base64 with RFC 2045 line wrapping (max 76 chars).
+ * Using base64 lets us safely transport arbitrary UTF-8 (emoji, accented
+ * characters, etc.) — `7bit` is only valid for strict 7-bit ASCII.
+ */
+function encodeBodyBase64(content: string): string[] {
+  const base64 = Buffer.from(content, 'utf-8').toString('base64')
+  return base64.match(/.{1,76}/g) || ['']
+}
+
+/**
+ * Render the inner part of a `multipart/alternative` section (text/plain
+ * followed by text/html, per RFC 2046 — clients pick the last format they
+ * understand).
+ */
+function renderAlternativeParts(plain: string, html: string, boundary: string): string[] {
+  return [
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    ...encodeBodyBase64(plain),
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    ...encodeBodyBase64(html),
+    '',
+    `--${boundary}--`,
+  ]
+}
+
+/**
+ * Build a `multipart/alternative` email (without attachments). Always emits
+ * both text/plain and text/html parts so Gmail renders messages full-width
+ * like a hand-composed email.
+ * @returns Base64url encoded raw message
+ */
+export function buildSimpleEmailMessage(params: {
+  to: string
+  cc?: string | null
+  bcc?: string | null
+  subject?: string | null
+  body: string
+  contentType?: 'text' | 'html'
+  inReplyTo?: string
+  references?: string
+}): string {
+  const { to, cc, bcc, subject, body, contentType, inReplyTo, references } = params
+  const boundary = generateBoundary()
+  const { plain, html } = buildBodyAlternatives(body, contentType)
+
+  const emailHeaders = ['MIME-Version: 1.0', `To: ${to}`]
+
+  if (cc) {
+    emailHeaders.push(`Cc: ${cc}`)
+  }
+  if (bcc) {
+    emailHeaders.push(`Bcc: ${bcc}`)
+  }
+
+  emailHeaders.push(`Subject: ${encodeRfc2047(subject || '')}`)
+
+  if (inReplyTo) {
+    emailHeaders.push(`In-Reply-To: ${inReplyTo}`)
+    const referencesChain = references ? `${references} ${inReplyTo}` : inReplyTo
+    emailHeaders.push(`References: ${referencesChain}`)
+  }
+
+  emailHeaders.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
+  emailHeaders.push('')
+  emailHeaders.push(...renderAlternativeParts(plain, html, boundary))
+
+  const email = emailHeaders.join('\n')
+  return Buffer.from(email).toString('base64url')
+}
+
+/**
+ * Build a MIME multipart message with optional attachments
+ * @param params Message parameters including recipients, subject, body, and attachments
+ * @returns Complete MIME message string ready to be base64url encoded
+ */
+export interface BuildMimeMessageParams {
+  to: string
+  cc?: string
+  bcc?: string
+  subject?: string
+  body: string
+  contentType?: 'text' | 'html'
+  inReplyTo?: string
+  references?: string
+  attachments?: Array<{
+    filename: string
+    mimeType: string
+    content: Buffer
+  }>
+}
+
+export function buildMimeMessage(params: BuildMimeMessageParams): string {
+  const { to, cc, bcc, subject, body, contentType, inReplyTo, references, attachments } = params
+  const messageParts: string[] = []
+  const { plain, html } = buildBodyAlternatives(body, contentType)
+
+  messageParts.push(`To: ${to}`)
+  if (cc) {
+    messageParts.push(`Cc: ${cc}`)
+  }
+  if (bcc) {
+    messageParts.push(`Bcc: ${bcc}`)
+  }
+  messageParts.push(`Subject: ${encodeRfc2047(subject || '')}`)
+
+  if (inReplyTo) {
+    messageParts.push(`In-Reply-To: ${inReplyTo}`)
+  }
+  if (references) {
+    const referencesChain = inReplyTo ? `${references} ${inReplyTo}` : references
+    messageParts.push(`References: ${referencesChain}`)
+  } else if (inReplyTo) {
+    messageParts.push(`References: ${inReplyTo}`)
+  }
+
+  messageParts.push('MIME-Version: 1.0')
+
+  if (attachments && attachments.length > 0) {
+    const mixedBoundary = generateBoundary()
+    const altBoundary = generateBoundary()
+
+    messageParts.push(`Content-Type: multipart/mixed; boundary="${mixedBoundary}"`)
+    messageParts.push('')
+    messageParts.push(`--${mixedBoundary}`)
+    messageParts.push(`Content-Type: multipart/alternative; boundary="${altBoundary}"`)
+    messageParts.push('')
+    messageParts.push(...renderAlternativeParts(plain, html, altBoundary))
+    messageParts.push('')
+
+    for (const attachment of attachments) {
+      messageParts.push(`--${mixedBoundary}`)
+      messageParts.push(`Content-Type: ${attachment.mimeType}`)
+      messageParts.push(`Content-Disposition: attachment; filename="${attachment.filename}"`)
+      messageParts.push('Content-Transfer-Encoding: base64')
+      messageParts.push('')
+
+      const base64Content = attachment.content.toString('base64')
+      const lines = base64Content.match(/.{1,76}/g) || []
+      messageParts.push(...lines)
+      messageParts.push('')
+    }
+
+    messageParts.push(`--${mixedBoundary}--`)
+  } else {
+    const altBoundary = generateBoundary()
+    messageParts.push(`Content-Type: multipart/alternative; boundary="${altBoundary}"`)
+    messageParts.push('')
+    messageParts.push(...renderAlternativeParts(plain, html, altBoundary))
+  }
+
+  return messageParts.join('\n')
 }

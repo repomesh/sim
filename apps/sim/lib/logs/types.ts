@@ -1,11 +1,16 @@
 import type { Edge } from 'reactflow'
-import type { BlockLog, NormalizedBlockOutput } from '@/executor/types'
-import type { DeploymentStatus } from '@/stores/workflows/registry/types'
-import type { Loop, Parallel, WorkflowState } from '@/stores/workflows/workflow/types'
+import type { AsyncExecutionCorrelation } from '@/lib/core/async-jobs/types'
+import type { ParentIteration, SerializableExecutionState } from '@/executor/execution/types'
+import type {
+  BlockTokens,
+  IterationToolCall,
+  NormalizedBlockOutput,
+  ProviderTimingSegment,
+} from '@/executor/types'
+import type { WorkflowState } from '@/stores/workflows/workflow/types'
 
-export type { WorkflowState, Loop, Parallel, DeploymentStatus }
+export type { WorkflowState }
 export type WorkflowEdge = Edge
-export type { NormalizedBlockOutput, BlockLog }
 
 export interface PricingInfo {
   input: number
@@ -15,8 +20,8 @@ export interface PricingInfo {
 }
 
 export interface TokenUsage {
-  prompt: number
-  completion: number
+  input: number
+  output: number
   total: number
 }
 
@@ -35,8 +40,8 @@ export interface ToolCall {
   startTime: string
   endTime: string
   status: 'success' | 'error'
-  input: Record<string, unknown>
-  output: Record<string, unknown>
+  input?: Record<string, unknown>
+  output?: Record<string, unknown>
   error?: string
 }
 
@@ -51,10 +56,14 @@ export interface ExecutionEnvironment {
   workspaceId: string
 }
 
+import type { CoreTriggerType } from '@/stores/logs/filters/types'
+
 export interface ExecutionTrigger {
-  type: 'api' | 'webhook' | 'schedule' | 'manual' | 'chat'
+  type: CoreTriggerType | string
   source: string
-  data?: Record<string, unknown>
+  data?: Record<string, unknown> & {
+    correlation?: AsyncExecutionCorrelation
+  }
   timestamp: string
 }
 
@@ -65,9 +74,34 @@ export interface ExecutionStatus {
   durationMs?: number
 }
 
+export const EXECUTION_FINALIZATION_PATHS = [
+  'completed',
+  'fallback_completed',
+  'force_failed',
+  'cancelled',
+  'paused',
+] as const
+
+export type ExecutionFinalizationPath = (typeof EXECUTION_FINALIZATION_PATHS)[number]
+
+export interface ExecutionLastStartedBlock {
+  blockId: string
+  blockName: string
+  blockType: string
+  startedAt: string
+}
+
+export interface ExecutionLastCompletedBlock {
+  blockId: string
+  blockName: string
+  blockType: string
+  endedAt: string
+  success: boolean
+}
+
 export interface WorkflowExecutionSnapshot {
   id: string
-  workflowId: string
+  workflowId: string | null
   stateHash: string
   stateData: WorkflowState
   createdAt: string
@@ -78,7 +112,7 @@ export type WorkflowExecutionSnapshotSelect = WorkflowExecutionSnapshot
 
 export interface WorkflowExecutionLog {
   id: string
-  workflowId: string
+  workflowId: string | null
   executionId: string
   stateSnapshotId: string
   level: 'info' | 'error'
@@ -93,16 +127,33 @@ export interface WorkflowExecutionLog {
     type: string
     url: string
     key: string
-    uploadedAt: string
-    expiresAt: string
-    storageProvider?: 's3' | 'blob' | 'local'
-    bucketName?: string
   }>
   // Execution details
   executionData: {
     environment?: ExecutionEnvironment
     trigger?: ExecutionTrigger
+    correlation?: AsyncExecutionCorrelation
+    error?: string
+    lastStartedBlock?: ExecutionLastStartedBlock
+    lastCompletedBlock?: ExecutionLastCompletedBlock
+    hasTraceSpans?: boolean
+    traceSpanCount?: number
+    completionFailure?: string
+    finalizationPath?: ExecutionFinalizationPath
     traceSpans?: TraceSpan[]
+    tokens?: { input?: number; output?: number; total?: number }
+    models?: Record<
+      string,
+      {
+        input?: number
+        output?: number
+        total?: number
+        tokens?: { input?: number; output?: number; total?: number }
+      }
+    >
+    executionState?: SerializableExecutionState
+    finalOutput?: any
+    workflowInput?: unknown
     errorDetails?: {
       blockId: string
       blockName: string
@@ -115,14 +166,14 @@ export interface WorkflowExecutionLog {
     input?: number
     output?: number
     total?: number
-    tokens?: { prompt?: number; completion?: number; total?: number }
+    tokens?: { input?: number; output?: number; total?: number }
     models?: Record<
       string,
       {
         input?: number
         output?: number
         total?: number
-        tokens?: { prompt?: number; completion?: number; total?: number }
+        tokens?: { input?: number; output?: number; total?: number }
       }
     >
   }
@@ -133,6 +184,15 @@ export interface WorkflowExecutionLog {
 export type WorkflowExecutionLogInsert = Omit<WorkflowExecutionLog, 'id' | 'createdAt'>
 export type WorkflowExecutionLogSelect = WorkflowExecutionLog
 
+export type TokenInfo = BlockTokens
+
+export interface ProviderTiming {
+  duration: number
+  startTime: string
+  endTime: string
+  segments: ProviderTimingSegment[]
+}
+
 export interface TraceSpan {
   id: string
   name: string
@@ -141,13 +201,71 @@ export interface TraceSpan {
   startTime: string
   endTime: string
   children?: TraceSpan[]
+  /**
+   * @deprecated Tool invocations are emitted as `children` with `type: 'tool'`.
+   * This field only appears on legacy trace spans persisted before the unification.
+   */
   toolCalls?: ToolCall[]
   status?: 'success' | 'error'
-  tokens?: number
+  /** Whether this block's error was handled by an error handler path */
+  errorHandled?: boolean
+  tokens?: TokenInfo
   relativeStartMs?: number
   blockId?: string
+  executionOrder?: number
   input?: Record<string, unknown>
   output?: Record<string, unknown>
+  childWorkflowSnapshotId?: string
+  childWorkflowId?: string
+  model?: string
+  cost?: {
+    input?: number
+    output?: number
+    total?: number
+    toolCost?: number
+  }
+  providerTiming?: ProviderTiming
+  loopId?: string
+  parallelId?: string
+  iterationIndex?: number
+  parentIterations?: ParentIteration[]
+  /**
+   * For model child spans: the assistant's thinking/reasoning blocks from this
+   * iteration, stringified. Surfaces Anthropic extended thinking and equivalents.
+   */
+  thinking?: string
+  /**
+   * For model child spans: the tool calls the assistant requested in this
+   * iteration. `id` is the provider-assigned `tool_call.id`, used to correlate
+   * the following tool child span via its `toolCallId` field.
+   */
+  modelToolCalls?: IterationToolCall[]
+  /**
+   * For model child spans: the provider-reported stop reason
+   * (`stop`, `tool_use`, `length`, …).
+   */
+  finishReason?: string
+  /**
+   * For tool child spans: the `tool_call.id` this tool invocation satisfies.
+   * Matches one of the preceding model child's `modelToolCalls[i].id`.
+   */
+  toolCallId?: string
+  /**
+   * For model child spans: time-to-first-token in ms (streaming runs only).
+   */
+  ttft?: number
+  /**
+   * For model child spans: the provider system identifier
+   * (`anthropic`, `openai`, `gemini`, …) — aligns with OTel `gen_ai.system`.
+   */
+  provider?: string
+  /**
+   * For failed child spans: structured error class
+   * (e.g. `rate_limit`, `context_length`).
+   */
+  errorType?: string
+  /** For failed child spans: human-readable error message. */
+  errorMessage?: string
 }
 
 export interface WorkflowExecutionSummary {
@@ -291,7 +409,6 @@ export interface BatchInsertResult<T> {
 export interface SnapshotService {
   createSnapshot(workflowId: string, state: WorkflowState): Promise<WorkflowExecutionSnapshot>
   getSnapshot(id: string): Promise<WorkflowExecutionSnapshot | null>
-  getSnapshotByHash(workflowId: string, hash: string): Promise<WorkflowExecutionSnapshot | null>
   computeStateHash(state: WorkflowState): string
   cleanupOrphanedSnapshots(olderThanDays: number): Promise<number>
 }
@@ -304,6 +421,7 @@ export interface SnapshotCreationResult {
 export interface ExecutionLoggerService {
   startWorkflowExecution(params: {
     workflowId: string
+    workspaceId: string
     executionId: string
     trigger: ExecutionTrigger
     environment: ExecutionEnvironment
@@ -326,5 +444,12 @@ export interface ExecutionLoggerService {
     }
     finalOutput: BlockOutputData
     traceSpans?: TraceSpan[]
+    workflowInput?: any
+    executionState?: SerializableExecutionState
+    finalizationPath?: ExecutionFinalizationPath
+    completionFailure?: string
+    isResume?: boolean
+    level?: 'info' | 'error'
+    status?: 'completed' | 'failed' | 'cancelled' | 'pending'
   }): Promise<WorkflowExecutionLog>
 }

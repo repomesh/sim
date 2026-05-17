@@ -1,13 +1,19 @@
+import { db } from '@sim/db'
+import { apiKey } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { safeCompare } from '@sim/security/compare'
+import { generateShortId } from '@sim/utils/id'
+import { and, eq } from 'drizzle-orm'
 import {
   decryptApiKey,
   encryptApiKey,
   generateApiKey,
   generateEncryptedApiKey,
+  hashApiKey,
   isEncryptedApiKeyFormat,
   isLegacyApiKeyFormat,
-} from '@/lib/api-key/service'
-import { env } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
+} from '@/lib/api-key/crypto'
+import { env } from '@/lib/core/config/env'
 
 const logger = createLogger('ApiKeyAuth')
 
@@ -39,7 +45,7 @@ export async function authenticateApiKey(inputKey: string, storedKey: string): P
       if (isEncryptedKey(storedKey)) {
         try {
           const { decrypted } = await decryptApiKey(storedKey)
-          return inputKey === decrypted
+          return safeCompare(inputKey, decrypted)
         } catch (decryptError) {
           logger.error('Failed to decrypt stored API key:', { error: decryptError })
           return false
@@ -54,27 +60,27 @@ export async function authenticateApiKey(inputKey: string, storedKey: string): P
       if (isEncryptedKey(storedKey)) {
         try {
           const { decrypted } = await decryptApiKey(storedKey)
-          return inputKey === decrypted
+          return safeCompare(inputKey, decrypted)
         } catch (decryptError) {
           logger.error('Failed to decrypt stored API key:', { error: decryptError })
           // Fall through to plain text comparison if decryption fails
         }
       }
       // Legacy format can match against plain text storage
-      return inputKey === storedKey
+      return safeCompare(inputKey, storedKey)
     }
 
     // If no recognized prefix, fall back to original behavior
     if (isEncryptedKey(storedKey)) {
       try {
         const { decrypted } = await decryptApiKey(storedKey)
-        return inputKey === decrypted
+        return safeCompare(inputKey, decrypted)
       } catch (decryptError) {
         logger.error('Failed to decrypt stored API key:', { error: decryptError })
       }
     }
 
-    return inputKey === storedKey
+    return safeCompare(inputKey, storedKey)
   } catch (error) {
     logger.error('API key authentication error:', { error })
     return false
@@ -86,7 +92,7 @@ export async function authenticateApiKey(inputKey: string, storedKey: string): P
  * @param apiKey - The plain text API key to encrypt
  * @returns Promise<string> - The encrypted key
  */
-export async function encryptApiKeyForStorage(apiKey: string): Promise<string> {
+async function encryptApiKeyForStorage(apiKey: string): Promise<string> {
   try {
     const { encrypted } = await encryptApiKey(apiKey)
     return encrypted
@@ -127,7 +133,7 @@ export async function createApiKey(useStorage = true): Promise<{
  * @param encryptedKey - The encrypted API key from the database
  * @returns Promise<string> - The decrypted API key
  */
-export async function decryptApiKeyFromStorage(encryptedKey: string): Promise<string> {
+async function decryptApiKeyFromStorage(encryptedKey: string): Promise<string> {
   try {
     const { decrypted } = await decryptApiKey(encryptedKey)
     return decrypted
@@ -191,7 +197,7 @@ export function formatApiKeyForDisplay(apiKey: string): string {
  * @param encryptedKey - The encrypted API key from the database
  * @returns Promise<string> - The last 4 characters
  */
-export async function getEncryptedApiKeyLast4(encryptedKey: string): Promise<string> {
+async function getEncryptedApiKeyLast4(encryptedKey: string): Promise<string> {
   try {
     if (isEncryptedKey(encryptedKey)) {
       const decryptedKey = await decryptApiKeyFromStorage(encryptedKey)
@@ -210,6 +216,53 @@ export async function getEncryptedApiKeyLast4(encryptedKey: string): Promise<str
  * @param apiKey - The API key to validate
  * @returns boolean - true if the format appears valid
  */
-export function isValidApiKeyFormat(apiKey: string): boolean {
-  return typeof apiKey === 'string' && apiKey.length > 10 && apiKey.length < 200
+export function isValidApiKeyFormat(apiKeyValue: string): boolean {
+  return typeof apiKeyValue === 'string' && apiKeyValue.length > 10 && apiKeyValue.length < 200
+}
+
+export async function createWorkspaceApiKey(params: {
+  workspaceId: string
+  userId: string
+  name: string
+}) {
+  const existingKey = await db
+    .select({ id: apiKey.id })
+    .from(apiKey)
+    .where(
+      and(
+        eq(apiKey.workspaceId, params.workspaceId),
+        eq(apiKey.name, params.name),
+        eq(apiKey.type, 'workspace')
+      )
+    )
+    .limit(1)
+
+  if (existingKey.length > 0) {
+    throw new Error(
+      `A workspace API key named "${params.name}" already exists. Choose a different name.`
+    )
+  }
+
+  const { key: plainKey, encryptedKey } = await createApiKey(true)
+  if (!encryptedKey) {
+    throw new Error('Failed to encrypt API key for storage')
+  }
+
+  const [newKey] = await db
+    .insert(apiKey)
+    .values({
+      id: generateShortId(),
+      workspaceId: params.workspaceId,
+      userId: params.userId,
+      createdBy: params.userId,
+      name: params.name,
+      key: encryptedKey,
+      keyHash: hashApiKey(plainKey),
+      type: 'workspace',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning({ id: apiKey.id, name: apiKey.name, createdAt: apiKey.createdAt })
+
+  return { id: newKey.id, name: newKey.name, key: plainKey, createdAt: newKey.createdAt }
 }

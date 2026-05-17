@@ -11,8 +11,10 @@ export const ResponseBlock: BlockConfig<ResponseBlockOutput> = {
   docsLink: 'https://docs.sim.ai/blocks/response',
   bestPractices: `
   - Only use this if the trigger block is the API Trigger.
-  - Prefer the editor mode over the builder mode.
-  - This is usually used as the last block in the workflow.
+  - Prefer the builder mode over the editor mode.
+  - The Response block is an exit point. When it executes, the workflow stops and the API response is sent immediately.
+  - Multiple Response blocks can be placed on different branches (e.g. after a Router or Condition). The first one to execute determines the API response and ends the workflow.
+  - If a Response block is on a parallel branch, there are no guarantees about whether other parallel blocks will run. Avoid placing Response blocks in parallel with blocks that have important side effects.
   `,
   category: 'blocks',
   bgColor: '#2F55FF',
@@ -22,7 +24,6 @@ export const ResponseBlock: BlockConfig<ResponseBlockOutput> = {
       id: 'dataMode',
       title: 'Response Data Mode',
       type: 'dropdown',
-      layout: 'full',
       options: [
         { label: 'Builder', id: 'structured' },
         { label: 'Editor', id: 'json' },
@@ -34,7 +35,6 @@ export const ResponseBlock: BlockConfig<ResponseBlockOutput> = {
       id: 'builderData',
       title: 'Response Structure',
       type: 'response-format',
-      layout: 'full',
       condition: { field: 'dataMode', value: 'structured' },
       description:
         'Define the structure of your response data. Use <variable.name> in field names to reference workflow variables.',
@@ -43,8 +43,7 @@ export const ResponseBlock: BlockConfig<ResponseBlockOutput> = {
       id: 'data',
       title: 'Response Data',
       type: 'code',
-      layout: 'full',
-      placeholder: '{\n  "message": "Hello world",\n  "userId": "<variable.userId>"\n}',
+      placeholder: '{\n  "message": "Hello world"\n}',
       language: 'json',
       condition: { field: 'dataMode', value: 'json' },
       description:
@@ -78,7 +77,6 @@ Example:
       id: 'status',
       title: 'Status Code',
       type: 'short-input',
-      layout: 'half',
       placeholder: '200',
       description: 'HTTP status code (default: 200)',
     },
@@ -86,7 +84,6 @@ Example:
       id: 'headers',
       title: 'Response Headers',
       type: 'table',
-      layout: 'full',
       columns: ['Key', 'Value'],
       description: 'Additional HTTP headers to include in the response',
     },

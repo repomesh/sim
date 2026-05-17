@@ -1,10 +1,9 @@
 'use client'
 
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useState } from 'react'
+import { Button } from '@/components/emcn'
 import { GithubIcon, GoogleIcon } from '@/components/icons'
-import { Button } from '@/components/ui/button'
-import { client } from '@/lib/auth-client'
-import { inter } from '@/app/fonts/inter'
+import { client } from '@/lib/auth/auth-client'
 
 interface SocialLoginButtonsProps {
   githubAvailable: boolean
@@ -23,15 +22,6 @@ export function SocialLoginButtons({
 }: SocialLoginButtonsProps) {
   const [isGithubLoading, setIsGithubLoading] = useState(false)
   const [isGoogleLoading, setIsGoogleLoading] = useState(false)
-  const [mounted, setMounted] = useState(false)
-
-  // Set mounted state to true on client-side
-  useEffect(() => {
-    setMounted(true)
-  }, [])
-
-  // Only render on the client side to avoid hydration errors
-  if (!mounted) return null
 
   async function signInWithGithub() {
     if (!githubAvailable) return
@@ -82,7 +72,7 @@ export function SocialLoginButtons({
   const githubButton = (
     <Button
       variant='outline'
-      className='w-full rounded-[10px] shadow-sm hover:bg-gray-50'
+      className='w-full rounded-sm border-[var(--landing-border-strong)] py-1.5 text-sm'
       disabled={!githubAvailable || isGithubLoading}
       onClick={signInWithGithub}
     >
@@ -94,7 +84,7 @@ export function SocialLoginButtons({
   const googleButton = (
     <Button
       variant='outline'
-      className='w-full rounded-[10px] shadow-sm hover:bg-gray-50'
+      className='w-full rounded-sm border-[var(--landing-border-strong)] py-1.5 text-sm'
       disabled={!googleAvailable || isGoogleLoading}
       onClick={signInWithGoogle}
     >
@@ -110,7 +100,7 @@ export function SocialLoginButtons({
   }
 
   return (
-    <div className={`${inter.className} grid gap-3 font-light`}>
+    <div className='grid gap-3 font-light'>
       {googleAvailable && googleButton}
       {githubAvailable && githubButton}
       {children}

@@ -1,673 +1,389 @@
-import { db, userStats, workflow, workflowSchedule } from '@sim/db'
+import { db, workflowDeploymentVersion, workflowSchedule } from '@sim/db'
+import { createLogger } from '@sim/logger'
+import { sha256Hex } from '@sim/security/hash'
+import { toError } from '@sim/utils/errors'
+import { generateId } from '@sim/utils/id'
 import { Cron } from 'croner'
-import { and, eq, lte, not, sql } from 'drizzle-orm'
-import { NextResponse } from 'next/server'
-import { v4 as uuidv4 } from 'uuid'
-import { z } from 'zod'
-import { getApiKeyOwnerUserId } from '@/lib/api-key/service'
-import { checkServerSideUsageLimits } from '@/lib/billing'
-import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
-import { getPersonalAndWorkspaceEnv } from '@/lib/environment/utils'
-import { createLogger } from '@/lib/logs/console/logger'
-import { LoggingSession } from '@/lib/logs/execution/logging-session'
-import { buildTraceSpans } from '@/lib/logs/execution/trace-spans/trace-spans'
+import { and, eq, inArray, isNull, lt, lte, ne, not, or, sql } from 'drizzle-orm'
+import { type NextRequest, NextResponse } from 'next/server'
+import { verifyCronAuth } from '@/lib/auth/internal'
+import { getJobQueue, shouldExecuteInline } from '@/lib/core/async-jobs'
+import { getMaxExecutionTimeout } from '@/lib/core/execution-limits'
+import { generateRequestId } from '@/lib/core/utils/request'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import {
-  type BlockState,
-  calculateNextRunTime as calculateNextTime,
-  getScheduleTimeValues,
-  getSubBlockValue,
-} from '@/lib/schedules/utils'
-import { decryptSecret, generateRequestId } from '@/lib/utils'
-import { blockExistsInDeployment, loadDeployedWorkflowState } from '@/lib/workflows/db-helpers'
-import { updateWorkflowRunCounts } from '@/lib/workflows/utils'
-import { Executor } from '@/executor'
-import { Serializer } from '@/serializer'
-import { RateLimiter } from '@/services/queue'
-import { mergeSubblockState } from '@/stores/workflows/server-utils'
+  executeJobInline,
+  executeScheduleJob,
+  releaseScheduleLock,
+} from '@/background/schedule-execution'
 
 export const dynamic = 'force-dynamic'
+export const maxDuration = 3600
 
 const logger = createLogger('ScheduledExecuteAPI')
+const WORKFLOW_CHUNK_SIZE = 100
+const JOB_CHUNK_SIZE = 100
+const MAX_TICK_DURATION_MS = 3 * 60 * 1000
+const STALE_SCHEDULE_CLAIM_MS = getMaxExecutionTimeout()
 
-// Maximum number of consecutive failures before disabling a schedule
-const MAX_CONSECUTIVE_FAILURES = 3
-
-/**
- * Calculate the next run time for a schedule
- * This is a wrapper around the utility function in schedule-utils.ts
- */
-function calculateNextRunTime(
-  schedule: typeof workflowSchedule.$inferSelect,
-  blocks: Record<string, BlockState>
-): Date {
-  // Look for either starter block or schedule trigger block
-  const scheduleBlock = Object.values(blocks).find(
-    (block) => block.type === 'starter' || block.type === 'schedule'
+const dueFilter = (queuedAt: Date) =>
+  and(
+    isNull(workflowSchedule.archivedAt),
+    lte(workflowSchedule.nextRunAt, queuedAt),
+    not(eq(workflowSchedule.status, 'disabled')),
+    ne(workflowSchedule.status, 'completed'),
+    or(
+      isNull(workflowSchedule.lastQueuedAt),
+      lt(workflowSchedule.lastQueuedAt, workflowSchedule.nextRunAt),
+      lt(workflowSchedule.lastQueuedAt, new Date(queuedAt.getTime() - STALE_SCHEDULE_CLAIM_MS))
+    )
   )
-  if (!scheduleBlock) throw new Error('No starter or schedule block found')
-  const scheduleType = getSubBlockValue(scheduleBlock, 'scheduleType')
-  const scheduleValues = getScheduleTimeValues(scheduleBlock)
 
-  if (schedule.cronExpression) {
-    const cron = new Cron(schedule.cronExpression)
-    const nextDate = cron.nextRun()
-    if (!nextDate) throw new Error('Invalid cron expression or no future occurrences')
-    return nextDate
-  }
+const activeWorkflowDeploymentFilter = () =>
+  sql`${workflowSchedule.deploymentVersionId} = (select ${workflowDeploymentVersion.id} from ${workflowDeploymentVersion} where ${workflowDeploymentVersion.workflowId} = ${workflowSchedule.workflowId} and ${workflowDeploymentVersion.isActive} = true)`
 
-  const lastRanAt = schedule.lastRanAt ? new Date(schedule.lastRanAt) : null
-  return calculateNextTime(scheduleType, scheduleValues, lastRanAt)
+const workflowScheduleFilter = (queuedAt: Date) =>
+  and(
+    dueFilter(queuedAt),
+    or(eq(workflowSchedule.sourceType, 'workflow'), isNull(workflowSchedule.sourceType)),
+    activeWorkflowDeploymentFilter()
+  )
+
+const jobScheduleFilter = (queuedAt: Date) =>
+  and(dueFilter(queuedAt), eq(workflowSchedule.sourceType, 'job'))
+
+function buildScheduleExecutionJobId(schedule: {
+  id: string
+  nextRunAt?: Date | null
+  lastQueuedAt?: Date | null
+}): string {
+  const occurrence =
+    schedule.nextRunAt?.toISOString() ?? schedule.lastQueuedAt?.toISOString() ?? 'due'
+  return `schedule_${sha256Hex(`${schedule.id}:${occurrence}`).slice(0, 32)}`
 }
 
-const EnvVarsSchema = z.record(z.string())
+function getNextRunFromCronExpression(cronExpression?: string | null): Date | null {
+  if (!cronExpression) return null
+  const cron = new Cron(cronExpression)
+  return cron.nextRun()
+}
 
-const runningExecutions = new Set<string>()
+async function claimWorkflowSchedules(queuedAt: Date, limit: number) {
+  if (limit <= 0) return []
 
-export async function GET() {
-  logger.info(`Scheduled execution triggered at ${new Date().toISOString()}`)
-  const requestId = generateRequestId()
-  const now = new Date()
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select({ id: workflowSchedule.id })
+      .from(workflowSchedule)
+      .where(workflowScheduleFilter(queuedAt))
+      .for('update', { skipLocked: true })
+      .limit(limit)
 
-  let dueSchedules: (typeof workflowSchedule.$inferSelect)[] = []
+    if (rows.length === 0) return []
+
+    return tx
+      .update(workflowSchedule)
+      .set({ lastQueuedAt: queuedAt, updatedAt: queuedAt })
+      .where(
+        and(
+          workflowScheduleFilter(queuedAt),
+          inArray(
+            workflowSchedule.id,
+            rows.map((row) => row.id)
+          )
+        )
+      )
+      .returning({
+        id: workflowSchedule.id,
+        workflowId: workflowSchedule.workflowId,
+        blockId: workflowSchedule.blockId,
+        cronExpression: workflowSchedule.cronExpression,
+        lastRanAt: workflowSchedule.lastRanAt,
+        failedCount: workflowSchedule.failedCount,
+        nextRunAt: workflowSchedule.nextRunAt,
+        lastQueuedAt: workflowSchedule.lastQueuedAt,
+        deploymentVersionId: workflowSchedule.deploymentVersionId,
+        sourceType: workflowSchedule.sourceType,
+      })
+  })
+}
+
+async function claimJobSchedules(queuedAt: Date, limit: number) {
+  if (limit <= 0) return []
+
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select({ id: workflowSchedule.id })
+      .from(workflowSchedule)
+      .where(jobScheduleFilter(queuedAt))
+      .for('update', { skipLocked: true })
+      .limit(limit)
+
+    if (rows.length === 0) return []
+
+    return tx
+      .update(workflowSchedule)
+      .set({ lastQueuedAt: queuedAt, updatedAt: queuedAt })
+      .where(
+        and(
+          jobScheduleFilter(queuedAt),
+          inArray(
+            workflowSchedule.id,
+            rows.map((row) => row.id)
+          )
+        )
+      )
+      .returning({
+        id: workflowSchedule.id,
+        cronExpression: workflowSchedule.cronExpression,
+        failedCount: workflowSchedule.failedCount,
+        lastQueuedAt: workflowSchedule.lastQueuedAt,
+        sourceType: workflowSchedule.sourceType,
+      })
+  })
+}
+
+type ClaimedSchedule = Awaited<ReturnType<typeof claimWorkflowSchedules>>[number]
+type ClaimedJob = Awaited<ReturnType<typeof claimJobSchedules>>[number]
+type WorkflowUtils = typeof import('@/lib/workflows/utils')
+type JobQueue = Awaited<ReturnType<typeof getJobQueue>>
+
+async function processScheduleItem(
+  schedule: ClaimedSchedule,
+  queuedAt: Date,
+  requestId: string,
+  jobQueue: JobQueue,
+  workflowUtils: WorkflowUtils
+) {
+  const queueTime = schedule.lastQueuedAt ?? queuedAt
+  const executionId = generateId()
+  const correlation = {
+    executionId,
+    requestId,
+    source: 'schedule' as const,
+    workflowId: schedule.workflowId!,
+    scheduleId: schedule.id,
+    triggerType: 'schedule',
+    scheduledFor: schedule.nextRunAt?.toISOString(),
+  }
+
+  const payload = {
+    scheduleId: schedule.id,
+    workflowId: schedule.workflowId!,
+    executionId,
+    requestId,
+    correlation,
+    blockId: schedule.blockId || undefined,
+    deploymentVersionId: schedule.deploymentVersionId || undefined,
+    cronExpression: schedule.cronExpression || undefined,
+    lastRanAt: schedule.lastRanAt?.toISOString(),
+    failedCount: schedule.failedCount || 0,
+    now: queueTime.toISOString(),
+    scheduledFor: schedule.nextRunAt?.toISOString(),
+  }
 
   try {
-    dueSchedules = await db
-      .select()
-      .from(workflowSchedule)
-      .where(
-        and(lte(workflowSchedule.nextRunAt, now), not(eq(workflowSchedule.status, 'disabled')))
+    const scheduleJobId = buildScheduleExecutionJobId(schedule)
+    const existingJob = await jobQueue.getJob(scheduleJobId)
+    if (existingJob && ['pending', 'processing'].includes(existingJob.status)) {
+      logger.info(`[${requestId}] Schedule execution job already exists`, {
+        scheduleId: schedule.id,
+        jobId: scheduleJobId,
+        status: existingJob.status,
+      })
+      return
+    }
+    if (existingJob) {
+      logger.info(`[${requestId}] Releasing stale schedule claim for finished job`, {
+        scheduleId: schedule.id,
+        jobId: scheduleJobId,
+        status: existingJob.status,
+      })
+      await releaseScheduleLock(
+        schedule.id,
+        requestId,
+        queuedAt,
+        `Released stale schedule ${schedule.id} for finished job ${scheduleJobId}`,
+        getNextRunFromCronExpression(schedule.cronExpression)
       )
-      .limit(10)
+      return
+    }
 
-    logger.debug(`[${requestId}] Successfully queried schedules: ${dueSchedules.length} found`)
+    const resolvedWorkflow = schedule.workflowId
+      ? await workflowUtils.getWorkflowById(schedule.workflowId)
+      : null
+    const resolvedWorkspaceId = resolvedWorkflow?.workspaceId
 
-    logger.info(`[${requestId}] Processing ${dueSchedules.length} due scheduled workflows`)
+    const jobId = await jobQueue.enqueue('schedule-execution', payload, {
+      jobId: scheduleJobId,
+      concurrencyKey: scheduleJobId,
+      metadata: {
+        workflowId: schedule.workflowId ?? undefined,
+        workspaceId: resolvedWorkspaceId ?? undefined,
+        correlation,
+      },
+    })
+    logger.info(
+      `[${requestId}] Queued schedule execution task ${jobId} for workflow ${schedule.workflowId}`
+    )
 
-    for (const schedule of dueSchedules) {
-      const executionId = uuidv4()
+    const queuedJob = await jobQueue.getJob(jobId)
+    if (queuedJob && !['pending', 'processing'].includes(queuedJob.status)) {
+      logger.info(`[${requestId}] Schedule execution job already finished`, {
+        scheduleId: schedule.id,
+        jobId,
+        status: queuedJob.status,
+      })
+      await releaseScheduleLock(
+        schedule.id,
+        requestId,
+        queuedAt,
+        `Released stale schedule ${schedule.id} for finished job ${jobId}`,
+        getNextRunFromCronExpression(schedule.cronExpression)
+      )
+      return
+    }
 
+    if (shouldExecuteInline()) {
       try {
-        if (runningExecutions.has(schedule.workflowId)) {
-          logger.debug(`[${requestId}] Skipping workflow ${schedule.workflowId} - already running`)
-          continue
-        }
-
-        runningExecutions.add(schedule.workflowId)
-        logger.debug(`[${requestId}] Starting execution of workflow ${schedule.workflowId}`)
-
-        const [workflowRecord] = await db
-          .select()
-          .from(workflow)
-          .where(eq(workflow.id, schedule.workflowId))
-          .limit(1)
-
-        if (!workflowRecord) {
-          logger.warn(`[${requestId}] Workflow ${schedule.workflowId} not found`)
-          runningExecutions.delete(schedule.workflowId)
-          continue
-        }
-
-        const actorUserId = await getApiKeyOwnerUserId(workflowRecord.pinnedApiKeyId)
-
-        if (!actorUserId) {
-          logger.warn(
-            `[${requestId}] Skipping schedule ${schedule.id}: pinned API key required to attribute usage.`
-          )
-          runningExecutions.delete(schedule.workflowId)
-          continue
-        }
-
-        // Check rate limits for scheduled execution (checks both personal and org subscriptions)
-        const userSubscription = await getHighestPrioritySubscription(actorUserId)
-
-        const rateLimiter = new RateLimiter()
-        const rateLimitCheck = await rateLimiter.checkRateLimitWithSubscription(
-          actorUserId,
-          userSubscription,
-          'schedule',
-          false // schedules are always sync
+        await jobQueue.startJob(jobId)
+        const output = await executeScheduleJob(payload)
+        await jobQueue.completeJob(jobId, output)
+      } catch (error) {
+        const errorMessage = toError(error).message
+        logger.error(
+          `[${requestId}] Schedule execution failed for workflow ${schedule.workflowId}`,
+          {
+            jobId,
+            error: errorMessage,
+          }
         )
-
-        if (!rateLimitCheck.allowed) {
-          logger.warn(
-            `[${requestId}] Rate limit exceeded for scheduled workflow ${schedule.workflowId}`,
-            {
-              userId: workflowRecord.userId,
-              remaining: rateLimitCheck.remaining,
-              resetAt: rateLimitCheck.resetAt,
-            }
-          )
-
-          // Retry in 5 minutes for rate limit
-          const retryDelay = 5 * 60 * 1000 // 5 minutes
-          const nextRetryAt = new Date(now.getTime() + retryDelay)
-
-          try {
-            await db
-              .update(workflowSchedule)
-              .set({
-                updatedAt: now,
-                nextRunAt: nextRetryAt,
-              })
-              .where(eq(workflowSchedule.id, schedule.id))
-
-            logger.debug(`[${requestId}] Updated next retry time due to rate limit`)
-          } catch (updateError) {
-            logger.error(`[${requestId}] Error updating schedule for rate limit:`, updateError)
-          }
-
-          runningExecutions.delete(schedule.workflowId)
-          continue
-        }
-
-        const usageCheck = await checkServerSideUsageLimits(actorUserId)
-        if (usageCheck.isExceeded) {
-          logger.warn(
-            `[${requestId}] User ${workflowRecord.userId} has exceeded usage limits. Skipping scheduled execution.`,
-            {
-              currentUsage: usageCheck.currentUsage,
-              limit: usageCheck.limit,
-              workflowId: schedule.workflowId,
-            }
-          )
-          try {
-            const deployedData = await loadDeployedWorkflowState(schedule.workflowId)
-            const nextRunAt = calculateNextRunTime(schedule, deployedData.blocks as any)
-            await db
-              .update(workflowSchedule)
-              .set({ updatedAt: now, nextRunAt })
-              .where(eq(workflowSchedule.id, schedule.id))
-          } catch (calcErr) {
-            logger.warn(
-              `[${requestId}] Unable to calculate nextRunAt while skipping schedule ${schedule.id}`,
-              calcErr
-            )
-          }
-          runningExecutions.delete(schedule.workflowId)
-          continue
-        }
-
-        // Execute scheduled workflow immediately (no queuing)
-        logger.info(`[${requestId}] Executing scheduled workflow ${schedule.workflowId}`)
-
         try {
-          const executionSuccess = await (async () => {
-            // Create logging session inside the execution callback
-            const loggingSession = new LoggingSession(
-              schedule.workflowId,
-              executionId,
-              'schedule',
-              requestId
-            )
-
-            try {
-              logger.debug(`[${requestId}] Loading deployed workflow ${schedule.workflowId}`)
-              const deployedData = await loadDeployedWorkflowState(schedule.workflowId)
-
-              const blocks = deployedData.blocks
-              const edges = deployedData.edges
-              const loops = deployedData.loops
-              const parallels = deployedData.parallels
-              logger.info(`[${requestId}] Loaded deployed workflow ${schedule.workflowId}`)
-
-              // Validate that the schedule's trigger block exists in the deployed state
-              if (schedule.blockId) {
-                const blockExists = await blockExistsInDeployment(
-                  schedule.workflowId,
-                  schedule.blockId
-                )
-                if (!blockExists) {
-                  logger.warn(
-                    `[${requestId}] Schedule trigger block ${schedule.blockId} not found in deployed workflow ${schedule.workflowId}. Skipping execution.`
-                  )
-                  return { skip: true, blocks: {} as Record<string, BlockState> }
-                }
-              }
-
-              const mergedStates = mergeSubblockState(blocks)
-
-              // Retrieve environment variables with workspace precedence
-              const { personalEncrypted, workspaceEncrypted } = await getPersonalAndWorkspaceEnv(
-                actorUserId,
-                workflowRecord.workspaceId || undefined
-              )
-              const variables = EnvVarsSchema.parse({
-                ...personalEncrypted,
-                ...workspaceEncrypted,
-              })
-
-              const currentBlockStates = await Object.entries(mergedStates).reduce(
-                async (accPromise, [id, block]) => {
-                  const acc = await accPromise
-                  acc[id] = await Object.entries(block.subBlocks).reduce(
-                    async (subAccPromise, [key, subBlock]) => {
-                      const subAcc = await subAccPromise
-                      let value = subBlock.value
-
-                      if (
-                        typeof value === 'string' &&
-                        value.includes('{{') &&
-                        value.includes('}}')
-                      ) {
-                        const matches = value.match(/{{([^}]+)}}/g)
-                        if (matches) {
-                          for (const match of matches) {
-                            const varName = match.slice(2, -2)
-                            const encryptedValue = variables[varName]
-                            if (!encryptedValue) {
-                              throw new Error(`Environment variable "${varName}" was not found`)
-                            }
-
-                            try {
-                              const { decrypted } = await decryptSecret(encryptedValue)
-                              value = (value as string).replace(match, decrypted)
-                            } catch (error: any) {
-                              logger.error(
-                                `[${requestId}] Error decrypting value for variable "${varName}"`,
-                                error
-                              )
-                              throw new Error(
-                                `Failed to decrypt environment variable "${varName}": ${error.message}`
-                              )
-                            }
-                          }
-                        }
-                      }
-
-                      subAcc[key] = value
-                      return subAcc
-                    },
-                    Promise.resolve({} as Record<string, any>)
-                  )
-                  return acc
-                },
-                Promise.resolve({} as Record<string, Record<string, any>>)
-              )
-
-              const decryptedEnvVars: Record<string, string> = {}
-              for (const [key, encryptedValue] of Object.entries(variables)) {
-                try {
-                  const { decrypted } = await decryptSecret(encryptedValue)
-                  decryptedEnvVars[key] = decrypted
-                } catch (error: any) {
-                  logger.error(
-                    `[${requestId}] Failed to decrypt environment variable "${key}"`,
-                    error
-                  )
-                  throw new Error(
-                    `Failed to decrypt environment variable "${key}": ${error.message}`
-                  )
-                }
-              }
-
-              // Process the block states to ensure response formats are properly parsed
-              const processedBlockStates = Object.entries(currentBlockStates).reduce(
-                (acc, [blockId, blockState]) => {
-                  // Check if this block has a responseFormat that needs to be parsed
-                  if (blockState.responseFormat && typeof blockState.responseFormat === 'string') {
-                    const responseFormatValue = blockState.responseFormat.trim()
-
-                    // Check for variable references like <start.input>
-                    if (responseFormatValue.startsWith('<') && responseFormatValue.includes('>')) {
-                      logger.debug(
-                        `[${requestId}] Response format contains variable reference for block ${blockId}`
-                      )
-                      // Keep variable references as-is - they will be resolved during execution
-                      acc[blockId] = blockState
-                    } else if (responseFormatValue === '') {
-                      // Empty string - remove response format
-                      acc[blockId] = {
-                        ...blockState,
-                        responseFormat: undefined,
-                      }
-                    } else {
-                      try {
-                        logger.debug(`[${requestId}] Parsing responseFormat for block ${blockId}`)
-                        // Attempt to parse the responseFormat if it's a string
-                        const parsedResponseFormat = JSON.parse(responseFormatValue)
-
-                        acc[blockId] = {
-                          ...blockState,
-                          responseFormat: parsedResponseFormat,
-                        }
-                      } catch (error) {
-                        logger.warn(
-                          `[${requestId}] Failed to parse responseFormat for block ${blockId}, using undefined`,
-                          error
-                        )
-                        // Set to undefined instead of keeping malformed JSON - this allows execution to continue
-                        acc[blockId] = {
-                          ...blockState,
-                          responseFormat: undefined,
-                        }
-                      }
-                    }
-                  } else {
-                    acc[blockId] = blockState
-                  }
-                  return acc
-                },
-                {} as Record<string, Record<string, any>>
-              )
-
-              // Get workflow variables
-              let workflowVariables = {}
-              if (workflowRecord.variables) {
-                try {
-                  if (typeof workflowRecord.variables === 'string') {
-                    workflowVariables = JSON.parse(workflowRecord.variables)
-                  } else {
-                    workflowVariables = workflowRecord.variables
-                  }
-                } catch (error) {
-                  logger.error(`Failed to parse workflow variables: ${schedule.workflowId}`, error)
-                }
-              }
-
-              const serializedWorkflow = new Serializer().serializeWorkflow(
-                mergedStates,
-                edges,
-                loops,
-                parallels,
-                true // Enable validation during execution
-              )
-
-              const input = {
-                _context: {
-                  workflowId: schedule.workflowId,
-                },
-              }
-
-              // Start logging with environment variables
-              await loggingSession.safeStart({
-                userId: actorUserId,
-                workspaceId: workflowRecord.workspaceId || '',
-                variables: variables || {},
-              })
-
-              const executor = new Executor({
-                workflow: serializedWorkflow,
-                currentBlockStates: processedBlockStates,
-                envVarValues: decryptedEnvVars,
-                workflowInput: input,
-                workflowVariables,
-                contextExtensions: {
-                  executionId,
-                  workspaceId: workflowRecord.workspaceId || '',
-                  isDeployedContext: true,
-                },
-              })
-
-              // Set up logging on the executor
-              loggingSession.setupExecutor(executor)
-
-              const result = await executor.execute(
-                schedule.workflowId,
-                schedule.blockId || undefined
-              )
-
-              const executionResult =
-                'stream' in result && 'execution' in result ? result.execution : result
-
-              logger.info(`[${requestId}] Workflow execution completed: ${schedule.workflowId}`, {
-                success: executionResult.success,
-                executionTime: executionResult.metadata?.duration,
-              })
-
-              if (executionResult.success) {
-                await updateWorkflowRunCounts(schedule.workflowId)
-
-                try {
-                  await db
-                    .update(userStats)
-                    .set({
-                      totalScheduledExecutions: sql`total_scheduled_executions + 1`,
-                      lastActive: now,
-                    })
-                    .where(eq(userStats.userId, actorUserId))
-
-                  logger.debug(`[${requestId}] Updated user stats for scheduled execution`)
-                } catch (statsError) {
-                  logger.error(`[${requestId}] Error updating user stats:`, statsError)
-                }
-              }
-
-              const { traceSpans, totalDuration } = buildTraceSpans(executionResult)
-
-              // Complete logging
-              await loggingSession.safeComplete({
-                endedAt: new Date().toISOString(),
-                totalDurationMs: totalDuration || 0,
-                finalOutput: executionResult.output || {},
-                traceSpans: (traceSpans || []) as any,
-              })
-
-              return { success: executionResult.success, blocks, executionResult }
-            } catch (earlyError: any) {
-              // Handle errors that occur before workflow execution (e.g., missing data, env vars, etc.)
-              logger.error(
-                `[${requestId}] Early failure in scheduled workflow ${schedule.workflowId}`,
-                earlyError
-              )
-
-              // Create a minimal log entry for early failures
-              try {
-                await loggingSession.safeStart({
-                  userId: workflowRecord.userId,
-                  workspaceId: workflowRecord.workspaceId || '',
-                  variables: {},
-                })
-
-                await loggingSession.safeCompleteWithError({
-                  error: {
-                    message: `Schedule execution failed before workflow started: ${earlyError.message}`,
-                    stackTrace: earlyError.stack,
-                  },
-                  traceSpans: [],
-                })
-              } catch (loggingError) {
-                logger.error(
-                  `[${requestId}] Failed to create log entry for early schedule failure`,
-                  loggingError
-                )
-              }
-
-              // Re-throw the error to be handled by the outer catch block
-              throw earlyError
-            }
-          })()
-
-          // Check if execution was skipped (e.g., trigger block not found)
-          if ('skip' in executionSuccess && executionSuccess.skip) {
-            runningExecutions.delete(schedule.workflowId)
-            continue
-          }
-
-          if (executionSuccess.success) {
-            logger.info(`[${requestId}] Workflow ${schedule.workflowId} executed successfully`)
-
-            const nextRunAt = calculateNextRunTime(schedule, executionSuccess.blocks)
-
-            logger.debug(
-              `[${requestId}] Calculated next run time: ${nextRunAt.toISOString()} for workflow ${schedule.workflowId}`
-            )
-
-            try {
-              await db
-                .update(workflowSchedule)
-                .set({
-                  lastRanAt: now,
-                  updatedAt: now,
-                  nextRunAt,
-                  failedCount: 0, // Reset failure count on success
-                })
-                .where(eq(workflowSchedule.id, schedule.id))
-
-              logger.debug(
-                `[${requestId}] Updated next run time for workflow ${schedule.workflowId} to ${nextRunAt.toISOString()}`
-              )
-            } catch (updateError) {
-              logger.error(`[${requestId}] Error updating schedule after success:`, updateError)
-            }
-          } else {
-            logger.warn(`[${requestId}] Workflow ${schedule.workflowId} execution failed`)
-
-            const newFailedCount = (schedule.failedCount || 0) + 1
-            const shouldDisable = newFailedCount >= MAX_CONSECUTIVE_FAILURES
-            const nextRunAt = calculateNextRunTime(schedule, executionSuccess.blocks)
-
-            if (shouldDisable) {
-              logger.warn(
-                `[${requestId}] Disabling schedule for workflow ${schedule.workflowId} after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`
-              )
-            }
-
-            try {
-              await db
-                .update(workflowSchedule)
-                .set({
-                  updatedAt: now,
-                  nextRunAt,
-                  failedCount: newFailedCount,
-                  lastFailedAt: now,
-                  status: shouldDisable ? 'disabled' : 'active',
-                })
-                .where(eq(workflowSchedule.id, schedule.id))
-
-              logger.debug(`[${requestId}] Updated schedule after failure`)
-            } catch (updateError) {
-              logger.error(`[${requestId}] Error updating schedule after failure:`, updateError)
-            }
-          }
-        } catch (error: any) {
-          // Handle sync queue overload
-          if (error.message?.includes('Service overloaded')) {
-            logger.warn(`[${requestId}] Service overloaded, retrying schedule in 5 minutes`)
-
-            const retryDelay = 5 * 60 * 1000 // 5 minutes
-            const nextRetryAt = new Date(now.getTime() + retryDelay)
-
-            try {
-              await db
-                .update(workflowSchedule)
-                .set({
-                  updatedAt: now,
-                  nextRunAt: nextRetryAt,
-                })
-                .where(eq(workflowSchedule.id, schedule.id))
-
-              logger.debug(`[${requestId}] Updated schedule retry time due to service overload`)
-            } catch (updateError) {
-              logger.error(
-                `[${requestId}] Error updating schedule for service overload:`,
-                updateError
-              )
-            }
-          } else {
-            logger.error(
-              `[${requestId}] Error executing scheduled workflow ${schedule.workflowId}`,
-              error
-            )
-
-            // Ensure we create a log entry for this failed execution
-            try {
-              const failureLoggingSession = new LoggingSession(
-                schedule.workflowId,
-                executionId,
-                'schedule',
-                requestId
-              )
-
-              await failureLoggingSession.safeStart({
-                userId: workflowRecord.userId,
-                workspaceId: workflowRecord.workspaceId || '',
-                variables: {},
-              })
-
-              await failureLoggingSession.safeCompleteWithError({
-                error: {
-                  message: `Schedule execution failed: ${error.message}`,
-                  stackTrace: error.stack,
-                },
-                traceSpans: [],
-              })
-            } catch (loggingError) {
-              logger.error(
-                `[${requestId}] Failed to create log entry for failed schedule execution`,
-                loggingError
-              )
-            }
-
-            let nextRunAt: Date
-            try {
-              const [workflowRecord] = await db
-                .select()
-                .from(workflow)
-                .where(eq(workflow.id, schedule.workflowId))
-                .limit(1)
-
-              if (workflowRecord?.isDeployed) {
-                try {
-                  const deployedData = await loadDeployedWorkflowState(schedule.workflowId)
-                  nextRunAt = calculateNextRunTime(schedule, deployedData.blocks as any)
-                } catch {
-                  nextRunAt = new Date(now.getTime() + 24 * 60 * 60 * 1000)
-                }
-              } else {
-                nextRunAt = new Date(now.getTime() + 24 * 60 * 60 * 1000)
-              }
-            } catch (workflowError) {
-              logger.error(
-                `[${requestId}] Error retrieving workflow for next run calculation`,
-                workflowError
-              )
-              nextRunAt = new Date(now.getTime() + 24 * 60 * 60 * 1000) // 24 hours as a fallback
-            }
-
-            const newFailedCount = (schedule.failedCount || 0) + 1
-            const shouldDisable = newFailedCount >= MAX_CONSECUTIVE_FAILURES
-
-            if (shouldDisable) {
-              logger.warn(
-                `[${requestId}] Disabling schedule for workflow ${schedule.workflowId} after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`
-              )
-            }
-
-            try {
-              await db
-                .update(workflowSchedule)
-                .set({
-                  updatedAt: now,
-                  nextRunAt,
-                  failedCount: newFailedCount,
-                  lastFailedAt: now,
-                  status: shouldDisable ? 'disabled' : 'active',
-                })
-                .where(eq(workflowSchedule.id, schedule.id))
-
-              logger.debug(`[${requestId}] Updated schedule after execution error`)
-            } catch (updateError) {
-              logger.error(
-                `[${requestId}] Error updating schedule after execution error:`,
-                updateError
-              )
-            }
-          }
-        } finally {
-          runningExecutions.delete(schedule.workflowId)
+          await jobQueue.markJobFailed(jobId, errorMessage)
+        } catch (markFailedError) {
+          logger.error(`[${requestId}] Failed to mark job as failed`, {
+            jobId,
+            error: toError(markFailedError).message,
+          })
         }
-      } catch (error: any) {
-        logger.error(`[${requestId}] Error in scheduled execution handler`, error)
-        return NextResponse.json({ error: error.message }, { status: 500 })
+        await releaseScheduleLock(
+          schedule.id,
+          requestId,
+          queuedAt,
+          `Failed to release lock for schedule ${schedule.id} after inline execution failure`
+        )
       }
     }
+  } catch (error) {
+    logger.error(
+      `[${requestId}] Failed to queue schedule execution for workflow ${schedule.workflowId}`,
+      error
+    )
+    await releaseScheduleLock(
+      schedule.id,
+      requestId,
+      queuedAt,
+      `Failed to release lock for schedule ${schedule.id} after queue failure`
+    )
+  }
+}
+
+async function processJobItem(job: ClaimedJob, queuedAt: Date, requestId: string) {
+  const queueTime = job.lastQueuedAt ?? queuedAt
+  const payload = {
+    scheduleId: job.id,
+    cronExpression: job.cronExpression || undefined,
+    failedCount: job.failedCount || 0,
+    now: queueTime.toISOString(),
+  }
+
+  try {
+    await executeJobInline(payload)
+  } catch (error) {
+    logger.error(`[${requestId}] Job execution failed for ${job.id}`, {
+      error: toError(error).message,
+    })
+    await releaseScheduleLock(
+      job.id,
+      requestId,
+      queuedAt,
+      `Failed to release lock for job ${job.id}`
+    )
+  }
+}
+
+export const GET = withRouteHandler(async (request: NextRequest) => {
+  const requestId = generateRequestId()
+  const tickStart = Date.now()
+  logger.info(`[${requestId}] Scheduled execution triggered at ${new Date().toISOString()}`)
+
+  const authError = verifyCronAuth(request, 'Schedule execution')
+  if (authError) {
+    return authError
+  }
+
+  try {
+    const jobQueue = await getJobQueue()
+    let workflowUtils: WorkflowUtils | undefined
+
+    let totalSchedules = 0
+    let totalJobs = 0
+    let iterations = 0
+    let schedulesExhausted = false
+    let jobsExhausted = false
+
+    while (Date.now() - tickStart < MAX_TICK_DURATION_MS) {
+      if (schedulesExhausted && jobsExhausted) break
+      const queuedAt = new Date()
+
+      const [dueSchedules, dueJobs] = await Promise.all([
+        schedulesExhausted ? [] : claimWorkflowSchedules(queuedAt, WORKFLOW_CHUNK_SIZE),
+        jobsExhausted ? [] : claimJobSchedules(queuedAt, JOB_CHUNK_SIZE),
+      ])
+
+      if (dueSchedules.length < WORKFLOW_CHUNK_SIZE) schedulesExhausted = true
+      if (dueJobs.length < JOB_CHUNK_SIZE) jobsExhausted = true
+
+      if (dueSchedules.length === 0 && dueJobs.length === 0) break
+
+      iterations += 1
+      totalSchedules += dueSchedules.length
+      totalJobs += dueJobs.length
+
+      logger.info(
+        `[${requestId}] Iteration ${iterations}: claimed ${dueSchedules.length} schedules, ${dueJobs.length} jobs`
+      )
+
+      if (dueSchedules.length > 0 && !workflowUtils) {
+        workflowUtils = await import('@/lib/workflows/utils')
+      }
+
+      const loadedWorkflowUtils = workflowUtils
+      const schedulePromises =
+        loadedWorkflowUtils && dueSchedules.length > 0
+          ? dueSchedules.map((schedule) =>
+              processScheduleItem(schedule, queuedAt, requestId, jobQueue, loadedWorkflowUtils)
+            )
+          : []
+
+      await Promise.allSettled([
+        ...schedulePromises,
+        ...dueJobs.map((job) => processJobItem(job, queuedAt, requestId)),
+      ])
+    }
+
+    const totalCount = totalSchedules + totalJobs
+    const durationMs = Date.now() - tickStart
+    logger.info(
+      `[${requestId}] Processed ${totalCount} items across ${iterations} iteration(s) in ${durationMs}ms (${totalSchedules} schedules, ${totalJobs} jobs)`
+    )
+
+    return NextResponse.json({
+      message: 'Scheduled workflow executions processed',
+      executedCount: totalCount,
+    })
   } catch (error: any) {
     logger.error(`[${requestId}] Error in scheduled execution handler`, error)
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
-
-  return NextResponse.json({
-    message: 'Scheduled workflow executions processed',
-    executedCount: dueSchedules.length,
-  })
-}
+})

@@ -1,28 +1,45 @@
 import { useCallback, useRef, useState } from 'react'
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
+import { useQueryClient } from '@tanstack/react-query'
+import { requestRaw } from '@/lib/api/client'
+import { wandGenerateStreamContract } from '@/lib/api/contracts'
+import { readSSEStream } from '@/lib/core/utils/sse'
 import type { GenerationType } from '@/blocks/types'
+import { subscriptionKeys } from '@/hooks/queries/subscription'
+import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 
 const logger = createLogger('useWand')
 
+interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'
+  content: string
+}
+
+interface BuildWandContextInfoOptions {
+  currentValue?: string
+  generationType?: string
+}
+
 /**
- * Builds rich context information based on current content and generation type
+ * Builds rich context information based on current content and generation type.
+ * Note: Table schema context is now fetched server-side in /api/wand for simplicity.
  */
-function buildContextInfo(currentValue?: string, generationType?: string): string {
-  if (!currentValue || currentValue.trim() === '') {
-    return 'no current content'
-  }
+function buildWandContextInfo({
+  currentValue,
+  generationType,
+}: BuildWandContextInfoOptions): string {
+  const hasContent = Boolean(currentValue && currentValue.trim() !== '')
+  const contentLength = currentValue?.length ?? 0
+  const lineCount = currentValue ? currentValue.split('\n').length : 0
 
-  const contentLength = currentValue.length
-  const lineCount = currentValue.split('\n').length
+  let contextInfo = hasContent
+    ? `Current content (${contentLength} characters, ${lineCount} lines):\n${currentValue}`
+    : 'no current content'
 
-  let contextInfo = `Current content (${contentLength} characters, ${lineCount} lines):\n${currentValue}`
-
-  // Add type-specific context analysis
-  if (generationType) {
+  if (generationType && currentValue) {
     switch (generationType) {
       case 'javascript-function-body':
       case 'typescript-function-body': {
-        // Analyze code structure
         const hasFunction = /function\s+\w+/.test(currentValue)
         const hasArrowFunction = /=>\s*{/.test(currentValue)
         const hasReturn = /return\s+/.test(currentValue)
@@ -32,7 +49,7 @@ function buildContextInfo(currentValue?: string, generationType?: string): strin
 
       case 'json-schema':
       case 'json-object':
-        // Analyze JSON structure
+      case 'table-schema':
         try {
           const parsed = JSON.parse(currentValue)
           const keys = Object.keys(parsed)
@@ -47,11 +64,6 @@ function buildContextInfo(currentValue?: string, generationType?: string): strin
   return contextInfo
 }
 
-interface ChatMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string
-}
-
 export interface WandConfig {
   enabled: boolean
   prompt: string
@@ -61,8 +73,11 @@ export interface WandConfig {
 }
 
 interface UseWandProps {
-  wandConfig: WandConfig
+  wandConfig?: WandConfig
   currentValue?: string
+  contextParams?: {
+    tableId?: string | null
+  }
   onGeneratedContent: (content: string) => void
   onStreamChunk?: (chunk: string) => void
   onStreamStart?: () => void
@@ -72,18 +87,20 @@ interface UseWandProps {
 export function useWand({
   wandConfig,
   currentValue,
+  contextParams,
   onGeneratedContent,
   onStreamChunk,
   onStreamStart,
   onGenerationComplete,
 }: UseWandProps) {
+  const queryClient = useQueryClient()
+  const workflowId = useWorkflowRegistry((state) => state.hydration.workflowId)
   const [isLoading, setIsLoading] = useState(false)
   const [isPromptVisible, setIsPromptVisible] = useState(false)
   const [promptInputValue, setPromptInputValue] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [isStreaming, setIsStreaming] = useState(false)
 
-  // Conversation history state
   const [conversationHistory, setConversationHistory] = useState<ChatMessage[]>([])
 
   const abortControllerRef = useRef<AbortController | null>(null)
@@ -131,7 +148,7 @@ export function useWand({
         return
       }
 
-      if (!wandConfig.enabled) {
+      if (!wandConfig?.enabled) {
         setError('Wand is not enabled.')
         return
       }
@@ -143,103 +160,60 @@ export function useWand({
 
       abortControllerRef.current = new AbortController()
 
-      // Signal the start of streaming to clear previous content
       if (onStreamStart) {
         onStreamStart()
       }
 
       try {
-        // Build context-aware message
-        const contextInfo = buildContextInfo(currentValue, wandConfig.generationType)
+        const contextInfo = buildWandContextInfo({
+          currentValue,
+          generationType: wandConfig?.generationType,
+        })
 
-        // Build the system prompt with context information
-        let systemPrompt = wandConfig.prompt
+        let systemPrompt = wandConfig?.prompt || ''
         if (systemPrompt.includes('{context}')) {
           systemPrompt = systemPrompt.replace('{context}', contextInfo)
         }
 
-        // User message is just the user's specific request
         const userMessage = prompt
 
-        // Keep track of the current prompt for history
         const currentPrompt = prompt
 
-        const response = await fetch('/api/wand-generate', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache, no-transform',
+        const response = await requestRaw(
+          wandGenerateStreamContract,
+          {
+            body: {
+              prompt: userMessage,
+              systemPrompt: systemPrompt,
+              stream: true,
+              history: wandConfig?.maintainHistory ? conversationHistory : [],
+              generationType: wandConfig?.generationType,
+              workflowId: workflowId ?? undefined,
+              wandContext: contextParams?.tableId ? { tableId: contextParams.tableId } : undefined,
+            },
+            signal: abortControllerRef.current.signal,
           },
-          body: JSON.stringify({
-            prompt: userMessage,
-            systemPrompt: systemPrompt, // Send the processed system prompt with context
-            stream: true,
-            history: wandConfig.maintainHistory ? conversationHistory : [], // Include history if enabled
-          }),
-          signal: abortControllerRef.current.signal,
-          cache: 'no-store',
-        })
-
-        if (!response.ok) {
-          const errorText = await response.text()
-          throw new Error(errorText || `HTTP error! status: ${response.status}`)
-        }
+          {
+            headers: {
+              'Cache-Control': 'no-cache, no-transform',
+            },
+            cache: 'no-store',
+          }
+        )
 
         if (!response.body) {
           throw new Error('Response body is null')
         }
 
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let accumulatedContent = ''
-
-        try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-
-            const chunk = decoder.decode(value)
-            const lines = chunk.split('\n\n')
-
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const lineData = line.substring(6)
-
-                if (lineData === '[DONE]') {
-                  continue
-                }
-
-                try {
-                  const data = JSON.parse(lineData)
-
-                  if (data.error) {
-                    throw new Error(data.error)
-                  }
-
-                  if (data.chunk) {
-                    accumulatedContent += data.chunk
-                    if (onStreamChunk) {
-                      onStreamChunk(data.chunk)
-                    }
-                  }
-
-                  if (data.done) {
-                    break
-                  }
-                } catch (parseError) {
-                  logger.debug('Failed to parse SSE line', { line, parseError })
-                }
-              }
-            }
-          }
-        } finally {
-          reader.releaseLock()
-        }
+        const accumulatedContent = await readSSEStream(response.body, {
+          onChunk: onStreamChunk,
+          signal: abortControllerRef.current?.signal,
+        })
 
         if (accumulatedContent) {
           onGeneratedContent(accumulatedContent)
 
-          if (wandConfig.maintainHistory) {
+          if (wandConfig?.maintainHistory) {
             setConversationHistory((prev) => [
               ...prev,
               { role: 'user', content: currentPrompt },
@@ -256,6 +230,10 @@ export function useWand({
           prompt,
           contentLength: accumulatedContent.length,
         })
+
+        setTimeout(() => {
+          queryClient.invalidateQueries({ queryKey: subscriptionKeys.all })
+        }, 1000)
       } catch (error: any) {
         if (error.name === 'AbortError') {
           logger.debug('Wand generation cancelled')
@@ -276,6 +254,9 @@ export function useWand({
       onStreamChunk,
       onStreamStart,
       onGenerationComplete,
+      queryClient,
+      contextParams?.tableId,
+      workflowId,
     ]
   )
 

@@ -11,6 +11,42 @@ export default {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        season: ['var(--font-season)'],
+        body: [
+          'ui-sans-serif',
+          '-apple-system',
+          'system-ui',
+          'Segoe UI',
+          'Helvetica',
+          'Apple Color Emoji',
+          'Arial',
+          'sans-serif',
+          'Segoe UI Emoji',
+          'Segoe UI Symbol',
+        ],
+        mono: [
+          'var(--font-martian-mono, ui-monospace)',
+          'SFMono-Regular',
+          'Menlo',
+          'Monaco',
+          'Consolas',
+          '"Liberation Mono"',
+          '"Courier New"',
+          'monospace',
+        ],
+      },
+      fontSize: {
+        micro: '10px',
+        xs: '11px',
+        caption: '12px',
+        small: '13px',
+        base: '15px',
+        md: '16px',
+      },
+      spacing: {
+        '4.5': '18px',
+      },
       colors: {
         background: 'hsl(var(--background))',
         foreground: 'hsl(var(--foreground))',
@@ -56,15 +92,45 @@ export default {
           primary: 'hsl(var(--gradient-primary))',
           secondary: 'hsl(var(--gradient-secondary))',
         },
+        gray: {
+          50: '#fafafa',
+          100: '#f5f5f5',
+          200: '#e5e5e5',
+          300: '#d4d4d4',
+          400: '#a3a3a3',
+          500: '#737373',
+          600: '#525252',
+          700: '#404040',
+          800: '#262626',
+          900: '#171717',
+          950: '#0a0a0a',
+        },
       },
       fontWeight: {
-        medium: '460',
-        semibold: '540',
+        base: 'var(--font-weight-base)',
+        medium: 'var(--font-weight-medium)',
+        semibold: 'var(--font-weight-semibold)',
       },
       borderRadius: {
-        lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
+        xs: '2px',
         sm: 'calc(var(--radius) - 4px)',
+        md: 'calc(var(--radius) - 2px)',
+        lg: 'var(--radius)',
+      },
+      boxShadow: {
+        subtle: 'var(--shadow-subtle)',
+        medium: 'var(--shadow-medium)',
+        overlay: 'var(--shadow-overlay)',
+        kbd: 'var(--shadow-kbd)',
+        'kbd-sm': 'var(--shadow-kbd-sm)',
+        'brand-inset': 'var(--shadow-brand-inset)',
+        card: 'var(--shadow-card)',
+      },
+      dropShadow: {
+        tour: [
+          '0 0 0.5px color-mix(in srgb, var(--text-primary) 10%, transparent)',
+          '0 4px 12px rgba(0,0,0,0.1)',
+        ],
       },
       transitionProperty: {
         width: 'width',
@@ -72,92 +138,12 @@ export default {
         padding: 'padding',
       },
       keyframes: {
-        'slide-down': {
-          '0%': {
-            transform: 'translate(-50%, -100%)',
-            opacity: '0',
-          },
-          '100%': {
-            transform: 'translate(-50%, 0)',
-            opacity: '1',
-          },
-        },
-        'notification-slide': {
-          '0%': {
-            opacity: '0',
-            transform: 'translateY(-100%)',
-          },
-          '100%': {
-            opacity: '1',
-            transform: 'translateY(0)',
-          },
-        },
-        'notification-fade-out': {
-          '0%': {
-            opacity: '1',
-            transform: 'translateY(0)',
-          },
-          '100%': {
-            opacity: '0',
-            transform: 'translateY(0)',
-          },
-        },
-        'fade-up': {
-          '0%': {
-            opacity: '0',
-            transform: 'translateY(10px)',
-          },
-          '100%': {
-            opacity: '1',
-            transform: 'translateY(0)',
-          },
-        },
-        'rocket-pulse': {
-          '0%, 100%': {
-            opacity: '1',
-          },
-          '50%': {
-            opacity: '0.7',
-          },
-        },
-        'run-glow': {
-          '0%, 100%': {
-            filter: 'opacity(1)',
-          },
-          '50%': {
-            filter: 'opacity(0.7)',
-          },
-        },
         'caret-blink': {
           '0%,70%,100%': {
             opacity: '1',
           },
           '20%,50%': {
             opacity: '0',
-          },
-        },
-        'pulse-slow': {
-          '0%, 100%': {
-            opacity: '1',
-          },
-          '50%': {
-            opacity: '0.7',
-          },
-        },
-        'accordion-down': {
-          from: {
-            height: '0',
-          },
-          to: {
-            height: 'var(--radix-accordion-content-height)',
-          },
-        },
-        'accordion-up': {
-          from: {
-            height: 'var(--radix-accordion-content-height)',
-          },
-          to: {
-            height: '0',
           },
         },
         'slide-left': {
@@ -176,22 +162,84 @@ export default {
             transform: 'translateX(0)',
           },
         },
+        'dash-animation': {
+          from: {
+            strokeDashoffset: '0',
+          },
+          to: {
+            strokeDashoffset: '-24',
+          },
+        },
+        'placeholder-pulse': {
+          '0%, 100%': {
+            opacity: '0.5',
+          },
+          '50%': {
+            opacity: '0.8',
+          },
+        },
+        'ring-pulse': {
+          '0%, 100%': {
+            'box-shadow': '0 0 0 1.5px var(--border-success)',
+          },
+          '50%': {
+            'box-shadow': '0 0 0 4px var(--border-success)',
+          },
+        },
+        'stream-fade-in': {
+          from: { opacity: '0' },
+          to: { opacity: '1' },
+        },
+        'thinking-block': {
+          '0%, 100%': { opacity: '0.15' },
+          '30%, 55%': { opacity: '1' },
+        },
+        'slide-in-right': {
+          from: { transform: 'translateX(40px)' },
+          to: { transform: 'translateX(0)' },
+        },
+        'slide-in-bottom': {
+          from: { opacity: '0', transform: 'translateY(20px)' },
+          to: { opacity: '1', transform: 'translateY(0)' },
+        },
+        'tour-tooltip-in': {
+          from: { opacity: '0', transform: 'scale(0.96) translateY(4px)' },
+          to: { opacity: '1', transform: 'scale(1) translateY(0)' },
+        },
+        'collapsible-down': {
+          from: { height: '0' },
+          to: { height: 'var(--radix-collapsible-content-height)' },
+        },
+        'collapsible-up': {
+          from: { height: 'var(--radix-collapsible-content-height)' },
+          to: { height: '0' },
+        },
       },
       animation: {
-        'slide-down': 'slide-down 0.3s ease-out',
-        'notification-slide': 'notification-slide 0.3s ease-out forwards',
-        'notification-fade-out': 'notification-fade-out 0.2s ease-out forwards',
-        'fade-up': 'fade-up 0.5s ease-out forwards',
-        'rocket-pulse': 'rocket-pulse 1.5s ease-in-out infinite',
-        'run-glow': 'run-glow 2s ease-in-out infinite',
         'caret-blink': 'caret-blink 1.25s ease-out infinite',
-        'pulse-slow': 'pulse-slow 3s ease-in-out infinite',
-        'accordion-down': 'accordion-down 0.2s ease-out',
-        'accordion-up': 'accordion-up 0.2s ease-out',
         'slide-left': 'slide-left 80s linear infinite',
         'slide-right': 'slide-right 80s linear infinite',
+        'dash-animation': 'dash-animation 1.5s linear infinite',
+        'placeholder-pulse': 'placeholder-pulse 1.5s ease-in-out infinite',
+        'ring-pulse': 'ring-pulse 1.5s ease-in-out infinite',
+        'stream-fade-in': 'stream-fade-in 300ms ease-out forwards',
+        'stream-fade-in-delayed': 'stream-fade-in 300ms ease-out 1.5s forwards',
+        'thinking-block': 'thinking-block 1.6s ease-in-out infinite',
+        'slide-in-right': 'slide-in-right 350ms ease-out forwards',
+        'slide-in-bottom': 'slide-in-bottom 400ms cubic-bezier(0.16, 1, 0.3, 1)',
+        'tour-tooltip-in': 'tour-tooltip-in 200ms cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+        'collapsible-down': 'collapsible-down 300ms cubic-bezier(0.4, 0, 0.2, 1)',
+        'collapsible-up': 'collapsible-up 300ms cubic-bezier(0.4, 0, 0.2, 1)',
       },
     },
   },
-  plugins: [require('tailwindcss-animate')],
+  plugins: [
+    require('tailwindcss-animate'),
+    require('@tailwindcss/typography'),
+    require('tailwindcss/plugin')(
+      ({ addVariant }: { addVariant: (name: string, definition: string) => void }) => {
+        addVariant('hover-hover', '@media (hover: hover) and (pointer: fine) { &:hover }')
+      }
+    ),
+  ],
 } satisfies Config

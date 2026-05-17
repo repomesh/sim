@@ -2,7 +2,8 @@
  * Cost calculation functions for tokenization
  */
 
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
+import { toError } from '@sim/utils/errors'
 import { createTokenizationError } from '@/lib/tokenization/errors'
 import {
   estimateInputTokens,
@@ -57,8 +58,8 @@ export function calculateStreamingCost(
 
     // Create token usage object
     const tokens: TokenUsage = {
-      prompt: totalPromptTokens,
-      completion: completionTokens,
+      input: totalPromptTokens,
+      output: completionTokens,
       total: totalTokens,
     }
 
@@ -95,7 +96,7 @@ export function calculateStreamingCost(
       model,
       inputLength: inputText?.length || 0,
       outputLength: outputText?.length || 0,
-      error: error instanceof Error ? error.message : String(error),
+      error: toError(error).message,
     })
 
     if (error instanceof Error && error.name === 'TokenizationError') {
@@ -104,7 +105,7 @@ export function calculateStreamingCost(
 
     throw createTokenizationError(
       'CALCULATION_FAILED',
-      `Failed to calculate streaming cost: ${error instanceof Error ? error.message : String(error)}`,
+      `Failed to calculate streaming cost: ${toError(error).message}`,
       { model, inputLength: inputText?.length || 0, outputLength: outputText?.length || 0 }
     )
   }

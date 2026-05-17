@@ -1,39 +1,24 @@
 import { db } from '@sim/db'
 import { permissions, workflow, workflowExecutionLogs } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
+import { generateId } from '@sim/utils/id'
 import { and, eq, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
-import { createLogger } from '@/lib/logs/console/logger'
+import { v1ListLogsContract } from '@/lib/api/contracts/v1/logs'
+import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { buildLogFilters, getOrderBy } from '@/app/api/v1/logs/filters'
 import { createApiResponse, getUserLimits } from '@/app/api/v1/logs/meta'
-import { checkRateLimit, createRateLimitResponse } from '@/app/api/v1/middleware'
+import {
+  checkRateLimit,
+  checkWorkspaceScope,
+  createRateLimitResponse,
+} from '@/app/api/v1/middleware'
 
 const logger = createLogger('V1LogsAPI')
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
-
-const QueryParamsSchema = z.object({
-  workspaceId: z.string(),
-  workflowIds: z.string().optional(),
-  folderIds: z.string().optional(),
-  triggers: z.string().optional(),
-  level: z.enum(['info', 'error']).optional(),
-  startDate: z.string().optional(),
-  endDate: z.string().optional(),
-  executionId: z.string().optional(),
-  minDurationMs: z.coerce.number().optional(),
-  maxDurationMs: z.coerce.number().optional(),
-  minCost: z.coerce.number().optional(),
-  maxCost: z.coerce.number().optional(),
-  model: z.string().optional(),
-  details: z.enum(['basic', 'full']).optional().default('basic'),
-  includeTraceSpans: z.coerce.boolean().optional().default(false),
-  includeFinalOutput: z.coerce.boolean().optional().default(false),
-  limit: z.coerce.number().optional().default(100),
-  cursor: z.string().optional(),
-  order: z.enum(['desc', 'asc']).optional().default('desc'),
-})
 
 interface CursorData {
   startedAt: string
@@ -52,8 +37,8 @@ function decodeCursor(cursor: string): CursorData | null {
   }
 }
 
-export async function GET(request: NextRequest) {
-  const requestId = crypto.randomUUID().slice(0, 8)
+export const GET = withRouteHandler(async (request: NextRequest) => {
+  const requestId = generateId().slice(0, 8)
 
   try {
     const rateLimit = await checkRateLimit(request, 'logs')
@@ -62,18 +47,27 @@ export async function GET(request: NextRequest) {
     }
 
     const userId = rateLimit.userId!
-    const { searchParams } = new URL(request.url)
-    const rawParams = Object.fromEntries(searchParams.entries())
+    const parsed = await parseRequest(
+      v1ListLogsContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) =>
+          NextResponse.json(
+            {
+              error: getValidationErrorMessage(error, 'Invalid parameters'),
+              details: error.issues,
+            },
+            { status: 400 }
+          ),
+      }
+    )
+    if (!parsed.success) return parsed.response
 
-    const validationResult = QueryParamsSchema.safeParse(rawParams)
-    if (!validationResult.success) {
-      return NextResponse.json(
-        { error: 'Invalid parameters', details: validationResult.error.errors },
-        { status: 400 }
-      )
-    }
+    const params = parsed.data.query
 
-    const params = validationResult.data
+    const scopeError = checkWorkspaceScope(rateLimit, params.workspaceId)
+    if (scopeError) return scopeError
 
     logger.info(`[${requestId}] Fetching logs for workspace ${params.workspaceId}`, {
       userId,
@@ -84,7 +78,6 @@ export async function GET(request: NextRequest) {
       },
     })
 
-    // Build filter conditions
     const filters = {
       workspaceId: params.workspaceId,
       workflowIds: params.workflowIds?.split(',').filter(Boolean),
@@ -106,12 +99,12 @@ export async function GET(request: NextRequest) {
     const conditions = buildLogFilters(filters)
     const orderBy = getOrderBy(params.order)
 
-    // Build and execute query
     const baseQuery = db
       .select({
         id: workflowExecutionLogs.id,
         workflowId: workflowExecutionLogs.workflowId,
         executionId: workflowExecutionLogs.executionId,
+        deploymentVersionId: workflowExecutionLogs.deploymentVersionId,
         level: workflowExecutionLogs.level,
         trigger: workflowExecutionLogs.trigger,
         startedAt: workflowExecutionLogs.startedAt,
@@ -124,18 +117,12 @@ export async function GET(request: NextRequest) {
         workflowDescription: workflow.description,
       })
       .from(workflowExecutionLogs)
-      .innerJoin(
-        workflow,
-        and(
-          eq(workflowExecutionLogs.workflowId, workflow.id),
-          eq(workflow.workspaceId, params.workspaceId)
-        )
-      )
+      .leftJoin(workflow, eq(workflowExecutionLogs.workflowId, workflow.id))
       .innerJoin(
         permissions,
         and(
           eq(permissions.entityType, 'workspace'),
-          eq(permissions.entityId, params.workspaceId),
+          eq(permissions.entityId, workflowExecutionLogs.workspaceId),
           eq(permissions.userId, userId)
         )
       )
@@ -162,6 +149,7 @@ export async function GET(request: NextRequest) {
         id: log.id,
         workflowId: log.workflowId,
         executionId: log.executionId,
+        deploymentVersionId: log.deploymentVersionId,
         level: log.level,
         trigger: log.trigger,
         startedAt: log.startedAt.toISOString(),
@@ -174,8 +162,9 @@ export async function GET(request: NextRequest) {
       if (params.details === 'full') {
         result.workflow = {
           id: log.workflowId,
-          name: log.workflowName,
+          name: log.workflowName || 'Deleted Workflow',
           description: log.workflowDescription,
+          deleted: !log.workflowName,
         }
 
         if (log.cost) {
@@ -196,11 +185,8 @@ export async function GET(request: NextRequest) {
       return result
     })
 
-    // Get user's workflow execution limits and usage
     const limits = await getUserLimits(userId)
 
-    // Create response with limits information
-    // The rateLimit object from checkRateLimit is for THIS API endpoint's rate limits
     const response = createApiResponse(
       {
         data: formattedLogs,
@@ -215,4 +201,4 @@ export async function GET(request: NextRequest) {
     logger.error(`[${requestId}] Logs fetch error`, { error: error.message })
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

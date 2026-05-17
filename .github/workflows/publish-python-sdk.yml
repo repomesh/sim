@@ -6,12 +6,15 @@ on:
     paths:
       - 'packages/python-sdk/**'
 
+permissions:
+  contents: write
+
 jobs:
   publish-pypi:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
         uses: actions/setup-python@v5

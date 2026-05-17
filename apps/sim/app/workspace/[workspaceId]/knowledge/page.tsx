@@ -1,5 +1,8 @@
-import { Knowledge } from '@/app/workspace/[workspaceId]/knowledge/knowledge'
+import type { Metadata } from 'next'
+import { Knowledge } from './knowledge'
 
-export default function KnowledgePage() {
-  return <Knowledge />
+export const metadata: Metadata = {
+  title: 'Knowledge Base',
 }
+
+export default Knowledge

@@ -1,36 +1,34 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getPresignedUrl, isUsingCloudStorage, uploadFile } from '@/lib/uploads'
-import '@/lib/uploads/setup.server'
+import { sanitizeFileName } from '@/executor/constants'
+import '@/lib/uploads/core/setup.server'
+import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
+import {
+  uploadFilesFormFieldsSchema,
+  uploadFilesFormFilesSchema,
+} from '@/lib/api/contracts/storage-transfer'
+import { getValidationErrorMessage } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { captureServerEvent } from '@/lib/posthog/server'
+import type { StorageContext } from '@/lib/uploads/config'
+import { generateWorkspaceFileKey } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
+import { isImageFileType, resolveFileType } from '@/lib/uploads/utils/file-utils'
+import {
+  SUPPORTED_ATTACHMENT_EXTENSIONS,
+  SUPPORTED_IMAGE_EXTENSIONS,
+  validateFileType,
+} from '@/lib/uploads/utils/validation'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 import {
   createErrorResponse,
   createOptionsResponse,
   InvalidRequestError,
 } from '@/app/api/files/utils'
 
-// Allowlist of permitted file extensions for security
-const ALLOWED_EXTENSIONS = new Set([
-  // Documents
-  'pdf',
-  'doc',
-  'docx',
-  'txt',
-  'md',
-  // Images (safe formats)
-  'png',
-  'jpg',
-  'jpeg',
-  'gif',
-  // Data files
-  'csv',
-  'xlsx',
-  'xls',
-])
+const ALLOWED_EXTENSIONS = new Set<string>(SUPPORTED_ATTACHMENT_EXTENSIONS)
 
-/**
- * Validates file extension against allowlist
- */
 function validateFileExtension(filename: string): boolean {
   const extension = filename.split('.').pop()?.toLowerCase()
   if (!extension) return false
@@ -41,7 +39,7 @@ export const dynamic = 'force-dynamic'
 
 const logger = createLogger('FilesUploadAPI')
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
@@ -50,33 +48,44 @@ export async function POST(request: NextRequest) {
 
     const formData = await request.formData()
 
-    // Check if multiple files are being uploaded or a single file
-    const files = formData.getAll('file') as File[]
-
-    if (!files || files.length === 0) {
+    const rawFiles = formData.getAll('file')
+    const filesResult = uploadFilesFormFilesSchema.safeParse(rawFiles)
+    if (!filesResult.success) {
       throw new InvalidRequestError('No files provided')
     }
+    const files = filesResult.data
 
-    // Get optional scoping parameters for execution-scoped storage
-    const workflowId = formData.get('workflowId') as string | null
-    const executionId = formData.get('executionId') as string | null
-    const workspaceId = formData.get('workspaceId') as string | null
+    const formFieldsResult = uploadFilesFormFieldsSchema.safeParse({
+      workflowId: formData.get('workflowId'),
+      executionId: formData.get('executionId'),
+      workspaceId: formData.get('workspaceId'),
+      context: formData.get('context'),
+    })
+    if (!formFieldsResult.success) {
+      throw new InvalidRequestError(
+        getValidationErrorMessage(formFieldsResult.error, 'Invalid upload form data')
+      )
+    }
+    const formFields = formFieldsResult.data
+    const { workflowId, executionId, workspaceId, context: contextParam } = formFields
 
-    // Log storage mode
-    const usingCloudStorage = isUsingCloudStorage()
-    logger.info(`Using storage mode: ${usingCloudStorage ? 'Cloud' : 'Local'} for file upload`)
-
-    if (workflowId && executionId) {
-      logger.info(
-        `Uploading files for execution-scoped storage: workflow=${workflowId}, execution=${executionId}`
+    // Context must be explicitly provided
+    if (!contextParam) {
+      throw new InvalidRequestError(
+        'Upload requires explicit context parameter (knowledge-base, workspace, execution, copilot, chat, profile-pictures, or workspace-logos)'
       )
     }
 
+    const context = contextParam as StorageContext
+
+    const storageService = await import('@/lib/uploads/core/storage-service')
+    const usingCloudStorage = storageService.hasCloudStorage()
+    logger.info(`Using storage mode: ${usingCloudStorage ? 'Cloud' : 'Local'} for file upload`)
+
     const uploadResults = []
 
-    // Process each file
     for (const file of files) {
-      const originalName = file.name
+      const originalName = file.name || 'untitled.md'
 
       if (!validateFileExtension(originalName)) {
         const extension = originalName.split('.').pop()?.toLowerCase() || 'unknown'
@@ -88,10 +97,15 @@ export async function POST(request: NextRequest) {
       const bytes = await file.arrayBuffer()
       const buffer = Buffer.from(bytes)
 
-      // For execution-scoped files, use the dedicated execution file storage
-      if (workflowId && executionId) {
-        // Use the dedicated execution file storage system
-        const { uploadExecutionFile } = await import('@/lib/workflows/execution-file-storage')
+      // Handle execution context
+      if (context === 'execution') {
+        if (!workflowId || !executionId) {
+          throw new InvalidRequestError(
+            'Execution context requires workflowId and executionId parameters'
+          )
+        }
+
+        const { uploadExecutionFile } = await import('@/lib/uploads/contexts/execution')
         const userFile = await uploadExecutionFile(
           {
             workspaceId: workspaceId || '',
@@ -100,51 +114,313 @@ export async function POST(request: NextRequest) {
           },
           buffer,
           originalName,
-          file.type
+          file.type,
+          session.user.id
         )
 
         uploadResults.push(userFile)
         continue
       }
 
-      // Upload to cloud or local storage using the standard uploadFile function
-      try {
-        logger.info(`Uploading file: ${originalName}`)
-        const result = await uploadFile(buffer, originalName, file.type, file.size)
+      // Handle knowledge-base context
+      if (context === 'knowledge-base') {
+        // Validate file type for knowledge base
+        const validationError = validateFileType(originalName, file.type)
+        if (validationError) {
+          throw new InvalidRequestError(validationError.message)
+        }
 
-        // Generate a presigned URL for cloud storage with appropriate expiry
-        // Regular files get 24 hours (execution files are handled above)
-        let presignedUrl: string | undefined
-        if (usingCloudStorage) {
-          try {
-            presignedUrl = await getPresignedUrl(result.key, 24 * 60 * 60) // 24 hours
-          } catch (error) {
-            logger.warn(`Failed to generate presigned URL for ${originalName}:`, error)
+        if (workspaceId) {
+          const permission = await getUserEntityPermissions(
+            session.user.id,
+            'workspace',
+            workspaceId
+          )
+          if (permission === null) {
+            return NextResponse.json(
+              { error: 'Insufficient permissions for workspace' },
+              { status: 403 }
+            )
           }
         }
 
-        const servePath = result.path
+        logger.info(`Uploading knowledge-base file: ${originalName}`)
 
-        const uploadResult = {
-          name: originalName,
-          size: file.size,
-          type: file.type,
-          key: result.key,
-          path: servePath,
-          url: presignedUrl || servePath,
+        const timestamp = Date.now()
+        const safeFileName = sanitizeFileName(originalName)
+        const storageKey = `kb/${timestamp}-${safeFileName}`
+
+        const metadata: Record<string, string> = {
+          originalName: originalName,
           uploadedAt: new Date().toISOString(),
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours
+          purpose: 'knowledge-base',
+          userId: session.user.id,
         }
 
-        logger.info(`Successfully uploaded: ${result.key}`)
+        if (workspaceId) {
+          metadata.workspaceId = workspaceId
+        }
+
+        const fileInfo = await storageService.uploadFile({
+          file: buffer,
+          fileName: storageKey,
+          contentType: file.type,
+          context: 'knowledge-base',
+          preserveKey: true,
+          customKey: storageKey,
+          metadata,
+        })
+
+        const finalPath = usingCloudStorage
+          ? `${fileInfo.path}?context=knowledge-base`
+          : fileInfo.path
+
+        const uploadResult = {
+          fileName: originalName,
+          presignedUrl: '', // Not used for server-side uploads
+          fileInfo: {
+            path: finalPath,
+            key: fileInfo.key,
+            name: originalName,
+            size: buffer.length,
+            type: file.type,
+          },
+          directUploadSupported: false,
+        }
+
+        logger.info(`Successfully uploaded knowledge-base file: ${fileInfo.key}`)
         uploadResults.push(uploadResult)
-      } catch (error) {
-        logger.error(`Error uploading ${originalName}:`, error)
-        throw error
+        continue
       }
+
+      // Handle workspace context
+      if (context === 'workspace') {
+        if (!workspaceId) {
+          throw new InvalidRequestError('Workspace context requires workspaceId parameter')
+        }
+        const permission = await getUserEntityPermissions(session.user.id, 'workspace', workspaceId)
+        if (permission !== 'admin' && permission !== 'write') {
+          return NextResponse.json(
+            { error: 'Write or Admin access required for workspace uploads' },
+            { status: 403 }
+          )
+        }
+
+        try {
+          const { uploadWorkspaceFile } = await import('@/lib/uploads/contexts/workspace')
+          const userFile = await uploadWorkspaceFile(
+            workspaceId,
+            session.user.id,
+            buffer,
+            originalName,
+            file.type || 'application/octet-stream'
+          )
+
+          uploadResults.push(userFile)
+          continue
+        } catch (workspaceError) {
+          const errorMessage = getErrorMessage(workspaceError, 'Upload failed')
+          const isDuplicate = errorMessage.includes('already exists')
+          const isStorageLimitError =
+            errorMessage.includes('Storage limit exceeded') ||
+            errorMessage.includes('storage limit')
+
+          logger.warn(`Workspace file upload failed: ${errorMessage}`)
+
+          let statusCode = 500
+          if (isDuplicate) statusCode = 409
+          else if (isStorageLimitError) statusCode = 413
+
+          return NextResponse.json(
+            {
+              success: false,
+              error: errorMessage,
+              isDuplicate,
+            },
+            { status: statusCode }
+          )
+        }
+      }
+
+      // Handle mothership context (chat-scoped uploads to workspace S3)
+      if (context === 'mothership') {
+        if (!workspaceId) {
+          throw new InvalidRequestError('Mothership context requires workspaceId parameter')
+        }
+
+        logger.info(`Uploading mothership file: ${originalName}`)
+
+        const storageKey = generateWorkspaceFileKey(workspaceId, originalName)
+
+        const metadata: Record<string, string> = {
+          originalName: originalName,
+          uploadedAt: new Date().toISOString(),
+          purpose: 'mothership',
+          userId: session.user.id,
+          workspaceId,
+        }
+
+        const fileInfo = await storageService.uploadFile({
+          file: buffer,
+          fileName: storageKey,
+          contentType: file.type || 'application/octet-stream',
+          context: 'mothership',
+          preserveKey: true,
+          customKey: storageKey,
+          metadata,
+        })
+
+        const finalPath = usingCloudStorage ? `${fileInfo.path}?context=mothership` : fileInfo.path
+
+        uploadResults.push({
+          fileName: originalName,
+          presignedUrl: '',
+          fileInfo: {
+            path: finalPath,
+            key: fileInfo.key,
+            name: originalName,
+            size: buffer.length,
+            type: file.type || 'application/octet-stream',
+          },
+          directUploadSupported: false,
+        })
+
+        logger.info(`Successfully uploaded mothership file: ${fileInfo.key}`)
+        continue
+      }
+
+      if (
+        context === 'copilot' ||
+        context === 'chat' ||
+        context === 'profile-pictures' ||
+        context === 'workspace-logos'
+      ) {
+        if (context !== 'copilot') {
+          const mimeType = file.type
+          const isGenericMime = !mimeType || mimeType === 'application/octet-stream'
+          const extension = originalName.split('.').pop()?.toLowerCase() ?? ''
+          const extensionIsImage = (SUPPORTED_IMAGE_EXTENSIONS as readonly string[]).includes(
+            extension
+          )
+          const isImage = isGenericMime ? extensionIsImage : isImageFileType(mimeType)
+          if (!isImage) {
+            throw new InvalidRequestError(`Only image files are allowed for ${context} uploads`)
+          }
+        }
+
+        if (context === 'workspace-logos') {
+          if (!workspaceId) {
+            throw new InvalidRequestError('workspace-logos context requires workspaceId parameter')
+          }
+          const permission = await getUserEntityPermissions(
+            session.user.id,
+            'workspace',
+            workspaceId
+          )
+          if (permission !== 'admin') {
+            return NextResponse.json(
+              { error: 'Admin access required for workspace logo uploads' },
+              { status: 403 }
+            )
+          }
+        }
+
+        if (context === 'chat' && workspaceId) {
+          const permission = await getUserEntityPermissions(
+            session.user.id,
+            'workspace',
+            workspaceId
+          )
+          if (permission === null) {
+            return NextResponse.json(
+              { error: 'Insufficient permissions for workspace' },
+              { status: 403 }
+            )
+          }
+        }
+
+        logger.info(`Uploading ${context} file: ${originalName}`)
+
+        const resolvedContentType = resolveFileType({ type: file.type, name: originalName })
+
+        const timestamp = Date.now()
+        const safeFileName = sanitizeFileName(originalName)
+        const storageKey = `${context}/${timestamp}-${safeFileName}`
+
+        const metadata: Record<string, string> = {
+          originalName: originalName,
+          uploadedAt: new Date().toISOString(),
+          purpose: context,
+          userId: session.user.id,
+        }
+
+        if (workspaceId && context === 'chat') {
+          metadata.workspaceId = workspaceId
+        }
+
+        const fileInfo = await storageService.uploadFile({
+          file: buffer,
+          fileName: storageKey,
+          contentType: resolvedContentType,
+          context,
+          preserveKey: true,
+          customKey: storageKey,
+          metadata,
+        })
+
+        const finalPath = usingCloudStorage ? `${fileInfo.path}?context=${context}` : fileInfo.path
+
+        const uploadResult = {
+          fileName: originalName,
+          presignedUrl: '', // Not used for server-side uploads
+          fileInfo: {
+            path: finalPath,
+            key: fileInfo.key,
+            name: originalName,
+            size: buffer.length,
+            type: resolvedContentType,
+          },
+          directUploadSupported: false,
+        }
+
+        logger.info(`Successfully uploaded ${context} file: ${fileInfo.key}`)
+
+        if (context === 'workspace-logos' && workspaceId) {
+          recordAudit({
+            workspaceId,
+            actorId: session.user.id,
+            actorName: session.user.name,
+            actorEmail: session.user.email,
+            action: AuditAction.FILE_UPLOADED,
+            resourceType: AuditResourceType.WORKSPACE,
+            resourceId: workspaceId,
+            description: `Uploaded workspace logo "${originalName}"`,
+            metadata: {
+              fileName: originalName,
+              fileKey: fileInfo.key,
+              fileSize: buffer.length,
+              fileType: resolvedContentType,
+            },
+            request,
+          })
+
+          captureServerEvent(session.user.id, 'workspace_logo_uploaded', {
+            workspace_id: workspaceId,
+            file_name: originalName,
+            file_size: buffer.length,
+          })
+        }
+
+        uploadResults.push(uploadResult)
+        continue
+      }
+
+      // Unknown context
+      throw new InvalidRequestError(
+        `Unsupported context: ${context}. Use knowledge-base, workspace, execution, copilot, chat, profile-pictures, or workspace-logos`
+      )
     }
 
-    // Return all file information
     if (uploadResults.length === 1) {
       return NextResponse.json(uploadResults[0])
     }
@@ -153,9 +429,8 @@ export async function POST(request: NextRequest) {
     logger.error('Error in file upload:', error)
     return createErrorResponse(error instanceof Error ? error : new Error('File upload failed'))
   }
-}
+})
 
-// Handle preflight requests
-export async function OPTIONS() {
+export const OPTIONS = withRouteHandler(async () => {
   return createOptionsResponse()
-}
+})

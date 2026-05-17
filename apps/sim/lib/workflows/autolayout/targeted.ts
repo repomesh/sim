@@ -1,47 +1,95 @@
-import { createLogger } from '@/lib/logs/console/logger'
-import type { BlockState } from '@/stores/workflows/workflow/types'
-import { assignLayers, groupByLayer } from './layering'
-import { calculatePositions } from './positioning'
-import type { Edge, LayoutOptions } from './types'
 import {
   CONTAINER_PADDING,
-  CONTAINER_PADDING_X,
-  CONTAINER_PADDING_Y,
-  DEFAULT_CONTAINER_HEIGHT,
-  DEFAULT_CONTAINER_WIDTH,
+  DEFAULT_HORIZONTAL_SPACING,
+  DEFAULT_VERTICAL_SPACING,
+  MAX_OVERLAP_ITERATIONS,
+} from '@/lib/workflows/autolayout/constants'
+import { assignLayers, layoutBlocksCore } from '@/lib/workflows/autolayout/core'
+import type { Edge, LayoutOptions } from '@/lib/workflows/autolayout/types'
+import {
+  calculateSubflowDepths,
+  filterLayoutEligibleBlockIds,
   getBlockMetrics,
   getBlocksByParent,
-  isContainerType,
-  prepareBlockMetrics,
-  ROOT_PADDING_X,
-  ROOT_PADDING_Y,
-} from './utils'
+  prepareContainerDimensions,
+  shouldSkipAutoLayout,
+  snapPositionToGrid,
+} from '@/lib/workflows/autolayout/utils'
+import { CONTAINER_DIMENSIONS } from '@/lib/workflows/blocks/block-dimensions'
+import type { BlockState } from '@/stores/workflows/workflow/types'
 
-const logger = createLogger('AutoLayout:Targeted')
+type TargetedBlockInfo = {
+  id: string
+  block: BlockState
+  metrics: ReturnType<typeof getBlockMetrics>
+}
 
 export interface TargetedLayoutOptions extends LayoutOptions {
   changedBlockIds: string[]
+  /** Existing blocks whose size changed but whose position should remain anchored. */
+  resizedBlockIds?: string[]
+  shiftSourceBlockIds?: string[]
   verticalSpacing?: number
   horizontalSpacing?: number
 }
 
+/**
+ * Applies targeted layout to only reposition changed blocks.
+ * Unchanged blocks act as anchors to preserve existing layout.
+ */
 export function applyTargetedLayout(
   blocks: Record<string, BlockState>,
   edges: Edge[],
   options: TargetedLayoutOptions
 ): Record<string, BlockState> {
-  const { changedBlockIds, verticalSpacing = 200, horizontalSpacing = 550 } = options
+  const {
+    changedBlockIds,
+    resizedBlockIds = [],
+    shiftSourceBlockIds = [],
+    verticalSpacing = DEFAULT_VERTICAL_SPACING,
+    horizontalSpacing = DEFAULT_HORIZONTAL_SPACING,
+    gridSize,
+  } = options
 
-  if (!changedBlockIds || changedBlockIds.length === 0) {
+  if (
+    (!changedBlockIds || changedBlockIds.length === 0) &&
+    resizedBlockIds.length === 0 &&
+    shiftSourceBlockIds.length === 0
+  ) {
     return blocks
   }
 
   const changedSet = new Set(changedBlockIds)
-  const blocksCopy: Record<string, BlockState> = JSON.parse(JSON.stringify(blocks))
+  const resizedSet = new Set(resizedBlockIds)
+  const shiftSourceSet = new Set(shiftSourceBlockIds)
+  const blocksCopy: Record<string, BlockState> = structuredClone(blocks)
+
+  prepareContainerDimensions(
+    blocksCopy,
+    edges,
+    layoutBlocksCore,
+    horizontalSpacing,
+    verticalSpacing,
+    gridSize
+  )
 
   const groups = getBlocksByParent(blocksCopy)
 
-  layoutGroup(null, groups.root, blocksCopy, edges, changedSet, verticalSpacing, horizontalSpacing)
+  const subflowDepths = calculateSubflowDepths(blocksCopy, edges, assignLayers)
+
+  layoutGroup(
+    null,
+    groups.root,
+    blocksCopy,
+    edges,
+    changedSet,
+    resizedSet,
+    shiftSourceSet,
+    verticalSpacing,
+    horizontalSpacing,
+    subflowDepths,
+    gridSize
+  )
 
   for (const [parentId, childIds] of groups.children.entries()) {
     layoutGroup(
@@ -50,116 +98,343 @@ export function applyTargetedLayout(
       blocksCopy,
       edges,
       changedSet,
+      resizedSet,
+      shiftSourceSet,
       verticalSpacing,
-      horizontalSpacing
+      horizontalSpacing,
+      subflowDepths,
+      gridSize
     )
   }
 
   return blocksCopy
 }
 
+/**
+ * Selects the best anchor block for offset computation.
+ * Prefers an upstream (predecessor) anchor over a downstream one because
+ * upstream blocks keep their layer assignment when new blocks are inserted
+ * after them, giving a stable offset. Downstream blocks shift to later
+ * layers in the ideal layout, producing a large incorrect offset.
+ */
+function selectBestAnchor(
+  eligibleIds: string[],
+  needsLayoutSet: Set<string>,
+  edges: Edge[],
+  layoutPositions: Map<string, { x: number; y: number }>
+): string | undefined {
+  const candidates = eligibleIds.filter((id) => !needsLayoutSet.has(id) && layoutPositions.has(id))
+  if (candidates.length === 0) return undefined
+  if (candidates.length === 1) return candidates[0]
+
+  const candidateSet = new Set(candidates)
+
+  for (const edge of edges) {
+    if (needsLayoutSet.has(edge.target) && candidateSet.has(edge.source)) {
+      return edge.source
+    }
+  }
+
+  for (const edge of edges) {
+    if (needsLayoutSet.has(edge.source) && candidateSet.has(edge.target)) {
+      return edge.target
+    }
+  }
+
+  return candidates[0]
+}
+
+/**
+ * Layouts a group of blocks (either root level or within a container).
+ * Only repositions blocks in `changedSet` or those with invalid positions.
+ * Resized existing blocks remain anchored and instead drive shifts in nearby
+ * frozen blocks when their new dimensions create overlap.
+ */
 function layoutGroup(
   parentId: string | null,
   childIds: string[],
   blocks: Record<string, BlockState>,
   edges: Edge[],
   changedSet: Set<string>,
+  resizedSet: Set<string>,
+  shiftSourceSet: Set<string>,
   verticalSpacing: number,
-  horizontalSpacing: number
+  horizontalSpacing: number,
+  subflowDepths: Map<string, number>,
+  gridSize?: number
 ): void {
   if (childIds.length === 0) return
 
   const parentBlock = parentId ? blocks[parentId] : undefined
 
-  const requestedLayout = childIds.filter((id) => {
-    const block = blocks[id]
-    if (!block) return false
-    // Never reposition containers, only update their dimensions
-    if (isContainerType(block.type)) return false
-    return changedSet.has(id)
-  })
-  const missingPositions = childIds.filter((id) => {
-    const block = blocks[id]
-    if (!block) return false
-    // Containers with missing positions should still get positioned
-    return !hasPosition(block)
-  })
-  const needsLayoutSet = new Set([...requestedLayout, ...missingPositions])
-  const needsLayout = Array.from(needsLayoutSet)
+  const layoutEligibleChildIds = filterLayoutEligibleBlockIds(childIds, blocks)
 
-  if (parentBlock) {
-    updateContainerDimensions(parentBlock, childIds, blocks)
-  }
-
-  // Always update container dimensions even if no blocks need repositioning
-  // This ensures containers resize properly when children are added/removed
-  if (needsLayout.length === 0) {
-    return
-  }
-
-  const oldPositions = new Map<string, { x: number; y: number }>()
-
-  for (const id of childIds) {
-    const block = blocks[id]
-    if (!block) continue
-    oldPositions.set(id, { ...block.position })
-  }
-
-  const layoutPositions = computeLayoutPositions(
-    childIds,
-    blocks,
-    edges,
-    parentBlock,
-    horizontalSpacing,
-    verticalSpacing
-  )
-
-  if (layoutPositions.size === 0) {
-    // No layout positions computed, but still update container dimensions
+  if (layoutEligibleChildIds.length === 0) {
     if (parentBlock) {
       updateContainerDimensions(parentBlock, childIds, blocks)
     }
     return
   }
 
-  let offsetX = 0
-  let offsetY = 0
+  const requestedLayout = layoutEligibleChildIds.filter((id) => {
+    const block = blocks[id]
+    if (!block) return false
+    return changedSet.has(id)
+  })
+  const invalidPositions = layoutEligibleChildIds.filter((id) => {
+    const block = blocks[id]
+    if (!block) return false
+    return !hasPosition(block)
+  })
+  const needsLayoutSet = new Set([...requestedLayout, ...invalidPositions])
+  const needsLayout = Array.from(needsLayoutSet)
+  const resizedAnchorIds = layoutEligibleChildIds.filter((id) => resizedSet.has(id))
+  const groupShiftSourceIds = layoutEligibleChildIds.filter((id) => shiftSourceSet.has(id))
+  const activeShiftSourceSet = new Set([
+    ...needsLayoutSet,
+    ...resizedAnchorIds,
+    ...groupShiftSourceIds,
+  ])
 
-  const anchorId = childIds.find((id) => !needsLayout.includes(id) && layoutPositions.has(id))
-
-  if (anchorId) {
-    const oldPos = oldPositions.get(anchorId)
-    const newPos = layoutPositions.get(anchorId)
-    if (oldPos && newPos) {
-      offsetX = oldPos.x - newPos.x
-      offsetY = oldPos.y - newPos.y
+  if (needsLayout.length === 0 && activeShiftSourceSet.size === 0) {
+    if (parentBlock) {
+      updateContainerDimensions(parentBlock, childIds, blocks)
     }
-  } else {
-    // No anchor - positions from calculatePositions are already correct relative to padding
-    // Container positions are parent-relative, root positions are absolute
-    // The normalization in computeLayoutPositions already handled the padding offset
-    offsetX = 0
-    offsetY = 0
+    return
   }
 
-  for (const id of needsLayout) {
-    const block = blocks[id]
-    const newPos = layoutPositions.get(id)
-    if (!block || !newPos) continue
-    block.position = {
-      x: newPos.x + offsetX,
-      y: newPos.y + offsetY,
+  if (needsLayout.length > 0) {
+    const oldPositions = new Map<string, { x: number; y: number }>()
+    for (const id of layoutEligibleChildIds) {
+      const block = blocks[id]
+      if (!block) continue
+      oldPositions.set(id, { ...block.position })
+    }
+
+    const layoutPositions = computeLayoutPositions(
+      layoutEligibleChildIds,
+      blocks,
+      edges,
+      parentBlock,
+      horizontalSpacing,
+      verticalSpacing,
+      parentId === null ? subflowDepths : undefined,
+      gridSize
+    )
+
+    if (layoutPositions.size === 0) {
+      if (parentBlock) {
+        updateContainerDimensions(parentBlock, childIds, blocks)
+      }
+      return
+    }
+
+    let offsetX = 0
+    let offsetY = 0
+
+    const anchorId = selectBestAnchor(
+      layoutEligibleChildIds,
+      needsLayoutSet,
+      edges,
+      layoutPositions
+    )
+
+    if (anchorId) {
+      const oldPos = oldPositions.get(anchorId)
+      const newPos = layoutPositions.get(anchorId)
+      if (oldPos && newPos) {
+        offsetX = oldPos.x - newPos.x
+        offsetY = oldPos.y - newPos.y
+      }
+    }
+
+    for (const id of needsLayout) {
+      const block = blocks[id]
+      const newPos = layoutPositions.get(id)
+      if (!block || !newPos) continue
+      block.position = snapPositionToGrid(
+        { x: newPos.x + offsetX, y: newPos.y + offsetY },
+        gridSize
+      )
+    }
+  }
+
+  const shiftedFrozenIds = shiftDownstreamFrozenBlocks(
+    activeShiftSourceSet,
+    needsLayoutSet,
+    layoutEligibleChildIds,
+    blocks,
+    edges,
+    horizontalSpacing,
+    gridSize
+  )
+
+  const affectedBlockIds = new Set([...needsLayoutSet, ...resizedAnchorIds, ...shiftedFrozenIds])
+  if (affectedBlockIds.size > 0) {
+    resolveVerticalOverlapsWithFrozen(
+      affectedBlockIds,
+      layoutEligibleChildIds,
+      blocks,
+      verticalSpacing,
+      gridSize
+    )
+  }
+
+  if (parentBlock) {
+    updateContainerDimensions(parentBlock, childIds, blocks)
+  }
+}
+
+/**
+ * Shifts frozen (unchanged) blocks rightward when a newly placed block
+ * overlaps with them in the X-axis. Traverses the DAG forward from changed
+ * blocks via BFS, cascading shifts through downstream frozen blocks so that
+ * insertions between existing layers push everything after them to the right.
+ *
+ * Only considers edges within the current layout group (scoped to subflow).
+ */
+function shiftDownstreamFrozenBlocks(
+  shiftSourceSet: Set<string>,
+  needsLayoutSet: Set<string>,
+  eligibleIds: string[],
+  blocks: Record<string, BlockState>,
+  edges: Edge[],
+  horizontalSpacing: number,
+  gridSize?: number
+): Set<string> {
+  const eligibleSet = new Set(eligibleIds)
+
+  const downstreamMap = new Map<string, string[]>()
+  for (const edge of edges) {
+    if (!eligibleSet.has(edge.source) || !eligibleSet.has(edge.target)) continue
+    if (!downstreamMap.has(edge.source)) downstreamMap.set(edge.source, [])
+    downstreamMap.get(edge.source)!.push(edge.target)
+  }
+
+  const shifted = new Set<string>()
+  const queue: string[] = Array.from(shiftSourceSet)
+
+  while (queue.length > 0) {
+    const sourceId = queue.shift()!
+    const sourceBlock = blocks[sourceId]
+    if (!sourceBlock) continue
+
+    const sourceMetrics = getBlockMetrics(sourceBlock)
+    const sourceRight = sourceBlock.position.x + sourceMetrics.width
+
+    const successors = downstreamMap.get(sourceId) || []
+    for (const targetId of successors) {
+      if (needsLayoutSet.has(targetId)) continue
+      if (shifted.has(targetId)) continue
+
+      const targetBlock = blocks[targetId]
+      if (!targetBlock) continue
+
+      if (targetBlock.position.x < sourceRight + horizontalSpacing) {
+        const shiftX = sourceRight + horizontalSpacing - targetBlock.position.x
+        targetBlock.position = snapPositionToGrid(
+          { x: targetBlock.position.x + shiftX, y: targetBlock.position.y },
+          gridSize
+        )
+        shifted.add(targetId)
+        queue.push(targetId)
+      }
+    }
+  }
+
+  return shifted
+}
+
+/**
+ * Resolves Y-axis overlaps between changed/shifted blocks and frozen blocks
+ * that share the same column (overlapping X ranges). When a new block is
+ * inserted into the same layer as existing blocks (e.g. adding a parallel
+ * branch), this pushes frozen blocks downward to make room, cascading
+ * through any further blocks below.
+ */
+function resolveVerticalOverlapsWithFrozen(
+  affectedBlockIds: Set<string>,
+  eligibleIds: string[],
+  blocks: Record<string, BlockState>,
+  verticalSpacing: number,
+  gridSize?: number
+): void {
+  const blockInfos = eligibleIds
+    .map((id) => {
+      const block = blocks[id]
+      if (!block) return null
+      return { id, block, metrics: getBlockMetrics(block) }
+    })
+    .filter((info): info is TargetedBlockInfo => info !== null)
+
+  if (blockInfos.length < 2 || affectedBlockIds.size === 0) return
+
+  const movedSet = new Set(affectedBlockIds)
+  let hasOverlap = true
+  let iteration = 0
+
+  while (hasOverlap && iteration < MAX_OVERLAP_ITERATIONS) {
+    hasOverlap = false
+    iteration++
+
+    blockInfos.sort((a, b) => a.block.position.y - b.block.position.y)
+
+    for (let i = 0; i < blockInfos.length - 1; i++) {
+      const upper = blockInfos[i]
+
+      for (let lowerIndex = i + 1; lowerIndex < blockInfos.length; lowerIndex++) {
+        const lower = blockInfos[lowerIndex]
+
+        if (!movedSet.has(upper.id) && !movedSet.has(lower.id)) continue
+        if (!blocksOverlapOnX(upper, lower)) continue
+
+        const requiredY = upper.block.position.y + upper.metrics.height + verticalSpacing
+        if (lower.block.position.y >= requiredY) continue
+
+        lower.block.position = snapPositionToGrid(
+          { x: lower.block.position.x, y: requiredY },
+          gridSize
+        )
+        movedSet.add(lower.id)
+        reorderBlockInfoByY(blockInfos, lowerIndex)
+        hasOverlap = true
+      }
     }
   }
 }
 
+function blocksOverlapOnX(left: TargetedBlockInfo, right: TargetedBlockInfo): boolean {
+  const leftRight = left.block.position.x + left.metrics.width
+  const rightRight = right.block.position.x + right.metrics.width
+  return left.block.position.x < rightRight && right.block.position.x < leftRight
+}
+
+function reorderBlockInfoByY(blockInfos: TargetedBlockInfo[], fromIndex: number): void {
+  const [movedInfo] = blockInfos.splice(fromIndex, 1)
+  let insertIndex = fromIndex
+
+  while (
+    insertIndex < blockInfos.length &&
+    blockInfos[insertIndex].block.position.y < movedInfo.block.position.y
+  ) {
+    insertIndex++
+  }
+
+  blockInfos.splice(insertIndex, 0, movedInfo)
+}
+
+/**
+ * Computes layout positions for a subset of blocks using the core layout function
+ */
 function computeLayoutPositions(
   childIds: string[],
   blocks: Record<string, BlockState>,
   edges: Edge[],
   parentBlock: BlockState | undefined,
   horizontalSpacing: number,
-  verticalSpacing: number
+  verticalSpacing: number,
+  subflowDepths?: Map<string, number>,
+  gridSize?: number
 ): Map<string, { x: number; y: number }> {
   const subsetBlocks: Record<string, BlockState> = {}
   for (const id of childIds) {
@@ -174,92 +449,51 @@ function computeLayoutPositions(
     return new Map()
   }
 
-  const nodes = assignLayers(subsetBlocks, subsetEdges)
-  prepareBlockMetrics(nodes)
+  const isContainer = !!parentBlock
+  const { nodes, dimensions } = layoutBlocksCore(subsetBlocks, subsetEdges, {
+    isContainer,
+    layoutOptions: {
+      horizontalSpacing: isContainer ? horizontalSpacing * 0.85 : horizontalSpacing,
+      verticalSpacing,
+      gridSize,
+    },
+    subflowDepths,
+  })
 
-  const layoutOptions: LayoutOptions = parentBlock
-    ? {
-        horizontalSpacing: horizontalSpacing * 0.85,
-        verticalSpacing,
-        padding: { x: CONTAINER_PADDING_X, y: CONTAINER_PADDING_Y },
-        alignment: 'center',
-      }
-    : {
-        horizontalSpacing,
-        verticalSpacing,
-        padding: { x: ROOT_PADDING_X, y: ROOT_PADDING_Y },
-        alignment: 'center',
-      }
-
-  calculatePositions(groupByLayer(nodes), layoutOptions)
-
-  // Now normalize positions to start from 0,0 relative to the container/root
-  let minX = Number.POSITIVE_INFINITY
-  let minY = Number.POSITIVE_INFINITY
-  let maxX = Number.NEGATIVE_INFINITY
-  let maxY = Number.NEGATIVE_INFINITY
-
-  for (const node of nodes.values()) {
-    minX = Math.min(minX, node.position.x)
-    minY = Math.min(minY, node.position.y)
-    maxX = Math.max(maxX, node.position.x + node.metrics.width)
-    maxY = Math.max(maxY, node.position.y + node.metrics.height)
+  if (parentBlock) {
+    parentBlock.data = {
+      ...parentBlock.data,
+      width: Math.max(dimensions.width, CONTAINER_DIMENSIONS.DEFAULT_WIDTH),
+      height: Math.max(dimensions.height, CONTAINER_DIMENSIONS.DEFAULT_HEIGHT),
+    }
   }
-
-  // Adjust all positions to be relative to the padding offset
-  const xOffset = (parentBlock ? CONTAINER_PADDING_X : ROOT_PADDING_X) - minX
-  const yOffset = (parentBlock ? CONTAINER_PADDING_Y : ROOT_PADDING_Y) - minY
 
   const positions = new Map<string, { x: number; y: number }>()
   for (const node of nodes.values()) {
-    positions.set(node.id, {
-      x: node.position.x + xOffset,
-      y: node.position.y + yOffset,
-    })
-  }
-
-  if (parentBlock) {
-    const calculatedWidth = maxX - minX + CONTAINER_PADDING * 2
-    const calculatedHeight = maxY - minY + CONTAINER_PADDING * 2
-
-    parentBlock.data = {
-      ...parentBlock.data,
-      width: Math.max(calculatedWidth, DEFAULT_CONTAINER_WIDTH),
-      height: Math.max(calculatedHeight, DEFAULT_CONTAINER_HEIGHT),
-    }
+    positions.set(node.id, { x: node.position.x, y: node.position.y })
   }
 
   return positions
 }
 
-function getBounds(positions: Map<string, { x: number; y: number }>) {
-  let minX = Number.POSITIVE_INFINITY
-  let minY = Number.POSITIVE_INFINITY
-
-  for (const pos of positions.values()) {
-    minX = Math.min(minX, pos.x)
-    minY = Math.min(minY, pos.y)
-  }
-
-  return { minX, minY }
-}
-
+/**
+ * Updates container dimensions based on children
+ */
 function updateContainerDimensions(
   parentBlock: BlockState,
   childIds: string[],
   blocks: Record<string, BlockState>
 ): void {
   if (childIds.length === 0) {
-    // No children - use minimum dimensions
     parentBlock.data = {
       ...parentBlock.data,
-      width: DEFAULT_CONTAINER_WIDTH,
-      height: DEFAULT_CONTAINER_HEIGHT,
+      width: CONTAINER_DIMENSIONS.DEFAULT_WIDTH,
+      height: CONTAINER_DIMENSIONS.DEFAULT_HEIGHT,
     }
     parentBlock.layout = {
       ...parentBlock.layout,
-      measuredWidth: DEFAULT_CONTAINER_WIDTH,
-      measuredHeight: DEFAULT_CONTAINER_HEIGHT,
+      measuredWidth: CONTAINER_DIMENSIONS.DEFAULT_WIDTH,
+      measuredHeight: CONTAINER_DIMENSIONS.DEFAULT_HEIGHT,
     }
     return
   }
@@ -272,6 +506,9 @@ function updateContainerDimensions(
   for (const id of childIds) {
     const child = blocks[id]
     if (!child) continue
+    if (shouldSkipAutoLayout(child)) {
+      continue
+    }
     const metrics = getBlockMetrics(child)
 
     minX = Math.min(minX, child.position.x)
@@ -284,14 +521,13 @@ function updateContainerDimensions(
     return
   }
 
-  // Match the regular autolayout's dimension calculation
   const calculatedWidth = maxX - minX + CONTAINER_PADDING * 2
   const calculatedHeight = maxY - minY + CONTAINER_PADDING * 2
 
   parentBlock.data = {
     ...parentBlock.data,
-    width: Math.max(calculatedWidth, DEFAULT_CONTAINER_WIDTH),
-    height: Math.max(calculatedHeight, DEFAULT_CONTAINER_HEIGHT),
+    width: Math.max(calculatedWidth, CONTAINER_DIMENSIONS.DEFAULT_WIDTH),
+    height: Math.max(calculatedHeight, CONTAINER_DIMENSIONS.DEFAULT_HEIGHT),
   }
 
   parentBlock.layout = {
@@ -301,52 +537,12 @@ function updateContainerDimensions(
   }
 }
 
+/**
+ * Checks if a block has a valid, finite position.
+ * Returns false for missing, undefined, NaN, or Infinity coordinates.
+ */
 function hasPosition(block: BlockState): boolean {
   if (!block.position) return false
   const { x, y } = block.position
   return Number.isFinite(x) && Number.isFinite(y)
-}
-
-/**
- * Estimate block heights for diff view by using current workflow measurements
- * This provides better height estimates than using default values
- */
-export function transferBlockHeights(
-  sourceBlocks: Record<string, BlockState>,
-  targetBlocks: Record<string, BlockState>
-): void {
-  // Build a map of block type+name to heights from source
-  const heightMap = new Map<string, { height: number; width: number; isWide: boolean }>()
-
-  for (const [id, block] of Object.entries(sourceBlocks)) {
-    const key = `${block.type}:${block.name}`
-    heightMap.set(key, {
-      height: block.height || 100,
-      width: block.layout?.measuredWidth || (block.isWide ? 480 : 350),
-      isWide: block.isWide || false,
-    })
-  }
-
-  // Transfer heights to target blocks
-  for (const block of Object.values(targetBlocks)) {
-    const key = `${block.type}:${block.name}`
-    const measurements = heightMap.get(key)
-
-    if (measurements) {
-      block.height = measurements.height
-      block.isWide = measurements.isWide
-
-      if (!block.layout) {
-        block.layout = {}
-      }
-      block.layout.measuredHeight = measurements.height
-      block.layout.measuredWidth = measurements.width
-    }
-  }
-
-  logger.debug('Transferred block heights from source workflow', {
-    sourceCount: Object.keys(sourceBlocks).length,
-    targetCount: Object.keys(targetBlocks).length,
-    heightsMapped: heightMap.size,
-  })
 }

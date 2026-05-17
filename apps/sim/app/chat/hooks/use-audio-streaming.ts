@@ -1,7 +1,7 @@
 'use client'
 
 import { type RefObject, useCallback, useRef, useState } from 'react'
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
 
 const logger = createLogger('UseAudioStreaming')
 
@@ -14,6 +14,7 @@ declare global {
 interface AudioStreamingOptions {
   voiceId: string
   modelId?: string
+  chatId: string
   onAudioStart?: () => void
   onAudioEnd?: () => void
   onError?: (error: Error) => void
@@ -76,7 +77,14 @@ export function useAudioStreaming(sharedAudioContextRef?: RefObject<AudioContext
     }
 
     const { text, options } = item
-    const { voiceId, modelId = 'eleven_turbo_v2_5', onAudioStart, onAudioEnd, onError } = options
+    const {
+      voiceId,
+      modelId = 'eleven_turbo_v2_5',
+      chatId,
+      onAudioStart,
+      onAudioEnd,
+      onError,
+    } = options
 
     try {
       const audioContext = getAudioContext()
@@ -84,6 +92,7 @@ export function useAudioStreaming(sharedAudioContextRef?: RefObject<AudioContext
       if (audioContext.state === 'suspended') {
         await audioContext.resume()
       }
+      // boundary-raw-fetch: TTS proxy returns raw audio bytes consumed via response.arrayBuffer() and decoded by AudioContext.decodeAudioData
       const response = await fetch('/api/proxy/tts/stream', {
         method: 'POST',
         headers: {
@@ -93,12 +102,14 @@ export function useAudioStreaming(sharedAudioContextRef?: RefObject<AudioContext
           text,
           voiceId,
           modelId,
+          chatId,
         }),
         signal: abortControllerRef.current?.signal,
       })
 
       if (!response.ok) {
-        throw new Error(`TTS request failed: ${response.statusText}`)
+        const errorText = await response.text().catch(() => '')
+        throw new Error(errorText || `TTS request failed: ${response.statusText}`)
       }
 
       const arrayBuffer = await response.arrayBuffer()

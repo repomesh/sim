@@ -1,15 +1,19 @@
 'use client'
 
 import { Component, type ReactNode, useEffect } from 'react'
-import { BotIcon } from 'lucide-react'
-import { Card } from '@/components/ui/card'
-import { createLogger } from '@/lib/logs/console/logger'
-import { ControlBar } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/control-bar/control-bar'
-import { Panel } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/panel'
+import { createLogger } from '@sim/logger'
+import { RefreshCw } from 'lucide-react'
+import { ReactFlowProvider } from 'reactflow'
+import { Button } from '@/components/emcn'
+import { Panel } from '@/app/workspace/[workspaceId]/w/[workflowId]/components'
+import { usePreventZoom } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks'
+import { Sidebar } from '@/app/workspace/[workspaceId]/w/components/sidebar/sidebar'
 
 const logger = createLogger('ErrorBoundary')
 
-// ======== Shared Error UI Component ========
+/**
+ * Shared Error UI Component
+ */
 interface ErrorUIProps {
   title?: string
   message?: string
@@ -18,43 +22,56 @@ interface ErrorUIProps {
 }
 
 export function ErrorUI({
-  title = 'Workflow Error',
-  message = 'This workflow encountered an error and is currently unavailable. Please try again later or create a new workflow.',
+  title = 'Something went wrong',
+  message = 'An unexpected error occurred. Please try again or refresh the page.',
   onReset,
   fullScreen = false,
 }: ErrorUIProps) {
-  const containerClass = fullScreen
-    ? 'flex flex-col w-full h-screen bg-muted/40'
-    : 'flex flex-col w-full h-full bg-muted/40'
+  const preventZoomRef = usePreventZoom()
+
+  if (!fullScreen) {
+    return (
+      <div className='flex h-full flex-1 items-center justify-center'>
+        <div className='flex flex-col items-center gap-4 text-center'>
+          <div className='flex flex-col gap-2'>
+            <h2 className='font-semibold text-[var(--text-primary)] text-md'>{title}</h2>
+            <p className='max-w-[300px] text-[var(--text-tertiary)] text-small'>{message}</p>
+          </div>
+          <Button variant='default' size='sm' onClick={onReset ?? (() => window.location.reload())}>
+            <RefreshCw className='mr-1.5 size-[14px]' />
+            Try again
+          </Button>
+        </div>
+      </div>
+    )
+  }
 
   return (
-    <div className={containerClass}>
-      {/* Control bar */}
-      <ControlBar hasValidationErrors={false} />
+    <div ref={preventZoomRef} className='flex h-screen w-full flex-col bg-[var(--surface-1)]'>
+      <Sidebar />
 
-      {/* Main content area */}
       <div className='relative flex flex-1'>
-        {/* Error message */}
-        <div className='flex flex-1 items-center justify-center'>
-          <Card className='max-w-md space-y-4 p-6 text-center'>
-            <div className='flex justify-center'>
-              <BotIcon className='h-16 w-16 text-muted-foreground' />
-            </div>
-            <h3 className='font-semibold text-lg'>{title}</h3>
-            <p className='text-muted-foreground'>{message}</p>
-          </Card>
+        <div className='pointer-events-none absolute inset-0 flex items-center justify-center'>
+          <div className='pointer-events-none flex flex-col items-center gap-4'>
+            <h3 className='font-semibold text-[var(--text-primary)] text-md'>{title}</h3>
+            <p className='max-w-sm text-center font-medium text-[var(--text-tertiary)] text-sm'>
+              {message}
+            </p>
+          </div>
         </div>
 
-        {/* Console panel */}
-        <div className='fixed top-0 right-0 z-10'>
+        <ReactFlowProvider>
           <Panel />
-        </div>
+        </ReactFlowProvider>
       </div>
     </div>
   )
 }
 
-// ======== React Error Boundary Component ========
+/**
+ * React Error Boundary Component
+ * Catches React rendering errors and displays ErrorUI fallback
+ */
 interface ErrorBoundaryProps {
   children: ReactNode
   fallback?: ReactNode
@@ -83,7 +100,10 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 }
 
-// ======== Next.js Error Page Component ========
+/**
+ * Next.js Error Page Component
+ * Renders when a workflow-specific error occurs
+ */
 interface NextErrorProps {
   error: Error & { digest?: string }
   reset: () => void
@@ -91,14 +111,16 @@ interface NextErrorProps {
 
 export function NextError({ error, reset }: NextErrorProps) {
   useEffect(() => {
-    // Optionally log the error to an error reporting service
     logger.error('Workflow error:', { error })
   }, [error])
 
   return <ErrorUI onReset={reset} />
 }
 
-// ======== Next.js Global Error Page Component ========
+/**
+ * Next.js Global Error Page Component
+ * Renders for application-level errors
+ */
 export function NextGlobalError({
   error,
   reset,

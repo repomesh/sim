@@ -3,14 +3,14 @@ import type { ToolResponse } from '@/tools/types'
 // Type for Excel cell values - covers all valid data types that Excel supports
 export type ExcelCellValue = string | number | boolean | null
 
-export interface MicrosoftExcelRange {
+interface MicrosoftExcelRange {
   sheetId?: number
   sheetName?: string
   range: string
   values: ExcelCellValue[][]
 }
 
-export interface MicrosoftExcelMetadata {
+interface MicrosoftExcelMetadata {
   spreadsheetId: string
   spreadsheetUrl?: string
   title?: string
@@ -48,9 +48,22 @@ export interface MicrosoftExcelTableAddResponse extends ToolResponse {
   }
 }
 
+export interface MicrosoftExcelWorksheetAddResponse extends ToolResponse {
+  output: {
+    worksheet: {
+      id: string
+      name: string
+      position: number
+      visibility: string
+    }
+    metadata: MicrosoftExcelMetadata
+  }
+}
+
 export interface MicrosoftExcelToolParams {
   accessToken: string
   spreadsheetId: string
+  driveId?: string
   range?: string
   values?: ExcelCellValue[][]
   valueInputOption?: 'RAW' | 'USER_ENTERED'
@@ -63,12 +76,61 @@ export interface MicrosoftExcelToolParams {
 export interface MicrosoftExcelTableToolParams {
   accessToken: string
   spreadsheetId: string
+  driveId?: string
   tableName: string
   values: ExcelCellValue[][]
   rowIndex?: number
+}
+
+export interface MicrosoftExcelWorksheetToolParams {
+  accessToken: string
+  spreadsheetId: string
+  driveId?: string
+  worksheetName: string
 }
 
 export type MicrosoftExcelResponse =
   | MicrosoftExcelReadResponse
   | MicrosoftExcelWriteResponse
   | MicrosoftExcelTableAddResponse
+  | MicrosoftExcelWorksheetAddResponse
+
+// V2 Types - with separate sheetName param
+export interface MicrosoftExcelV2ToolParams {
+  accessToken: string
+  spreadsheetId: string
+  driveId?: string
+  sheetName: string
+  cellRange?: string
+  values?: ExcelCellValue[][]
+  valueInputOption?: 'RAW' | 'USER_ENTERED'
+  includeValuesInResponse?: boolean
+  majorDimension?: 'ROWS' | 'COLUMNS'
+}
+
+export interface MicrosoftExcelV2ReadResponse extends ToolResponse {
+  output: {
+    sheetName: string
+    range: string
+    values: ExcelCellValue[][]
+    metadata: {
+      spreadsheetId: string
+      spreadsheetUrl: string
+    }
+  }
+}
+
+export interface MicrosoftExcelV2WriteResponse extends ToolResponse {
+  output: {
+    updatedRange: string | null
+    updatedRows: number
+    updatedColumns: number
+    updatedCells: number
+    metadata: {
+      spreadsheetId: string
+      spreadsheetUrl: string
+    }
+  }
+}
+
+export type MicrosoftExcelV2Response = MicrosoftExcelV2ReadResponse | MicrosoftExcelV2WriteResponse

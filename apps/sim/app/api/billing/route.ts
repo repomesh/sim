@@ -1,18 +1,21 @@
 import { db } from '@sim/db'
-import { member, userStats } from '@sim/db/schema'
+import { member } from '@sim/db/schema'
+import { createLogger } from '@sim/logger'
 import { and, eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { billingQuerySchema } from '@/lib/api/contracts/subscription'
 import { getSession } from '@/lib/auth'
+import { getEffectiveBillingStatus } from '@/lib/billing/core/access'
 import { getSimplifiedBillingSummary } from '@/lib/billing/core/billing'
 import { getOrganizationBillingData } from '@/lib/billing/core/organization'
-import { createLogger } from '@/lib/logs/console/logger'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 const logger = createLogger('UnifiedBillingAPI')
 
 /**
  * Unified Billing Endpoint
  */
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   const session = await getSession()
 
   try {
@@ -21,16 +24,20 @@ export async function GET(request: NextRequest) {
     }
 
     const { searchParams } = new URL(request.url)
-    const context = searchParams.get('context') || 'user'
-    const contextId = searchParams.get('id')
+    const parsedQuery = billingQuerySchema.safeParse({
+      context: searchParams.get('context') || undefined,
+      id: searchParams.get('id') || undefined,
+      includeOrg: searchParams.get('includeOrg') === 'true',
+    })
 
-    // Validate context parameter
-    if (!['user', 'organization'].includes(context)) {
+    if (!parsedQuery.success) {
       return NextResponse.json(
         { error: 'Invalid context. Must be "user" or "organization"' },
         { status: 400 }
       )
     }
+
+    const { context, id: contextId, includeOrg } = parsedQuery.data
 
     // For organization context, require contextId
     if (context === 'organization' && !contextId) {
@@ -43,17 +50,53 @@ export async function GET(request: NextRequest) {
     let billingData
 
     if (context === 'user') {
-      // Get user billing (may include organization if they're part of one)
-      billingData = await getSimplifiedBillingSummary(session.user.id, contextId || undefined)
-      // Attach billingBlocked status for the current user
-      const stats = await db
-        .select({ blocked: userStats.billingBlocked })
-        .from(userStats)
-        .where(eq(userStats.userId, session.user.id))
-        .limit(1)
+      if (contextId) {
+        const membership = await db
+          .select({ role: member.role })
+          .from(member)
+          .where(and(eq(member.organizationId, contextId), eq(member.userId, session.user.id)))
+          .limit(1)
+        if (membership.length === 0) {
+          return NextResponse.json(
+            { error: 'Access denied - not a member of this organization' },
+            { status: 403 }
+          )
+        }
+      }
+
+      const [billingResult, billingStatus] = await Promise.all([
+        getSimplifiedBillingSummary(session.user.id, contextId || undefined),
+        getEffectiveBillingStatus(session.user.id),
+      ])
+      billingData = billingResult
+
       billingData = {
         ...billingData,
-        billingBlocked: stats.length > 0 ? !!stats[0].blocked : false,
+        billingBlocked: billingStatus.billingBlocked,
+        billingBlockedReason: billingStatus.billingBlockedReason,
+        blockedByOrgOwner: billingStatus.blockedByOrgOwner,
+      }
+
+      // Optionally include organization membership and role
+      if (includeOrg) {
+        const userMembership = await db
+          .select({
+            organizationId: member.organizationId,
+            role: member.role,
+          })
+          .from(member)
+          .where(eq(member.userId, session.user.id))
+          .limit(1)
+
+        if (userMembership.length > 0) {
+          billingData = {
+            ...billingData,
+            organization: {
+              id: userMembership[0].organizationId,
+              role: userMembership[0].role as 'owner' | 'admin' | 'member',
+            },
+          }
+        }
       }
     } else {
       // Get user role in organization for permission checks first
@@ -80,7 +123,6 @@ export async function GET(request: NextRequest) {
         )
       }
 
-      // Transform data to match component expectations
       billingData = {
         organizationId: rawBillingData.organizationId,
         organizationName: rawBillingData.organizationName,
@@ -95,26 +137,24 @@ export async function GET(request: NextRequest) {
         averageUsagePerMember: rawBillingData.averageUsagePerMember,
         billingPeriodStart: rawBillingData.billingPeriodStart?.toISOString() || null,
         billingPeriodEnd: rawBillingData.billingPeriodEnd?.toISOString() || null,
-        members: rawBillingData.members.map((member) => ({
-          ...member,
-          joinedAt: member.joinedAt.toISOString(),
-          lastActive: member.lastActive?.toISOString() || null,
+        members: rawBillingData.members.map((m) => ({
+          ...m,
+          joinedAt: m.joinedAt.toISOString(),
+          lastActive: m.lastActive?.toISOString() || null,
         })),
       }
 
       const userRole = memberRecord[0].role
 
-      // Include the requesting user's blocked flag as well so UI can reflect it
-      const stats = await db
-        .select({ blocked: userStats.billingBlocked })
-        .from(userStats)
-        .where(eq(userStats.userId, session.user.id))
-        .limit(1)
+      // Get effective billing blocked status (includes org owner check)
+      const billingStatus = await getEffectiveBillingStatus(session.user.id)
 
       // Merge blocked flag into data for convenience
       billingData = {
         ...billingData,
-        billingBlocked: stats.length > 0 ? !!stats[0].blocked : false,
+        billingBlocked: billingStatus.billingBlocked,
+        billingBlockedReason: billingStatus.billingBlockedReason,
+        blockedByOrgOwner: billingStatus.blockedByOrgOwner,
       }
 
       return NextResponse.json({
@@ -123,6 +163,8 @@ export async function GET(request: NextRequest) {
         data: billingData,
         userRole,
         billingBlocked: billingData.billingBlocked,
+        billingBlockedReason: billingData.billingBlockedReason,
+        blockedByOrgOwner: billingData.blockedByOrgOwner,
       })
     }
 
@@ -139,4 +181,4 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

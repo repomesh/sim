@@ -1,27 +1,36 @@
 import { db } from '@sim/db'
 import { workflowFolder } from '@sim/db/schema'
-import { and, asc, desc, eq, isNull } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { and, asc, eq, isNotNull, isNull } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
+import { createFolderContract, listFoldersContract } from '@/lib/api/contracts'
+import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { createLogger } from '@/lib/logs/console/logger'
-import { getUserEntityPermissions } from '@/lib/permissions/utils'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { captureServerEvent } from '@/lib/posthog/server'
+import { performCreateFolder } from '@/lib/workflows/orchestration'
+import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const logger = createLogger('FoldersAPI')
 
+function folderMutationStatus(errorCode: string | undefined): number {
+  if (errorCode === 'validation') return 400
+  if (errorCode === 'conflict') return 409
+  if (errorCode === 'not_found') return 404
+  return 500
+}
+
 // GET - Fetch folders for a workspace
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { searchParams } = new URL(request.url)
-    const workspaceId = searchParams.get('workspaceId')
-
-    if (!workspaceId) {
-      return NextResponse.json({ error: 'Workspace ID is required' }, { status: 400 })
-    }
+    const parsed = await parseRequest(listFoldersContract, request, {})
+    if (!parsed.success) return parsed.response
+    const { workspaceId, scope } = parsed.data.query
 
     // Check if user has workspace permissions
     const workspacePermission = await getUserEntityPermissions(
@@ -34,12 +43,15 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Access denied to this workspace' }, { status: 403 })
     }
 
-    // If user has workspace permissions, fetch ALL folders in the workspace
-    // This allows shared workspace members to see folders created by other users
+    const archivedFilter =
+      scope === 'archived'
+        ? isNotNull(workflowFolder.archivedAt)
+        : isNull(workflowFolder.archivedAt)
+
     const folders = await db
       .select()
       .from(workflowFolder)
-      .where(eq(workflowFolder.workspaceId, workspaceId))
+      .where(and(eq(workflowFolder.workspaceId, workspaceId), archivedFilter))
       .orderBy(asc(workflowFolder.sortOrder), asc(workflowFolder.createdAt))
 
     return NextResponse.json({ folders })
@@ -47,24 +59,27 @@ export async function GET(request: NextRequest) {
     logger.error('Error fetching folders:', { error })
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})
 
 // POST - Create a new folder
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const body = await request.json()
-    const { name, workspaceId, parentId, color } = body
+    const parsed = await parseRequest(createFolderContract, request, {})
+    if (!parsed.success) return parsed.response
+    const {
+      id: clientId,
+      name,
+      workspaceId,
+      parentId,
+      color,
+      sortOrder: providedSortOrder,
+    } = parsed.data.body
 
-    if (!name || !workspaceId) {
-      return NextResponse.json({ error: 'Name and workspace ID are required' }, { status: 400 })
-    }
-
-    // Check if user has workspace permissions (at least 'write' access to create folders)
     const workspacePermission = await getUserEntityPermissions(
       session.user.id,
       'workspace',
@@ -78,49 +93,37 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Generate a new ID
-    const id = crypto.randomUUID()
-
-    // Use transaction to ensure sortOrder consistency
-    const newFolder = await db.transaction(async (tx) => {
-      // Get the next sort order for the parent (or root level)
-      // Consider all folders in the workspace, not just those created by current user
-      const existingFolders = await tx
-        .select({ sortOrder: workflowFolder.sortOrder })
-        .from(workflowFolder)
-        .where(
-          and(
-            eq(workflowFolder.workspaceId, workspaceId),
-            parentId ? eq(workflowFolder.parentId, parentId) : isNull(workflowFolder.parentId)
-          )
-        )
-        .orderBy(desc(workflowFolder.sortOrder))
-        .limit(1)
-
-      const nextSortOrder = existingFolders.length > 0 ? existingFolders[0].sortOrder + 1 : 0
-
-      // Insert the new folder within the same transaction
-      const [folder] = await tx
-        .insert(workflowFolder)
-        .values({
-          id,
-          name: name.trim(),
-          userId: session.user.id,
-          workspaceId,
-          parentId: parentId || null,
-          color: color || '#6B7280',
-          sortOrder: nextSortOrder,
-        })
-        .returning()
-
-      return folder
+    const result = await performCreateFolder({
+      id: clientId,
+      userId: session.user.id,
+      workspaceId,
+      name,
+      parentId,
+      color,
+      sortOrder: providedSortOrder,
     })
 
-    logger.info('Created new folder:', { id, name, workspaceId, parentId })
+    if (!result.success || !result.folder) {
+      return NextResponse.json(
+        { error: result.error },
+        { status: folderMutationStatus(result.errorCode) }
+      )
+    }
+
+    const newFolder = result.folder
+
+    logger.info('Created new folder:', { id: newFolder.id, name, workspaceId, parentId })
+
+    captureServerEvent(
+      session.user.id,
+      'folder_created',
+      { workspace_id: workspaceId },
+      { groups: { workspace: workspaceId } }
+    )
 
     return NextResponse.json({ folder: newFolder })
   } catch (error) {
     logger.error('Error creating folder:', { error })
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
-}
+})

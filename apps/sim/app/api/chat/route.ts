@@ -1,47 +1,20 @@
 import { db } from '@sim/db'
 import { chat } from '@sim/db/schema'
-import { eq } from 'drizzle-orm'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
+import { and, eq, isNull } from 'drizzle-orm'
 import type { NextRequest } from 'next/server'
-import { v4 as uuidv4 } from 'uuid'
-import { z } from 'zod'
+import { createChatContract } from '@/lib/api/contracts/chats'
+import { getValidationErrorMessage, parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
-import { env } from '@/lib/env'
-import { isDev } from '@/lib/environment'
-import { createLogger } from '@/lib/logs/console/logger'
-import { encryptSecret } from '@/lib/utils'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
+import { performChatDeploy } from '@/lib/workflows/orchestration'
 import { checkWorkflowAccessForChatCreation } from '@/app/api/chat/utils'
 import { createErrorResponse, createSuccessResponse } from '@/app/api/workflows/utils'
 
 const logger = createLogger('ChatAPI')
 
-const chatSchema = z.object({
-  workflowId: z.string().min(1, 'Workflow ID is required'),
-  identifier: z
-    .string()
-    .min(1, 'Identifier is required')
-    .regex(/^[a-z0-9-]+$/, 'Identifier can only contain lowercase letters, numbers, and hyphens'),
-  title: z.string().min(1, 'Title is required'),
-  description: z.string().optional(),
-  customizations: z.object({
-    primaryColor: z.string(),
-    welcomeMessage: z.string(),
-    imageUrl: z.string().optional(),
-  }),
-  authType: z.enum(['public', 'password', 'email']).default('public'),
-  password: z.string().optional(),
-  allowedEmails: z.array(z.string()).optional().default([]),
-  outputConfigs: z
-    .array(
-      z.object({
-        blockId: z.string(),
-        path: z.string(),
-      })
-    )
-    .optional()
-    .default([]),
-})
-
-export async function GET(request: NextRequest) {
+export const GET = withRouteHandler(async (_request: NextRequest) => {
   try {
     const session = await getSession()
 
@@ -50,16 +23,19 @@ export async function GET(request: NextRequest) {
     }
 
     // Get the user's chat deployments
-    const deployments = await db.select().from(chat).where(eq(chat.userId, session.user.id))
+    const deployments = await db
+      .select()
+      .from(chat)
+      .where(and(eq(chat.userId, session.user.id), isNull(chat.archivedAt)))
 
     return createSuccessResponse({ deployments })
-  } catch (error: any) {
+  } catch (error) {
     logger.error('Error fetching chat deployments:', error)
-    return createErrorResponse(error.message || 'Failed to fetch chat deployments', 500)
+    return createErrorResponse(getErrorMessage(error, 'Failed to fetch chat deployments'), 500)
   }
-}
+})
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
   try {
     const session = await getSession()
 
@@ -67,149 +43,90 @@ export async function POST(request: NextRequest) {
       return createErrorResponse('Unauthorized', 401)
     }
 
-    // Parse and validate request body
-    const body = await request.json()
-
-    try {
-      const validatedData = chatSchema.parse(body)
-
-      // Extract validated data
-      const {
-        workflowId,
-        identifier,
-        title,
-        description = '',
-        customizations,
-        authType = 'public',
-        password,
-        allowedEmails = [],
-        outputConfigs = [],
-      } = validatedData
-
-      // Perform additional validation specific to auth types
-      if (authType === 'password' && !password) {
-        return createErrorResponse('Password is required when using password protection', 400)
+    const parsed = await parseRequest(
+      createChatContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) =>
+          createErrorResponse(getValidationErrorMessage(error), 400, 'VALIDATION_ERROR'),
       }
+    )
+    if (!parsed.success) return parsed.response
 
-      if (authType === 'email' && (!Array.isArray(allowedEmails) || allowedEmails.length === 0)) {
-        return createErrorResponse(
-          'At least one email or domain is required when using email access control',
-          400
-        )
-      }
+    const {
+      workflowId,
+      identifier,
+      title,
+      description = '',
+      customizations,
+      authType = 'public',
+      password,
+      allowedEmails = [],
+      outputConfigs = [],
+    } = parsed.data.body
 
-      // Check if identifier is available
-      const existingIdentifier = await db
+    if (authType === 'password' && !password) {
+      return createErrorResponse('Password is required when using password protection', 400)
+    }
+
+    if (authType === 'email' && (!Array.isArray(allowedEmails) || allowedEmails.length === 0)) {
+      return createErrorResponse(
+        'At least one email or domain is required when using email access control',
+        400
+      )
+    }
+
+    if (authType === 'sso' && (!Array.isArray(allowedEmails) || allowedEmails.length === 0)) {
+      return createErrorResponse(
+        'At least one email or domain is required when using SSO access control',
+        400
+      )
+    }
+
+    const [existingIdentifier, { hasAccess, workflow: workflowRecord }] = await Promise.all([
+      db
         .select()
         .from(chat)
-        .where(eq(chat.identifier, identifier))
-        .limit(1)
+        .where(and(eq(chat.identifier, identifier), isNull(chat.archivedAt)))
+        .limit(1),
+      checkWorkflowAccessForChatCreation(workflowId, session.user.id),
+    ])
 
-      if (existingIdentifier.length > 0) {
-        return createErrorResponse('Identifier already in use', 400)
-      }
-
-      // Check if user has permission to create chat for this workflow
-      const { hasAccess, workflow: workflowRecord } = await checkWorkflowAccessForChatCreation(
-        workflowId,
-        session.user.id
-      )
-
-      if (!hasAccess || !workflowRecord) {
-        return createErrorResponse('Workflow not found or access denied', 404)
-      }
-
-      // Verify the workflow is deployed (required for chat deployment)
-      if (!workflowRecord.isDeployed) {
-        return createErrorResponse('Workflow must be deployed before creating a chat', 400)
-      }
-
-      // Encrypt password if provided
-      let encryptedPassword = null
-      if (authType === 'password' && password) {
-        const { encrypted } = await encryptSecret(password)
-        encryptedPassword = encrypted
-      }
-
-      // Create the chat deployment
-      const id = uuidv4()
-
-      // Log the values we're inserting
-      logger.info('Creating chat deployment with values:', {
-        workflowId,
-        identifier,
-        title,
-        authType,
-        hasPassword: !!encryptedPassword,
-        emailCount: allowedEmails?.length || 0,
-        outputConfigsCount: outputConfigs.length,
-      })
-
-      // Merge customizations with the additional fields
-      const mergedCustomizations = {
-        ...(customizations || {}),
-        primaryColor: customizations?.primaryColor || 'var(--brand-primary-hover-hex)',
-        welcomeMessage: customizations?.welcomeMessage || 'Hi there! How can I help you today?',
-      }
-
-      await db.insert(chat).values({
-        id,
-        workflowId,
-        userId: session.user.id,
-        identifier,
-        title,
-        description: description || '',
-        customizations: mergedCustomizations,
-        isActive: true,
-        authType,
-        password: encryptedPassword,
-        allowedEmails: authType === 'email' ? allowedEmails : [],
-        outputConfigs,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-
-      // Return successful response with chat URL
-      // Generate chat URL using path-based routing instead of subdomains
-      const baseUrl = env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
-
-      let chatUrl: string
-      try {
-        const url = new URL(baseUrl)
-        let host = url.host
-        if (host.startsWith('www.')) {
-          host = host.substring(4)
-        }
-        chatUrl = `${url.protocol}//${host}/chat/${identifier}`
-      } catch (error) {
-        logger.warn('Failed to parse baseUrl, falling back to defaults:', {
-          baseUrl,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        })
-        // Fallback based on environment
-        if (isDev) {
-          chatUrl = `http://localhost:3000/chat/${identifier}`
-        } else {
-          chatUrl = `https://sim.ai/chat/${identifier}`
-        }
-      }
-
-      logger.info(`Chat "${title}" deployed successfully at ${chatUrl}`)
-
-      return createSuccessResponse({
-        id,
-        chatUrl,
-        message: 'Chat deployment created successfully',
-      })
-    } catch (validationError) {
-      if (validationError instanceof z.ZodError) {
-        const errorMessage = validationError.errors[0]?.message || 'Invalid request data'
-        return createErrorResponse(errorMessage, 400, 'VALIDATION_ERROR')
-      }
-      throw validationError
+    if (existingIdentifier.length > 0) {
+      return createErrorResponse('Identifier already in use', 400)
     }
-  } catch (error: any) {
+
+    if (!hasAccess || !workflowRecord) {
+      return createErrorResponse('Workflow not found or access denied', 404)
+    }
+
+    const result = await performChatDeploy({
+      workflowId,
+      userId: session.user.id,
+      identifier,
+      title,
+      description,
+      customizations,
+      authType,
+      password,
+      allowedEmails,
+      outputConfigs,
+      workspaceId: workflowRecord.workspaceId,
+    })
+
+    if (!result.success) {
+      return createErrorResponse(result.error || 'Failed to deploy chat', 500)
+    }
+
+    return createSuccessResponse({
+      id: result.chatId,
+      chatId: result.chatId,
+      chatUrl: result.chatUrl,
+      message: 'Chat deployment created successfully',
+    })
+  } catch (error) {
     logger.error('Error creating chat deployment:', error)
-    return createErrorResponse(error.message || 'Failed to create chat deployment', 500)
+    return createErrorResponse(getErrorMessage(error, 'Failed to create chat deployment'), 500)
   }
-}
+})

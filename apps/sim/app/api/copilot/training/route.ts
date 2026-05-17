@@ -1,22 +1,21 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
-import { env } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
+import { copilotTrainingDataContract } from '@/lib/api/contracts/copilot'
+import { parseRequest, validationErrorResponse } from '@/lib/api/server'
+import { checkInternalApiKey, createUnauthorizedResponse } from '@/lib/copilot/request/http'
+import { env } from '@/lib/core/config/env'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 const logger = createLogger('CopilotTrainingAPI')
 
-// Schema for the request body
-const TrainingDataSchema = z.object({
-  title: z.string().min(1),
-  prompt: z.string().min(1),
-  input: z.any(), // Workflow state (start)
-  output: z.any(), // Workflow state (end)
-  operations: z.any(),
-})
+export const POST = withRouteHandler(async (request: NextRequest) => {
+  const auth = checkInternalApiKey(request)
+  if (!auth.success) {
+    return createUnauthorizedResponse()
+  }
 
-export async function POST(request: NextRequest) {
   try {
-    // Check for required environment variables
     const baseUrl = env.AGENT_INDEXER_URL
     if (!baseUrl) {
       logger.error('Missing AGENT_INDEXER_URL environment variable')
@@ -32,29 +31,25 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Parse and validate request body
-    const body = await request.json()
-    const validationResult = TrainingDataSchema.safeParse(body)
-
-    if (!validationResult.success) {
-      logger.warn('Invalid training data format', { errors: validationResult.error.errors })
-      return NextResponse.json(
-        {
-          error: 'Invalid training data format',
-          details: validationResult.error.errors,
+    const parsed = await parseRequest(
+      copilotTrainingDataContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          logger.warn('Invalid training data format', { errors: error.issues })
+          return validationErrorResponse(error, 'Invalid training data format')
         },
-        { status: 400 }
-      )
-    }
-
-    const { title, prompt, input, output, operations } = validationResult.data
+      }
+    )
+    if (!parsed.success) return parsed.response
+    const { title, prompt, input, output, operations } = parsed.data.body
 
     logger.info('Sending training data to agent indexer', {
       title,
-      operationsCount: Array.isArray(operations) ? operations.length : 0,
+      operationsCount: operations.length,
     })
 
-    // Forward to agent indexer
     const upstreamUrl = `${baseUrl}/operations/add`
     const upstreamResponse = await fetch(upstreamUrl, {
       method: 'POST',
@@ -91,9 +86,9 @@ export async function POST(request: NextRequest) {
     logger.error('Failed to send training data to agent indexer', { error })
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : 'Failed to send training data',
+        error: getErrorMessage(error, 'Failed to send training data'),
       },
       { status: 502 }
     )
   }
-}
+})

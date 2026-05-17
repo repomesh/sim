@@ -1,13 +1,23 @@
+import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { type NextRequest, NextResponse } from 'next/server'
-import { env } from '@/lib/env'
-import { createLogger } from '@/lib/logs/console/logger'
+import { copilotTrainingExampleContract } from '@/lib/api/contracts/copilot'
+import { parseRequest, validationErrorResponse } from '@/lib/api/server'
+import { checkInternalApiKey, createUnauthorizedResponse } from '@/lib/copilot/request/http'
+import { env } from '@/lib/core/config/env'
+import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
 const logger = createLogger('CopilotTrainingExamplesAPI')
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteHandler(async (request: NextRequest) => {
+  const auth = checkInternalApiKey(request)
+  if (!auth.success) {
+    return createUnauthorizedResponse()
+  }
+
   const baseUrl = env.AGENT_INDEXER_URL
   if (!baseUrl) {
     logger.error('Missing AGENT_INDEXER_URL environment variable')
@@ -21,10 +31,23 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const body = await request.json()
+    const parsed = await parseRequest(
+      copilotTrainingExampleContract,
+      request,
+      {},
+      {
+        validationErrorResponse: (error) => {
+          logger.warn('Invalid training example format', { errors: error.issues })
+          return validationErrorResponse(error, 'Invalid training example format')
+        },
+      }
+    )
+    if (!parsed.success) return parsed.response
+    const validatedData = parsed.data.body
 
     logger.info('Sending workflow example to agent indexer', {
-      hasJsonField: typeof body?.json === 'string',
+      hasJsonField: typeof validatedData.json === 'string',
+      title: validatedData.title,
     })
 
     const upstream = await fetch(`${baseUrl}/examples/add`, {
@@ -33,7 +56,7 @@ export async function POST(request: NextRequest) {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(validatedData),
     })
 
     if (!upstream.ok) {
@@ -52,8 +75,8 @@ export async function POST(request: NextRequest) {
       headers: { 'content-type': 'application/json' },
     })
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : 'Failed to add example'
+    const errorMessage = getErrorMessage(err, 'Failed to add example')
     logger.error('Failed to send workflow example', { error: err })
     return NextResponse.json({ error: errorMessage }, { status: 502 })
   }
-}
+})

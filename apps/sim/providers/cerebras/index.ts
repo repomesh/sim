@@ -1,42 +1,30 @@
 import { Cerebras } from '@cerebras/cerebras_cloud_sdk'
-import { createLogger } from '@/lib/logs/console/logger'
+import { createLogger } from '@sim/logger'
+import { getErrorMessage, toError } from '@sim/utils/errors'
 import type { StreamingExecution } from '@/executor/types'
+import { MAX_TOOL_ITERATIONS } from '@/providers'
+import { formatMessagesForProvider } from '@/providers/attachments'
+import type { CerebrasResponse } from '@/providers/cerebras/types'
+import { createReadableStreamFromCerebrasStream } from '@/providers/cerebras/utils'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
 import type {
   ProviderConfig,
   ProviderRequest,
   ProviderResponse,
   TimeSegment,
 } from '@/providers/types'
-import { prepareToolExecution } from '@/providers/utils'
+import { ProviderError } from '@/providers/types'
+import {
+  calculateCost,
+  prepareToolExecution,
+  prepareToolsWithUsageControl,
+  sumToolCosts,
+  trackForcedToolUsage,
+} from '@/providers/utils'
 import { executeTool } from '@/tools'
 
 const logger = createLogger('CerebrasProvider')
-
-/**
- * Helper to convert a Cerebras streaming response (async iterable) into a ReadableStream.
- * Enqueues only the model's text delta chunks as UTF-8 encoded bytes.
- */
-function createReadableStreamFromCerebrasStream(
-  cerebrasStream: AsyncIterable<any>
-): ReadableStream {
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        for await (const chunk of cerebrasStream) {
-          // Expecting delta content similar to OpenAI: chunk.choices[0]?.delta?.content
-          const content = chunk.choices?.[0]?.delta?.content || ''
-          if (content) {
-            controller.enqueue(new TextEncoder().encode(content))
-          }
-        }
-        controller.close()
-      } catch (error) {
-        controller.error(error)
-      }
-    },
-  })
-}
 
 export const cerebrasProvider: ProviderConfig = {
   id: 'cerebras',
@@ -53,7 +41,6 @@ export const cerebrasProvider: ProviderConfig = {
       throw new Error('API key is required for Cerebras')
     }
 
-    // Start execution timer for the entire provider execution
     const providerStartTime = Date.now()
     const providerStartTimeISO = new Date(providerStartTime).toISOString()
 
@@ -62,31 +49,24 @@ export const cerebrasProvider: ProviderConfig = {
         apiKey: request.apiKey,
       })
 
-      // Start with an empty array for all messages
       const allMessages = []
-
-      // Add system prompt if present
       if (request.systemPrompt) {
         allMessages.push({
           role: 'system',
           content: request.systemPrompt,
         })
       }
-
-      // Add context if present
       if (request.context) {
         allMessages.push({
           role: 'user',
           content: request.context,
         })
       }
-
-      // Add remaining messages
       if (request.messages) {
         allMessages.push(...request.messages)
       }
+      const formattedMessages = formatMessagesForProvider(allMessages, 'cerebras')
 
-      // Transform tools to Cerebras format if provided
       const tools = request.tools?.length
         ? request.tools.map((tool) => ({
             type: 'function',
@@ -98,74 +78,84 @@ export const cerebrasProvider: ProviderConfig = {
           }))
         : undefined
 
-      // Build the request payload
       const payload: any = {
-        model: (request.model || 'cerebras/llama-3.3-70b').replace('cerebras/', ''),
-        messages: allMessages,
+        model: request.model.replace('cerebras/', ''),
+        messages: formattedMessages,
       }
-
-      // Add optional parameters
       if (request.temperature !== undefined) payload.temperature = request.temperature
-      if (request.maxTokens !== undefined) payload.max_tokens = request.maxTokens
-
-      // Add response format for structured output if specified
+      if (request.maxTokens != null) payload.max_completion_tokens = request.maxTokens
       if (request.responseFormat) {
         payload.response_format = {
           type: 'json_schema',
-          schema: request.responseFormat.schema || request.responseFormat,
+          json_schema: {
+            name: request.responseFormat.name || 'response_schema',
+            schema: request.responseFormat.schema || request.responseFormat,
+            strict: request.responseFormat.strict !== false,
+          },
         }
       }
 
-      // Add tools if provided
-      if (tools?.length) {
-        // Filter out any tools with usageControl='none', treat 'force' as 'auto' since Cerebras only supports 'auto'
-        const filteredTools = tools.filter((tool) => {
-          const toolId = tool.function?.name
-          const toolConfig = request.tools?.find((t) => t.id === toolId)
-          // Only filter out tools with usageControl='none'
-          return toolConfig?.usageControl !== 'none'
-        })
+      let originalToolChoice: any
+      let forcedTools: string[] = []
+      let hasFilteredTools = false
 
-        if (filteredTools?.length) {
-          payload.tools = filteredTools
-          // Always use 'auto' for Cerebras, explicitly converting any 'force' usageControl to 'auto'
-          payload.tool_choice = 'auto'
+      if (tools?.length) {
+        const preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'openai')
+
+        if (preparedTools.tools?.length) {
+          payload.tools = preparedTools.tools
+          payload.tool_choice = preparedTools.toolChoice || 'auto'
+          originalToolChoice = preparedTools.toolChoice
+          forcedTools = preparedTools.forcedTools || []
+          hasFilteredTools = preparedTools.hasFilteredTools
 
           logger.info('Cerebras request configuration:', {
-            toolCount: filteredTools.length,
-            toolChoice: 'auto', // Cerebras always uses auto, 'force' is treated as 'auto'
+            toolCount: preparedTools.tools.length,
+            toolChoice: payload.tool_choice,
+            forcedToolsCount: forcedTools.length,
+            hasFilteredTools,
             model: request.model,
           })
-        } else if (tools.length > 0 && filteredTools.length === 0) {
-          // Handle case where all tools are filtered out
-          logger.info(`All tools have usageControl='none', removing tools from request`)
         }
       }
 
-      // EARLY STREAMING: if streaming requested and no tools to execute, stream directly
       if (request.stream && (!tools || tools.length === 0)) {
         logger.info('Using streaming response for Cerebras request (no tools)')
-        const streamResponse: any = await client.chat.completions.create({
-          ...payload,
-          stream: true,
-        })
 
-        // Start collecting token usage
-        const tokenUsage = {
-          prompt: 0,
-          completion: 0,
-          total: 0,
-        }
+        const streamResponse: any = await client.chat.completions.create(
+          {
+            ...payload,
+            stream: true,
+          },
+          request.abortSignal ? { signal: request.abortSignal } : undefined
+        )
 
-        // Create a StreamingExecution response with a readable stream
         const streamingResult = {
-          stream: createReadableStreamFromCerebrasStream(streamResponse),
+          stream: createReadableStreamFromCerebrasStream(streamResponse, (content, usage) => {
+            streamingResult.execution.output.content = content
+            streamingResult.execution.output.tokens = {
+              input: usage.prompt_tokens,
+              output: usage.completion_tokens,
+              total: usage.total_tokens,
+            }
+
+            const costResult = calculateCost(
+              request.model,
+              usage.prompt_tokens,
+              usage.completion_tokens
+            )
+            streamingResult.execution.output.cost = {
+              input: costResult.input,
+              output: costResult.output,
+              total: costResult.total,
+            }
+          }),
           execution: {
             success: true,
             output: {
-              content: '', // Will be filled by streaming content in chat component
-              model: request.model || 'cerebras/llama-3.3-70b',
-              tokens: tokenUsage,
+              content: '',
+              model: request.model,
+              tokens: { input: 0, output: 0, total: 0 },
               toolCalls: undefined,
               providerTiming: {
                 startTime: providerStartTimeISO,
@@ -174,21 +164,16 @@ export const cerebrasProvider: ProviderConfig = {
                 timeSegments: [
                   {
                     type: 'model',
-                    name: 'Streaming response',
+                    name: request.model,
                     startTime: providerStartTime,
                     endTime: Date.now(),
                     duration: Date.now() - providerStartTime,
                   },
                 ],
               },
-              // Estimate token cost
-              cost: {
-                total: 0.0,
-                input: 0.0,
-                output: 0.0,
-              },
+              cost: { input: 0, output: 0, total: 0 },
             },
-            logs: [], // No block logs for direct streaming
+            logs: [],
             metadata: {
               startTime: providerStartTimeISO,
               endTime: new Date().toISOString(),
@@ -198,54 +183,52 @@ export const cerebrasProvider: ProviderConfig = {
           },
         }
 
-        // Return the streaming execution object
         return streamingResult as StreamingExecution
       }
-
-      // Make the initial API request
       const initialCallTime = Date.now()
 
-      let currentResponse = (await client.chat.completions.create(payload)) as CerebrasResponse
+      let currentResponse = (await client.chat.completions.create(
+        payload,
+        request.abortSignal ? { signal: request.abortSignal } : undefined
+      )) as CerebrasResponse
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = currentResponse.choices[0]?.message?.content || ''
       const tokens = {
-        prompt: currentResponse.usage?.prompt_tokens || 0,
-        completion: currentResponse.usage?.completion_tokens || 0,
+        input: currentResponse.usage?.prompt_tokens || 0,
+        output: currentResponse.usage?.completion_tokens || 0,
         total: currentResponse.usage?.total_tokens || 0,
       }
       const toolCalls = []
-      const toolResults = []
-      const currentMessages = [...allMessages]
+      const toolResults: Record<string, unknown>[] = []
+      const currentMessages = [...formattedMessages]
       let iterationCount = 0
-      const MAX_ITERATIONS = 10 // Prevent infinite loops
 
-      // Track time spent in model vs tools
       let modelTime = firstResponseTime
       let toolsTime = 0
-
-      // Track each model and tool call segment with timestamps
       const timeSegments: TimeSegment[] = [
         {
           type: 'model',
-          name: 'Initial response',
+          name: request.model,
           startTime: initialCallTime,
           endTime: initialCallTime + firstResponseTime,
           duration: firstResponseTime,
         },
       ]
 
-      // Keep track of processed tool calls to avoid duplicates
       const processedToolCallIds = new Set()
-      // Keep track of tool call signatures to detect repeats
       const toolCallSignatures = new Set()
-
       try {
-        while (iterationCount < MAX_ITERATIONS) {
-          // Check for tool calls
+        while (iterationCount < MAX_TOOL_ITERATIONS) {
           const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
 
-          // Break if no tool calls
+          enrichLastModelSegmentFromChatCompletions(
+            timeSegments,
+            currentResponse,
+            toolCallsInResponse,
+            { model: request.model, provider: 'cerebras' }
+          )
+
           if (!toolCallsInResponse || toolCallsInResponse.length === 0) {
             if (currentResponse.choices[0]?.message?.content) {
               content = currentResponse.choices[0].message.content
@@ -253,233 +236,289 @@ export const cerebrasProvider: ProviderConfig = {
             break
           }
 
-          // Track time for tool calls in this batch
           const toolsStartTime = Date.now()
-
-          // Process each tool call
-          let processedAnyToolCall = false
           let hasRepeatedToolCalls = false
-
-          for (const toolCall of toolCallsInResponse) {
-            // Skip if we've already processed this tool call
+          const filteredToolCalls = toolCallsInResponse.filter((toolCall) => {
             if (processedToolCallIds.has(toolCall.id)) {
-              continue
+              return false
             }
-
-            // Create a signature for this tool call to detect repeats
             const toolCallSignature = `${toolCall.function.name}-${toolCall.function.arguments}`
             if (toolCallSignatures.has(toolCallSignature)) {
               hasRepeatedToolCalls = true
-              continue
+              return false
             }
+            processedToolCallIds.add(toolCall.id)
+            toolCallSignatures.add(toolCallSignature)
+            return true
+          })
+
+          const processedAnyToolCall = filteredToolCalls.length > 0
+          const toolExecutionPromises = filteredToolCalls.map(async (toolCall) => {
+            const toolCallStartTime = Date.now()
+            const toolName = toolCall.function.name
 
             try {
-              processedToolCallIds.add(toolCall.id)
-              toolCallSignatures.add(toolCallSignature)
-              processedAnyToolCall = true
-
-              const toolName = toolCall.function.name
               const toolArgs = JSON.parse(toolCall.function.arguments)
-
-              // Get the tool from the tools registry
               const tool = request.tools?.find((t) => t.id === toolName)
-              if (!tool) continue
-
-              // Execute the tool
-              const toolCallStartTime = Date.now()
+              if (!tool) return null
 
               const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-
-              const result = await executeTool(toolName, executionParams, true)
+              const result = await executeTool(toolName, executionParams, {
+                signal: request.abortSignal,
+              })
               const toolCallEndTime = Date.now()
-              const toolCallDuration = toolCallEndTime - toolCallStartTime
 
-              // Add to time segments for both success and failure
-              timeSegments.push({
-                type: 'tool',
-                name: toolName,
+              return {
+                toolCall,
+                toolName,
+                toolParams,
+                result,
                 startTime: toolCallStartTime,
                 endTime: toolCallEndTime,
-                duration: toolCallDuration,
-              })
-
-              // Prepare result content for the LLM
-              let resultContent: any
-              if (result.success) {
-                toolResults.push(result.output)
-                resultContent = result.output
-              } else {
-                // Include error information so LLM can respond appropriately
-                resultContent = {
-                  error: true,
-                  message: result.error || 'Tool execution failed',
-                  tool: toolName,
-                }
+                duration: toolCallEndTime - toolCallStartTime,
               }
-
-              toolCalls.push({
-                name: toolName,
-                arguments: toolParams,
-                startTime: new Date(toolCallStartTime).toISOString(),
-                endTime: new Date(toolCallEndTime).toISOString(),
-                duration: toolCallDuration,
-                result: resultContent,
-                success: result.success,
-              })
-
-              // Add the tool call and result to messages (both success and failure)
-              currentMessages.push({
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                  {
-                    id: toolCall.id,
-                    type: 'function',
-                    function: {
-                      name: toolName,
-                      arguments: toolCall.function.arguments,
-                    },
-                  },
-                ],
-              })
-
-              currentMessages.push({
-                role: 'tool',
-                tool_call_id: toolCall.id,
-                content: JSON.stringify(resultContent),
-              })
             } catch (error) {
-              logger.error('Error processing tool call:', { error })
+              const toolCallEndTime = Date.now()
+              logger.error('Error processing tool call (Cerebras):', {
+                error: toError(error).message,
+                toolName,
+              })
+
+              return {
+                toolCall,
+                toolName,
+                toolParams: {},
+                result: {
+                  success: false,
+                  output: undefined,
+                  error: getErrorMessage(error, 'Tool execution failed'),
+                },
+                startTime: toolCallStartTime,
+                endTime: toolCallEndTime,
+                duration: toolCallEndTime - toolCallStartTime,
+              }
+            }
+          })
+
+          const executionResults = await Promise.allSettled(toolExecutionPromises)
+          currentMessages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: filteredToolCalls.map((tc) => ({
+              id: tc.id,
+              type: 'function',
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              },
+            })),
+          })
+
+          for (const settledResult of executionResults) {
+            if (settledResult.status === 'rejected' || !settledResult.value) continue
+
+            const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
+              settledResult.value
+            timeSegments.push({
+              type: 'tool',
+              name: toolName,
+              startTime: startTime,
+              endTime: endTime,
+              duration: duration,
+              toolCallId: toolCall.id,
+            })
+            let resultContent: any
+            if (result.success && result.output) {
+              toolResults.push(result.output)
+              resultContent = result.output
+            } else {
+              resultContent = {
+                error: true,
+                message: result.error || 'Tool execution failed',
+                tool: toolName,
+              }
+            }
+
+            toolCalls.push({
+              name: toolName,
+              arguments: toolParams,
+              startTime: new Date(startTime).toISOString(),
+              endTime: new Date(endTime).toISOString(),
+              duration: duration,
+              result: resultContent,
+              success: result.success,
+            })
+            currentMessages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(resultContent),
+            })
+          }
+
+          const thisToolsTime = Date.now() - toolsStartTime
+          toolsTime += thisToolsTime
+          let usedForcedTools: string[] = []
+          if (typeof originalToolChoice === 'object' && forcedTools.length > 0) {
+            const toolTracking = trackForcedToolUsage(
+              currentResponse.choices[0]?.message?.tool_calls,
+              originalToolChoice,
+              logger,
+              'openai',
+              forcedTools,
+              usedForcedTools
+            )
+            usedForcedTools = toolTracking.usedForcedTools
+            const nextToolChoice = toolTracking.nextToolChoice
+            if (nextToolChoice && typeof nextToolChoice === 'object') {
+              payload.tool_choice = nextToolChoice
+            } else if (nextToolChoice === 'auto' || !nextToolChoice) {
+              payload.tool_choice = 'auto'
             }
           }
 
-          // Calculate tool call time for this iteration
-          const thisToolsTime = Date.now() - toolsStartTime
-          toolsTime += thisToolsTime
-
-          // After processing tool calls, get a final response
           if (processedAnyToolCall || hasRepeatedToolCalls) {
-            // Time the next model call
             const nextModelStartTime = Date.now()
 
-            // Make the final request
             const finalPayload = {
               ...payload,
               messages: currentMessages,
             }
-
-            // Use tool_choice: 'none' for the final response to avoid an infinite loop
             finalPayload.tool_choice = 'none'
 
             const finalResponse = (await client.chat.completions.create(
-              finalPayload
+              finalPayload,
+              request.abortSignal ? { signal: request.abortSignal } : undefined
             )) as CerebrasResponse
 
             const nextModelEndTime = Date.now()
             const thisModelTime = nextModelEndTime - nextModelStartTime
 
-            // Add to time segments
             timeSegments.push({
               type: 'model',
-              name: 'Final response',
+              name: request.model,
               startTime: nextModelStartTime,
               endTime: nextModelEndTime,
               duration: thisModelTime,
             })
 
-            // Add to model time
             modelTime += thisModelTime
 
             if (finalResponse.choices[0]?.message?.content) {
               content = finalResponse.choices[0].message.content
             }
-
-            // Update final token counts
             if (finalResponse.usage) {
-              tokens.prompt += finalResponse.usage.prompt_tokens || 0
-              tokens.completion += finalResponse.usage.completion_tokens || 0
+              tokens.input += finalResponse.usage.prompt_tokens || 0
+              tokens.output += finalResponse.usage.completion_tokens || 0
               tokens.total += finalResponse.usage.total_tokens || 0
             }
+
+            enrichLastModelSegmentFromChatCompletions(
+              timeSegments,
+              finalResponse,
+              finalResponse.choices[0]?.message?.tool_calls,
+              { model: request.model, provider: 'cerebras' }
+            )
 
             break
           }
 
-          // Only continue if we haven't processed any tool calls and haven't seen repeats
           if (!processedAnyToolCall && !hasRepeatedToolCalls) {
-            // Make the next request with updated messages
             const nextPayload = {
               ...payload,
               messages: currentMessages,
             }
 
-            // Time the next model call
             const nextModelStartTime = Date.now()
-
-            // Make the next request
             currentResponse = (await client.chat.completions.create(
-              nextPayload
+              nextPayload,
+              request.abortSignal ? { signal: request.abortSignal } : undefined
             )) as CerebrasResponse
 
             const nextModelEndTime = Date.now()
             const thisModelTime = nextModelEndTime - nextModelStartTime
 
-            // Add to time segments
             timeSegments.push({
               type: 'model',
-              name: `Model response (iteration ${iterationCount + 1})`,
+              name: request.model,
               startTime: nextModelStartTime,
               endTime: nextModelEndTime,
               duration: thisModelTime,
             })
 
-            // Add to model time
             modelTime += thisModelTime
-
-            // Update token counts
             if (currentResponse.usage) {
-              tokens.prompt += currentResponse.usage.prompt_tokens || 0
-              tokens.completion += currentResponse.usage.completion_tokens || 0
+              tokens.input += currentResponse.usage.prompt_tokens || 0
+              tokens.output += currentResponse.usage.completion_tokens || 0
               tokens.total += currentResponse.usage.total_tokens || 0
             }
 
             iterationCount++
           }
         }
+
+        if (iterationCount === MAX_TOOL_ITERATIONS) {
+          enrichLastModelSegmentFromChatCompletions(
+            timeSegments,
+            currentResponse,
+            currentResponse.choices[0]?.message?.tool_calls,
+            { model: request.model, provider: 'cerebras' }
+          )
+        }
       } catch (error) {
         logger.error('Error in Cerebras tool processing:', { error })
       }
 
-      // Calculate overall timing
       const providerEndTime = Date.now()
       const providerEndTimeISO = new Date(providerEndTime).toISOString()
       const totalDuration = providerEndTime - providerStartTime
 
-      // POST-TOOL-STREAMING: stream after tool calls if requested
-      if (request.stream && iterationCount > 0) {
-        logger.info('Using streaming for final Cerebras response after tool calls')
+      if (request.stream) {
+        logger.info('Using streaming for final Cerebras response after tool processing')
 
-        // When streaming after tool calls with forced tools, make sure tool_choice is set to 'auto'
-        // This prevents the API from trying to force tool usage again in the final streaming response
         const streamingPayload = {
           ...payload,
           messages: currentMessages,
-          tool_choice: 'auto', // Always use 'auto' for the streaming response after tool calls
+          tool_choice: 'auto',
           stream: true,
         }
 
-        const streamResponse: any = await client.chat.completions.create(streamingPayload)
+        const streamResponse: any = await client.chat.completions.create(
+          streamingPayload,
+          request.abortSignal ? { signal: request.abortSignal } : undefined
+        )
 
-        // Create a StreamingExecution response with all collected data
+        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+
         const streamingResult = {
-          stream: createReadableStreamFromCerebrasStream(streamResponse),
+          stream: createReadableStreamFromCerebrasStream(streamResponse, (content, usage) => {
+            streamingResult.execution.output.content = content
+            streamingResult.execution.output.tokens = {
+              input: tokens.input + usage.prompt_tokens,
+              output: tokens.output + usage.completion_tokens,
+              total: tokens.total + usage.total_tokens,
+            }
+
+            const streamCost = calculateCost(
+              request.model,
+              usage.prompt_tokens,
+              usage.completion_tokens
+            )
+            const tc = sumToolCosts(toolResults)
+            streamingResult.execution.output.cost = {
+              input: accumulatedCost.input + streamCost.input,
+              output: accumulatedCost.output + streamCost.output,
+              toolCost: tc || undefined,
+              total: accumulatedCost.total + streamCost.total + tc,
+            }
+          }),
           execution: {
             success: true,
             output: {
-              content: '', // Will be filled by the callback
-              model: request.model || 'cerebras/llama-3.3-70b',
+              content: '',
+              model: request.model,
               tokens: {
-                prompt: tokens.prompt,
-                completion: tokens.completion,
+                input: tokens.input,
+                output: tokens.output,
                 total: tokens.total,
               },
               toolCalls:
@@ -500,12 +539,13 @@ export const cerebrasProvider: ProviderConfig = {
                 timeSegments: timeSegments,
               },
               cost: {
-                total: (tokens.total || 0) * 0.0001,
-                input: (tokens.prompt || 0) * 0.0001,
-                output: (tokens.completion || 0) * 0.0001,
+                input: accumulatedCost.input,
+                output: accumulatedCost.output,
+                toolCost: undefined as number | undefined,
+                total: accumulatedCost.total,
               },
             },
-            logs: [], // No block logs at provider level
+            logs: [],
             metadata: {
               startTime: providerStartTimeISO,
               endTime: new Date().toISOString(),
@@ -515,7 +555,6 @@ export const cerebrasProvider: ProviderConfig = {
           },
         }
 
-        // Return the streaming execution object
         return streamingResult as StreamingExecution
       }
 
@@ -537,7 +576,6 @@ export const cerebrasProvider: ProviderConfig = {
         },
       }
     } catch (error) {
-      // Include timing information even for errors
       const providerEndTime = Date.now()
       const providerEndTimeISO = new Date(providerEndTime).toISOString()
       const totalDuration = providerEndTime - providerStartTime
@@ -547,16 +585,16 @@ export const cerebrasProvider: ProviderConfig = {
         duration: totalDuration,
       })
 
-      // Create a new error with timing information
-      const enhancedError = new Error(error instanceof Error ? error.message : String(error))
-      // @ts-ignore - Adding timing property to the error
-      enhancedError.timing = {
+      throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,
         endTime: providerEndTimeISO,
         duration: totalDuration,
-      }
-
-      throw enhancedError
+      })
     }
   },
 }
+
+/**
+ * Enriches the last model segment with per-iteration content from a Chat
+ * Completions response: assistant text, tool calls, finish reason, token usage.
+ */

@@ -1,27 +1,60 @@
-import type { ParameterVisibility, ToolConfig } from '@/tools/types'
+import { createLogger } from '@sim/logger'
+import { extractInputFieldsFromBlocks } from '@/lib/workflows/input-format'
+import {
+  buildCanonicalIndex,
+  type CanonicalModeOverrides,
+  evaluateSubBlockCondition,
+  isCanonicalPair,
+  isSubBlockHidden,
+  isTriggerModeSubBlock,
+  resolveCanonicalMode,
+  type SubBlockCondition,
+} from '@/lib/workflows/subblocks/visibility'
+import type {
+  BlockConfig as AppBlockConfig,
+  SubBlockConfig as BlockSubBlockConfig,
+  GenerationType,
+} from '@/blocks/types'
+import { safeAssign } from '@/tools/safe-assign'
+import { isEmptyTagValue } from '@/tools/shared/tags'
+import type { OAuthConfig, ParameterVisibility, ToolConfig } from '@/tools/types'
 import { getTool } from '@/tools/utils'
 
-export interface Option {
+const logger = createLogger('ToolsParams')
+type ToolParamDefinition = ToolConfig['params'][string]
+
+/**
+ * Checks if a value is non-empty (not undefined, null, or empty string)
+ */
+export function isNonEmpty(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== ''
+}
+
+// ============================================================================
+// Tag/Value Parsing Utilities
+// ============================================================================
+
+interface Option {
   label: string
   value: string
 }
 
-export interface ComponentCondition {
+interface ComponentCondition {
   field: string
-  value: string
+  value: string | number | boolean | Array<string | number | boolean>
+  not?: boolean
 }
 
-export interface UIComponentConfig {
+interface UIComponentConfig {
   type: string
   options?: Option[]
   placeholder?: string
   password?: boolean
   condition?: ComponentCondition
   title?: string
-  layout?: string
   value?: unknown
-  provider?: string
   serviceId?: string
+  selectorKey?: BlockSubBlockConfig['selectorKey']
   requiredScopes?: string[]
   mimeType?: string
   columns?: string[]
@@ -33,10 +66,26 @@ export interface UIComponentConfig {
   generationType?: string
   acceptedTypes?: string[]
   multiple?: boolean
+  multiSelect?: boolean
   maxSize?: number
+  dependsOn?: string[] | { all?: string[]; any?: string[] }
+  /** Canonical parameter ID if this is part of a canonical group */
+  canonicalParamId?: string
+  /** The mode of the source subblock (basic/advanced/both) */
+  mode?: 'basic' | 'advanced' | 'both' | 'trigger' | 'trigger-advanced'
+  /** The actual subblock ID this config was derived from */
+  actualSubBlockId?: string
+  /** Wand configuration for AI assistance */
+  wandConfig?: {
+    enabled: boolean
+    prompt: string
+    generationType?: GenerationType
+    placeholder?: string
+    maintainHistory?: boolean
+  }
 }
 
-export interface SubBlockConfig {
+interface SubBlockConfig {
   id: string
   type: string
   title?: string
@@ -44,9 +93,7 @@ export interface SubBlockConfig {
   placeholder?: string
   password?: boolean
   condition?: ComponentCondition
-  layout?: string
   value?: unknown
-  provider?: string
   serviceId?: string
   requiredScopes?: string[]
   mimeType?: string
@@ -60,22 +107,32 @@ export interface SubBlockConfig {
   acceptedTypes?: string[]
   multiple?: boolean
   maxSize?: number
+  dependsOn?: string[]
 }
 
-export interface BlockConfig {
-  type: string
-  subBlocks?: SubBlockConfig[]
-}
+type ToolInputBlockConfig = Pick<AppBlockConfig, 'type' | 'subBlocks' | 'tools'>
 
-export interface SchemaProperty {
+interface SchemaProperty {
   type: string
   description: string
+  items?: Record<string, any>
+  properties?: Record<string, SchemaProperty>
+  required?: string[]
 }
 
 export interface ToolSchema {
   type: 'object'
   properties: Record<string, SchemaProperty>
   required: string[]
+}
+
+export interface UserToolSchemaOptions {
+  surface?: 'default' | 'copilot'
+}
+
+export interface LLMToolSchemaResult {
+  schema: ToolSchema
+  enrichedDescription?: string
 }
 
 export interface ValidationResult {
@@ -103,23 +160,91 @@ export interface ToolWithParameters {
   optionalParameters: ToolParameterConfig[] // Nice to have, shown to user
 }
 
-let blockConfigCache: Record<string, BlockConfig> | null = null
+let blockConfigCache: Record<string, ToolInputBlockConfig> | null = null
 
-function getBlockConfigurations(): Record<string, BlockConfig> {
+function getBlockConfigurations(): Record<string, ToolInputBlockConfig> {
   if (!blockConfigCache) {
     try {
       const { getAllBlocks } = require('@/blocks')
       const allBlocks = getAllBlocks()
       blockConfigCache = {}
-      allBlocks.forEach((block: BlockConfig) => {
+      allBlocks.forEach((block: AppBlockConfig) => {
         blockConfigCache![block.type] = block
       })
     } catch (error) {
-      console.warn('Could not load block configuration:', error)
+      logger.warn('Could not load block configuration:', error)
       blockConfigCache = {}
     }
   }
   return blockConfigCache
+}
+
+/**
+ * Gets the correct tool ID for a block operation.
+ */
+export function getToolIdForOperation(blockType: string, operation?: string): string | undefined {
+  const block = getBlockConfigurations()[blockType]
+  if (!block?.tools?.access) return undefined
+
+  if (block.tools.access.length === 1) {
+    return block.tools.access[0]
+  }
+
+  if (operation && block.tools.config?.tool) {
+    try {
+      return block.tools.config.tool({ operation })
+    } catch (error) {
+      logger.error('Error selecting tool for operation:', error)
+    }
+  }
+
+  if (operation && block.tools.access.includes(operation)) {
+    return operation
+  }
+
+  return block.tools.access[0]
+}
+
+function resolveSubBlockForParam(
+  paramId: string,
+  subBlocks: BlockSubBlockConfig[],
+  valuesWithOperation: Record<string, unknown>,
+  paramType: string
+): BlockSubBlockConfig | undefined {
+  const blockSubBlocks = subBlocks
+
+  // First pass: find subblock with matching condition
+  let fallbackMatch: BlockSubBlockConfig | undefined
+
+  for (const sb of blockSubBlocks) {
+    const matches = sb.id === paramId || sb.canonicalParamId === paramId
+    if (!matches) continue
+
+    // Remember first match as fallback (for condition-based filtering in UI)
+    if (!fallbackMatch) fallbackMatch = sb
+
+    if (
+      !sb.condition ||
+      evaluateSubBlockCondition(sb.condition as SubBlockCondition, valuesWithOperation)
+    ) {
+      return sb
+    }
+  }
+
+  // Return fallback so its condition can be used for UI filtering
+  if (fallbackMatch) return fallbackMatch
+
+  // Check if boolean param is part of a checkbox-list
+  if (paramType === 'boolean') {
+    return blockSubBlocks.find(
+      (sb) =>
+        sb.type === 'checkbox-list' &&
+        Array.isArray(sb.options) &&
+        (sb.options as Array<{ id?: string }>).some((opt) => opt.id === paramId)
+    )
+  }
+
+  return undefined
 }
 
 /**
@@ -128,26 +253,85 @@ function getBlockConfigurations(): Record<string, BlockConfig> {
  */
 export function getToolParametersConfig(
   toolId: string,
-  blockType?: string
+  blockType?: string,
+  currentValues?: Record<string, unknown>
 ): ToolWithParameters | null {
   try {
     const toolConfig = getTool(toolId)
     if (!toolConfig) {
-      console.warn(`Tool not found: ${toolId}`)
+      logger.warn(`Tool not found: ${toolId}`)
       return null
     }
 
     // Validate that toolConfig has required properties
     if (!toolConfig.params || typeof toolConfig.params !== 'object') {
-      console.warn(`Tool ${toolId} has invalid params configuration`)
+      logger.warn(`Tool ${toolId} has invalid params configuration`)
       return null
     }
 
+    // Special handling for workflow_executor tool
+    if (toolId === 'workflow_executor') {
+      const parameters: ToolParameterConfig[] = [
+        {
+          id: 'workflowId',
+          type: 'string',
+          required: true,
+          visibility: 'user-only',
+          description: 'The ID of the workflow to execute',
+          uiComponent: {
+            type: 'workflow-selector',
+            placeholder: 'Select workflow to execute',
+            selectorKey: 'sim.workflows',
+          },
+        },
+        {
+          id: 'inputMapping',
+          type: 'object',
+          required: false,
+          visibility: 'user-or-llm',
+          description: 'Map inputs to the selected workflow',
+          uiComponent: {
+            type: 'workflow-input-mapper',
+            title: 'Workflow Inputs',
+            condition: {
+              field: 'workflowId',
+              value: '',
+              not: true, // Show when workflowId is not empty
+            },
+            dependsOn: ['workflowId'],
+          },
+        },
+      ]
+
+      return {
+        toolConfig,
+        allParameters: parameters,
+        userInputParameters: parameters.filter(
+          (param) => param.visibility === 'user-or-llm' || param.visibility === 'user-only'
+        ),
+        requiredParameters: parameters.filter((param) => param.required),
+        optionalParameters: parameters.filter(
+          (param) => param.visibility === 'user-only' && !param.required
+        ),
+      }
+    }
+
     // Get block configuration for UI component information
-    let blockConfig: BlockConfig | null = null
+    let blockConfig: ToolInputBlockConfig | null = null
     if (blockType) {
       const blockConfigs = getBlockConfigurations()
       blockConfig = blockConfigs[blockType] || null
+    }
+
+    // Build values for condition evaluation
+    // Operation should come from currentValues if provided, otherwise extract from toolId
+    const values = currentValues || {}
+    const valuesWithOperation = { ...values }
+    if (valuesWithOperation.operation === undefined) {
+      // Fallback: extract operation from tool ID (e.g., 'slack_message' -> 'message')
+      const parts = toolId.split('_')
+      valuesWithOperation.operation =
+        parts.length >= 3 ? parts.slice(2).join('_') : parts[parts.length - 1]
     }
 
     // Convert tool params to our standard format with UI component info
@@ -162,68 +346,29 @@ export function getToolParametersConfig(
           default: param.default,
         }
 
-        // Add UI component information from block config if available
         if (blockConfig) {
-          // For multi-operation tools, find the subblock that matches both the parameter ID
-          // and the current tool operation
-          let subBlock = blockConfig.subBlocks?.find((sb: SubBlockConfig) => {
-            if (sb.id !== paramId) return false
-
-            // If there's a condition, check if it matches the current tool
-            if (sb.condition && sb.condition.field === 'operation') {
-              // First try exact match with full tool ID
-              if (sb.condition.value === toolId) return true
-
-              // Then try extracting operation from tool ID
-              // For tools like 'google_calendar_quick_add', extract 'quick_add'
-              const parts = toolId.split('_')
-              if (parts.length >= 3) {
-                // Join everything after the provider prefix (e.g., 'google_calendar_')
-                const operation = parts.slice(2).join('_')
-                if (sb.condition.value === operation) return true
-              }
-
-              // Fallback to last part only
-              const operation = parts[parts.length - 1]
-              return sb.condition.value === operation
-            }
-
-            // If no condition, it's a global parameter (like apiKey)
-            return !sb.condition
-          })
-
-          // Fallback: if no operation-specific match, find any matching parameter
-          if (!subBlock) {
-            subBlock = blockConfig.subBlocks?.find((sb: SubBlockConfig) => sb.id === paramId)
-          }
-
-          // Special case: Check if this boolean parameter is part of a checkbox-list
-          if (!subBlock && param.type === 'boolean' && blockConfig) {
-            // Look for a checkbox-list that includes this parameter as an option
-            const checkboxListBlock = blockConfig.subBlocks?.find(
-              (sb: SubBlockConfig) =>
-                sb.type === 'checkbox-list' &&
-                Array.isArray(sb.options) &&
-                sb.options.some((opt: any) => opt.id === paramId)
-            )
-
-            if (checkboxListBlock) {
-              subBlock = checkboxListBlock
-            }
-          }
+          const subBlock = resolveSubBlockForParam(
+            paramId,
+            blockConfig.subBlocks || [],
+            valuesWithOperation,
+            param.type
+          )
 
           if (subBlock) {
+            if (isSubBlockHidden(subBlock)) {
+              toolParam.visibility = 'hidden'
+            }
+
             toolParam.uiComponent = {
               type: subBlock.type,
-              options: subBlock.options,
+              options: subBlock.options as Option[] | undefined,
               placeholder: subBlock.placeholder,
               password: subBlock.password,
-              condition: subBlock.condition,
+              condition: subBlock.condition as ComponentCondition | undefined,
               title: subBlock.title,
-              layout: subBlock.layout,
               value: subBlock.value,
-              provider: subBlock.provider,
               serviceId: subBlock.serviceId,
+              selectorKey: subBlock.selectorKey,
               requiredScopes: subBlock.requiredScopes,
               mimeType: subBlock.mimeType,
               columns: subBlock.columns,
@@ -233,9 +378,14 @@ export function getToolParametersConfig(
               integer: subBlock.integer,
               language: subBlock.language,
               generationType: subBlock.generationType,
-              acceptedTypes: subBlock.acceptedTypes,
+              acceptedTypes: subBlock.acceptedTypes ? [subBlock.acceptedTypes] : undefined,
               multiple: subBlock.multiple,
               maxSize: subBlock.maxSize,
+              dependsOn: subBlock.dependsOn,
+              canonicalParamId: subBlock.canonicalParamId,
+              mode: subBlock.mode,
+              actualSubBlockId: subBlock.id,
+              wandConfig: subBlock.wandConfig,
             }
           }
         }
@@ -265,7 +415,7 @@ export function getToolParametersConfig(
       optionalParameters,
     }
   } catch (error) {
-    console.error('Error getting tool parameters config:', error)
+    logger.error('Error getting tool parameters config:', error)
     return null
   }
 }
@@ -273,51 +423,261 @@ export function getToolParametersConfig(
 /**
  * Creates a tool schema for LLM with user-provided parameters excluded
  */
-export function createLLMToolSchema(
+function buildParameterSchema(
+  toolId: string,
+  paramId: string,
+  param: ToolParamDefinition,
+  options: UserToolSchemaOptions = {}
+): SchemaProperty {
+  const surface = options.surface ?? 'default'
+
+  if (surface === 'copilot' && (param.type === 'file' || param.type === 'file[]')) {
+    return buildCopilotFileParameterSchema(param)
+  }
+
+  let schemaType = param.type
+  if (schemaType === 'json' || schemaType === 'any') {
+    schemaType = 'object'
+  }
+
+  const propertySchema: SchemaProperty = {
+    type: schemaType,
+    description: param.description || '',
+  }
+
+  if (param.type === 'array' && param.items) {
+    propertySchema.items = {
+      ...param.items,
+      ...(param.items.properties && {
+        properties: { ...param.items.properties },
+      }),
+    }
+  } else if (param.items) {
+    logger.warn(`items property ignored for non-array param "${paramId}" in tool "${toolId}"`)
+  }
+
+  return propertySchema
+}
+
+function buildCopilotFileParameterSchema(param: ToolParamDefinition): SchemaProperty {
+  const baseDescription =
+    param.description ||
+    (param.type === 'file'
+      ? 'A file object for tool execution.'
+      : 'An array of file objects for tool execution.')
+  const resolutionDescription =
+    'For copilot and mothership tool calls, prefer passing canonical workspace file IDs such as "wf_123". The runtime will resolve them into full file objects before tool execution.'
+
+  const fileObjectSchema: SchemaProperty = {
+    type: 'object',
+    description: `${baseDescription} ${resolutionDescription}`,
+    properties: {
+      id: { type: 'string', description: 'Canonical workspace file ID.' },
+      name: { type: 'string', description: 'File name.' },
+      url: { type: 'string', description: 'File URL or serve path.' },
+      size: { type: 'number', description: 'File size in bytes.' },
+      type: { type: 'string', description: 'MIME type.' },
+      key: { type: 'string', description: 'Internal storage key.' },
+      context: { type: 'string', description: 'Optional file context.' },
+      base64: { type: 'string', description: 'Optional base64-encoded file contents.' },
+    },
+    required: ['id', 'name', 'url', 'size', 'type', 'key'],
+  }
+
+  if (param.type === 'file') {
+    return fileObjectSchema
+  }
+
+  return {
+    type: 'array',
+    description: `${baseDescription} ${resolutionDescription}`,
+    items: {
+      type: 'object',
+      description: 'A file object.',
+      properties: fileObjectSchema.properties,
+    },
+  }
+}
+
+export function createUserToolSchema(
   toolConfig: ToolConfig,
-  userProvidedParams: Record<string, unknown>
+  options: UserToolSchemaOptions = {}
 ): ToolSchema {
+  const surface = options.surface ?? 'default'
   const schema: ToolSchema = {
     type: 'object',
     properties: {},
     required: [],
   }
 
-  // Only include parameters that the LLM should/can provide
-  Object.entries(toolConfig.params).forEach(([paramId, param]) => {
-    const isUserProvided =
-      userProvidedParams[paramId] !== undefined &&
-      userProvidedParams[paramId] !== null &&
-      userProvidedParams[paramId] !== ''
-
-    // Skip parameters that user has already provided
-    if (isUserProvided) {
-      return
+  for (const [paramId, param] of Object.entries(toolConfig.params)) {
+    if (!param) continue
+    const visibility = param.visibility ?? 'user-or-llm'
+    if (visibility === 'hidden') {
+      continue
     }
 
-    // Skip parameters that are user-only (never shown to LLM)
-    if (param.visibility === 'user-only') {
-      return
+    const propertySchema = buildParameterSchema(toolConfig.id, paramId, param, options)
+    schema.properties[paramId] = propertySchema
+
+    if (param.required) {
+      schema.required.push(paramId)
+    }
+  }
+
+  if (toolConfig.oauth?.required && surface === 'copilot') {
+    schema.properties.credentialId = {
+      type: 'string',
+      description:
+        'Credential ID to use for this OAuth tool call. Required for Copilot/Superagent execution. Get valid IDs from environment/credentials.json.',
+    }
+    schema.required.push('credentialId')
+  }
+
+  return schema
+}
+
+export async function createLLMToolSchema(
+  toolConfig: ToolConfig,
+  userProvidedParams: Record<string, unknown>
+): Promise<LLMToolSchemaResult> {
+  const schema: ToolSchema = {
+    type: 'object',
+    properties: {},
+    required: [],
+  }
+
+  for (const [paramId, param] of Object.entries(toolConfig.params)) {
+    const enrichmentConfig = toolConfig.schemaEnrichment?.[paramId]
+
+    const isWorkflowInputMapping =
+      toolConfig.id === 'workflow_executor' && paramId === 'inputMapping'
+
+    if (enrichmentConfig) {
+      const dependencyValue = userProvidedParams[enrichmentConfig.dependsOn] as string
+      if (!dependencyValue) {
+        continue
+      }
+
+      const propertySchema = buildParameterSchema(toolConfig.id, paramId, param)
+      const enrichedSchema = await enrichmentConfig.enrichSchema(dependencyValue)
+
+      if (enrichedSchema) {
+        safeAssign(propertySchema, enrichedSchema as Record<string, unknown>)
+        schema.properties[paramId] = propertySchema
+
+        if (param.required) {
+          schema.required.push(paramId)
+        }
+      }
+      continue
     }
 
-    // Skip hidden parameters
-    if (param.visibility === 'hidden') {
-      return
+    if (!isWorkflowInputMapping) {
+      if (isNonEmpty(userProvidedParams[paramId])) {
+        continue
+      }
+
+      if (param.visibility === 'user-only') {
+        continue
+      }
+
+      if (param.visibility === 'hidden') {
+        continue
+      }
     }
 
-    // Add parameter to LLM schema
-    schema.properties[paramId] = {
-      type: param.type === 'json' ? 'object' : param.type,
-      description: param.description || '',
+    const propertySchema = buildParameterSchema(toolConfig.id, paramId, param)
+
+    if (isWorkflowInputMapping) {
+      const workflowId = userProvidedParams.workflowId as string
+      if (workflowId) {
+        await applyDynamicSchemaForWorkflow(propertySchema, workflowId)
+      }
     }
 
-    // Add to required if LLM must provide it and it's originally required
+    schema.properties[paramId] = propertySchema
+
     if ((param.visibility === 'user-or-llm' || param.visibility === 'llm-only') && param.required) {
       schema.required.push(paramId)
     }
-  })
+  }
 
-  return schema
+  if (toolConfig.toolEnrichment) {
+    const dependencyValue = userProvidedParams[toolConfig.toolEnrichment.dependsOn] as string
+    if (dependencyValue) {
+      const enriched = await toolConfig.toolEnrichment.enrichTool(
+        dependencyValue,
+        schema,
+        toolConfig.description
+      )
+      if (enriched) {
+        return {
+          schema: enriched.parameters as ToolSchema,
+          enrichedDescription: enriched.description,
+        }
+      }
+    }
+  }
+
+  return { schema }
+}
+
+/**
+ * Apply dynamic schema enrichment for workflow_executor's inputMapping parameter
+ */
+async function applyDynamicSchemaForWorkflow(
+  propertySchema: any,
+  workflowId: string
+): Promise<void> {
+  try {
+    const workflowInputFields = await fetchWorkflowInputFields(workflowId)
+
+    if (workflowInputFields && workflowInputFields.length > 0) {
+      propertySchema.type = 'object'
+      propertySchema.properties = {}
+      propertySchema.required = []
+
+      // Convert workflow input fields to JSON schema properties
+      for (const field of workflowInputFields) {
+        propertySchema.properties[field.name] = {
+          type: field.type || 'string',
+          description: field.description || `Input field: ${field.name}`,
+        }
+        propertySchema.required.push(field.name)
+      }
+
+      // Update description to be more specific
+      propertySchema.description = `Input values for the workflow. Required fields: ${workflowInputFields.map((f) => f.name).join(', ')}`
+    }
+  } catch (error) {
+    logger.error('Failed to fetch workflow input fields for LLM schema:', error)
+  }
+}
+
+/**
+ * Fetches workflow input fields from the API.
+ */
+async function fetchWorkflowInputFields(
+  workflowId: string
+): Promise<Array<{ name: string; type: string; description?: string }>> {
+  try {
+    const { buildAuthHeaders, buildAPIUrl } = await import('@/executor/utils/http')
+
+    const headers = await buildAuthHeaders()
+    const url = buildAPIUrl(`/api/workflows/${workflowId}`)
+
+    const response = await fetch(url.toString(), { headers })
+    if (!response.ok) {
+      throw new Error('Failed to fetch workflow')
+    }
+
+    const { data } = await response.json()
+    return extractInputFieldsFromBlocks(data?.state?.blocks)
+  } catch (error) {
+    logger.error('Error fetching workflow input fields:', error)
+    return []
+  }
 }
 
 /**
@@ -331,10 +691,26 @@ export function createExecutionToolSchema(toolConfig: ToolConfig): ToolSchema {
   }
 
   Object.entries(toolConfig.params).forEach(([paramId, param]) => {
-    schema.properties[paramId] = {
+    const propertySchema: any = {
       type: param.type === 'json' ? 'object' : param.type,
       description: param.description || '',
     }
+
+    // Include items property for arrays
+    if (param.type === 'array' && param.items) {
+      propertySchema.items = {
+        ...param.items,
+        ...(param.items.properties && {
+          properties: { ...param.items.properties },
+        }),
+      }
+    } else if (param.items) {
+      logger.warn(
+        `items property ignored for non-array param "${paramId}" in tool "${toolConfig.id}"`
+      )
+    }
+
+    schema.properties[paramId] = propertySchema
 
     if (param.required) {
       schema.required.push(paramId)
@@ -345,17 +721,101 @@ export function createExecutionToolSchema(toolConfig: ToolConfig): ToolSchema {
 }
 
 /**
- * Merges user-provided parameters with LLM-generated parameters
+ * Deep merges inputMapping objects, where LLM values fill in empty/missing user values.
+ * User-provided non-empty values take precedence.
+ */
+export function deepMergeInputMapping(
+  llmInputMapping: Record<string, unknown> | undefined,
+  userInputMapping: Record<string, unknown> | string | undefined
+): Record<string, unknown> {
+  // Parse user inputMapping if it's a JSON string
+  let parsedUserMapping: Record<string, unknown> = {}
+  if (typeof userInputMapping === 'string') {
+    try {
+      const parsed = JSON.parse(userInputMapping)
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        parsedUserMapping = parsed
+      }
+    } catch {
+      // Invalid JSON, treat as empty
+    }
+  } else if (
+    typeof userInputMapping === 'object' &&
+    userInputMapping !== null &&
+    !Array.isArray(userInputMapping)
+  ) {
+    parsedUserMapping = userInputMapping
+  }
+
+  // If no LLM mapping, return user mapping (or empty)
+  if (!llmInputMapping || typeof llmInputMapping !== 'object') {
+    return parsedUserMapping
+  }
+
+  // Deep merge: LLM values as base, user non-empty values override
+  // If user provides empty object {}, LLM values fill all fields (intentional)
+  const merged: Record<string, unknown> = { ...llmInputMapping }
+
+  for (const [key, userValue] of Object.entries(parsedUserMapping)) {
+    // Only override LLM value if user provided a non-empty value
+    if (isNonEmpty(userValue)) {
+      merged[key] = userValue
+    }
+  }
+
+  return merged
+}
+
+/**
+ * Merges user-provided parameters with LLM-generated parameters.
+ * User-provided parameters take precedence, but empty strings are skipped
+ * so that LLM-generated values are used when user clears a field.
+ *
+ * Special handling for inputMapping: deep merges so LLM can fill in
+ * fields that user left empty in the UI.
  */
 export function mergeToolParameters(
   userProvidedParams: Record<string, unknown>,
   llmGeneratedParams: Record<string, unknown>
 ): Record<string, unknown> {
-  // User-provided parameters take precedence
-  return {
-    ...llmGeneratedParams,
-    ...userProvidedParams,
+  // Filter out empty and effectively-empty values from user-provided params
+  // so that cleared fields don't override LLM values
+  const filteredUserParams: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(userProvidedParams)) {
+    if (isNonEmpty(value)) {
+      // Skip tag-based params if they're effectively empty (only default/unfilled entries)
+      if ((key === 'documentTags' || key === 'tagFilters') && isEmptyTagValue(value)) {
+        continue
+      }
+      filteredUserParams[key] = value
+    }
   }
+
+  // Start with LLM params as base
+  const result: Record<string, unknown> = { ...llmGeneratedParams }
+
+  // Apply user params, with special handling for inputMapping
+  for (const [key, userValue] of Object.entries(filteredUserParams)) {
+    if (key === 'inputMapping') {
+      // Deep merge inputMapping so LLM values fill in empty user fields
+      const llmInputMapping = llmGeneratedParams.inputMapping as Record<string, unknown> | undefined
+      const mergedInputMapping = deepMergeInputMapping(
+        llmInputMapping,
+        userValue as Record<string, unknown> | string | undefined
+      )
+      result.inputMapping = mergedInputMapping
+    } else {
+      // Normal override for other params
+      result[key] = userValue
+    }
+  }
+
+  // If LLM provided inputMapping but user didn't, ensure it's included
+  if (llmGeneratedParams.inputMapping && !filteredUserParams.inputMapping) {
+    result.inputMapping = llmGeneratedParams.inputMapping
+  }
+
+  return result
 }
 
 /**
@@ -374,11 +834,7 @@ export function filterSchemaForLLM(
 
   // Remove user-provided parameters from the schema
   Object.keys(userProvidedParams).forEach((paramKey) => {
-    if (
-      userProvidedParams[paramKey] !== undefined &&
-      userProvidedParams[paramKey] !== null &&
-      userProvidedParams[paramKey] !== ''
-    ) {
+    if (isNonEmpty(userProvidedParams[paramKey])) {
       delete filteredProperties[paramKey]
       const reqIndex = filteredRequired.indexOf(paramKey)
       if (reqIndex > -1) {
@@ -477,4 +933,200 @@ export function formatParameterLabel(paramId: string): string {
 
   // Simple case - just capitalize first letter
   return paramId.charAt(0).toUpperCase() + paramId.slice(1)
+}
+
+/**
+ * SubBlock IDs that control tool routing, not user-facing parameters.
+ * Excluded from tool-input rendering unless they have an explicit paramVisibility set.
+ */
+const STRUCTURAL_SUBBLOCK_IDS = new Set(['operation'])
+
+/**
+ * SubBlock types that represent auth/credential inputs handled separately
+ * by the tool-input OAuth credential selector.
+ */
+const AUTH_SUBBLOCK_TYPES = new Set(['oauth-input'])
+
+/**
+ * SubBlock types that should never appear in tool-input context.
+ */
+const EXCLUDED_SUBBLOCK_TYPES = new Set([
+  'tool-input',
+  'skill-input',
+  'condition-input',
+  'eval-input',
+  'webhook-config',
+  'schedule-info',
+  'input-format',
+  'response-format',
+  'mcp-server-selector',
+  'mcp-tool-selector',
+  'mcp-dynamic-args',
+  'input-mapping',
+  'variables-input',
+  'messages-input',
+  'router-input',
+  'text',
+])
+
+export interface SubBlocksForToolInput {
+  toolConfig: ToolConfig
+  subBlocks: BlockSubBlockConfig[]
+  oauthConfig?: OAuthConfig
+}
+
+/**
+ * Returns filtered SubBlockConfig[] for rendering in tool-input context.
+ * Uses subblock definitions as the primary source of UI metadata,
+ * getting all features (wandConfig, rich conditions, dependsOn, etc.) for free.
+ *
+ * For blocks without paramVisibility annotations, falls back to inferring
+ * visibility from the tool's param definitions.
+ */
+export function getSubBlocksForToolInput(
+  toolId: string,
+  blockType: string,
+  currentValues?: Record<string, unknown>,
+  canonicalModeOverrides?: CanonicalModeOverrides,
+  blockConfigOverride?: Pick<ToolInputBlockConfig, 'subBlocks'>
+): SubBlocksForToolInput | null {
+  try {
+    const toolConfig = getTool(toolId)
+    if (!toolConfig) {
+      logger.warn(`Tool not found: ${toolId}`)
+      return null
+    }
+
+    const blockConfigs = getBlockConfigurations()
+    const blockConfig = blockConfigOverride ?? blockConfigs[blockType]
+    if (!blockConfig?.subBlocks?.length) {
+      return null
+    }
+
+    const allSubBlocks = blockConfig.subBlocks as BlockSubBlockConfig[]
+    const canonicalIndex = buildCanonicalIndex(allSubBlocks)
+
+    // Build values for condition evaluation
+    const values = currentValues || {}
+    const valuesWithOperation = { ...values }
+    if (valuesWithOperation.operation === undefined) {
+      const parts = toolId.split('_')
+      valuesWithOperation.operation =
+        parts.length >= 3 ? parts.slice(2).join('_') : parts[parts.length - 1]
+    }
+
+    // Build a map of tool param IDs to their resolved visibility
+    const toolParamVisibility: Record<string, ParameterVisibility> = {}
+    for (const [paramId, param] of Object.entries(toolConfig.params || {})) {
+      toolParamVisibility[paramId] =
+        param.visibility ?? (param.required ? 'user-or-llm' : 'user-only')
+    }
+
+    // Track which canonical groups we've already included (to avoid duplicates)
+    const includedCanonicalIds = new Set<string>()
+
+    const filtered: BlockSubBlockConfig[] = []
+
+    for (const sb of allSubBlocks) {
+      // Skip excluded types
+      if (EXCLUDED_SUBBLOCK_TYPES.has(sb.type)) continue
+
+      // Skip trigger-mode-only subblocks
+      if (isTriggerModeSubBlock(sb)) continue
+
+      // Hide tool API key fields when running on hosted Sim or when env var is set
+      if (isSubBlockHidden(sb)) continue
+
+      // Determine the effective param ID (canonical or subblock id)
+      const effectiveParamId = sb.canonicalParamId || sb.id
+
+      // Resolve paramVisibility: explicit > inferred from tool params > skip
+      let visibility = sb.paramVisibility
+      if (!visibility) {
+        // Infer from structural checks
+        if (STRUCTURAL_SUBBLOCK_IDS.has(sb.id)) {
+          visibility = 'hidden'
+        } else if (AUTH_SUBBLOCK_TYPES.has(sb.type) && sb.canonicalParamId !== 'oauthCredential') {
+          visibility = 'hidden'
+        } else if (sb.canonicalParamId === 'oauthCredential') {
+          visibility = 'user-only'
+        } else if (
+          sb.password &&
+          (sb.id === 'botToken' || sb.id === 'accessToken' || sb.id === 'apiKey')
+        ) {
+          // Auth tokens without explicit paramVisibility are hidden
+          // (they're handled by the OAuth credential selector or structurally)
+          // But only if they don't have a matching tool param
+          if (!(sb.id in toolParamVisibility)) {
+            visibility = 'hidden'
+          } else {
+            visibility = toolParamVisibility[sb.id] || 'user-or-llm'
+          }
+        } else if (effectiveParamId in toolParamVisibility) {
+          // Fallback: infer from tool param visibility
+          visibility = toolParamVisibility[effectiveParamId]
+        } else if (sb.id in toolParamVisibility) {
+          visibility = toolParamVisibility[sb.id]
+        } else if (sb.canonicalParamId) {
+          visibility = 'user-or-llm'
+        } else {
+          continue
+        }
+      }
+
+      // Filter by visibility: exclude hidden and llm-only
+      if (visibility === 'hidden' || visibility === 'llm-only') continue
+
+      if (sb.condition && !sb.reactiveCondition) {
+        const conditionMet = evaluateSubBlockCondition(
+          sb.condition as SubBlockCondition,
+          valuesWithOperation
+        )
+        if (!conditionMet) continue
+      }
+
+      // Handle canonical pairs: only include the active mode variant
+      const canonicalId = canonicalIndex.canonicalIdBySubBlockId[sb.id]
+      if (canonicalId) {
+        const group = canonicalIndex.groupsById[canonicalId]
+        if (group && isCanonicalPair(group)) {
+          if (includedCanonicalIds.has(canonicalId)) continue
+          includedCanonicalIds.add(canonicalId)
+
+          // Determine active mode
+          const mode = resolveCanonicalMode(group, valuesWithOperation, canonicalModeOverrides)
+          if (mode === 'advanced') {
+            // Find the advanced variant
+            const advancedSb = allSubBlocks.find((s) => group.advancedIds.includes(s.id))
+            if (advancedSb) {
+              filtered.push({ ...advancedSb, paramVisibility: visibility })
+            }
+          } else {
+            // Include basic variant (current sb if it's the basic one)
+            if (group.basicId === sb.id) {
+              filtered.push({ ...sb, paramVisibility: visibility })
+            } else {
+              const basicSb = allSubBlocks.find((s) => s.id === group.basicId)
+              if (basicSb) {
+                filtered.push({ ...basicSb, paramVisibility: visibility })
+              }
+            }
+          }
+          continue
+        }
+      }
+
+      // Non-canonical, non-hidden, condition-passing subblock
+      filtered.push({ ...sb, paramVisibility: visibility })
+    }
+
+    return {
+      toolConfig,
+      subBlocks: filtered,
+      oauthConfig: toolConfig.oauth,
+    }
+  } catch (error) {
+    logger.error('Error getting subblocks for tool input:', error)
+    return null
+  }
 }
