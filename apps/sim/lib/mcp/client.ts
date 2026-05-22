@@ -8,6 +8,7 @@
  * - Custom security/consent layer
  */
 
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import {
@@ -18,6 +19,7 @@ import {
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { getMaxExecutionTimeout } from '@/lib/core/execution-limits'
+import { McpOauthRedirectRequired } from '@/lib/mcp/oauth'
 import { createMcpPinnedFetch } from '@/lib/mcp/pinned-fetch'
 import {
   type McpClientOptions,
@@ -34,6 +36,7 @@ import {
   type McpToolsChangedCallback,
   type McpVersionInfo,
 } from '@/lib/mcp/types'
+import { MCP_CLIENT_CONSTANTS } from '@/lib/mcp/utils'
 
 const logger = createLogger('McpClient')
 
@@ -44,6 +47,7 @@ export class McpClient {
   private connectionStatus: McpConnectionStatus
   private securityPolicy: McpSecurityPolicy
   private onToolsChanged?: McpToolsChangedCallback
+  private authProvider?: McpClientOptions['authProvider']
   private isConnected = false
 
   private static readonly SUPPORTED_VERSIONS = [
@@ -60,6 +64,7 @@ export class McpClient {
       maxToolExecutionsPerHour: 1000,
     }
     this.onToolsChanged = options.onToolsChanged
+    this.authProvider = options.authProvider
     const resolvedIP = options.resolvedIP
 
     this.connectionStatus = { connected: false }
@@ -68,10 +73,13 @@ export class McpClient {
       throw new McpError('URL required for Streamable HTTP transport')
     }
 
+    if (this.config.authType === 'oauth' && this.authProvider == null) {
+      throw new McpError('OAuth MCP server requires an authProvider')
+    }
+    const useOauth = this.config.authType === 'oauth'
     this.transport = new StreamableHTTPClientTransport(new URL(this.config.url), {
-      requestInit: {
-        headers: this.config.headers,
-      },
+      authProvider: useOauth ? this.authProvider : undefined,
+      requestInit: { headers: this.config.headers },
       ...(resolvedIP ? { fetch: createMcpPinnedFetch(resolvedIP) } : {}),
     })
 
@@ -115,9 +123,13 @@ export class McpClient {
         protocolVersion: serverVersion,
       })
     } catch (error) {
+      this.isConnected = false
+      if (error instanceof McpOauthRedirectRequired || error instanceof UnauthorizedError) {
+        this.connectionStatus.lastError = undefined
+        throw error
+      }
       const errorMessage = getErrorMessage(error, 'Unknown error')
       this.connectionStatus.lastError = errorMessage
-      this.isConnected = false
       logger.error(`Failed to connect to MCP server ${this.config.name}:`, error)
       throw new McpConnectionError(errorMessage, this.config.name)
     }
@@ -156,7 +168,9 @@ export class McpClient {
     }
 
     try {
-      const result: ListToolsResult = await this.client.listTools()
+      const result: ListToolsResult = await this.client.listTools(undefined, {
+        timeout: MCP_CLIENT_CONSTANTS.LIST_TOOLS_TIMEOUT_MS,
+      })
 
       if (!result.tools || !Array.isArray(result.tools)) {
         logger.warn(`Invalid tools response from server ${this.config.name}:`, result)

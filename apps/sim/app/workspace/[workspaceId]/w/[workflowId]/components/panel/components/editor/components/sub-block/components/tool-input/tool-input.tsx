@@ -51,6 +51,7 @@ import type { WandControlHandlers } from '@/app/workspace/[workspaceId]/w/[workf
 import { getAllBlocks } from '@/blocks'
 import type { SubBlockConfig as BlockSubBlockConfig } from '@/blocks/types'
 import { BUILT_IN_TOOL_TYPES } from '@/blocks/utils'
+import { useMcpOauthPopup } from '@/hooks/mcp/use-mcp-oauth-popup'
 import { useMcpTools } from '@/hooks/mcp/use-mcp-tools'
 import { useWorkspaceCredential } from '@/hooks/queries/credentials'
 import {
@@ -212,7 +213,7 @@ function WorkflowToolDeployBadge({
   workflowId: string
   onDeploySuccess?: () => void
 }) {
-  const { data, isLoading } = useDeploymentInfo(workflowId, { refetchOnMount: 'always' })
+  const { data, isLoading } = useDeploymentInfo(workflowId)
   const { mutate, isPending: isDeploying } = useDeployWorkflow()
   const userPermissions = useUserPermissionsContext()
 
@@ -514,10 +515,11 @@ export const ToolInput = memo(function ToolInput({
 
   const { data: mcpServers = [], isLoading: mcpServersLoading } = useMcpServers(workspaceId)
   const { data: storedMcpTools = [] } = useStoredMcpTools(workspaceId)
-  const forceRefreshMcpTools = useForceRefreshMcpTools()
+  const forceRefreshMcpTools = useForceRefreshMcpTools().mutate
   useMcpToolsEvents(workspaceId)
   const { navigateToSettings } = useSettingsNavigation()
   const createMcpServer = useCreateMcpServer()
+  const { startOauthForServer } = useMcpOauthPopup({ workspaceId })
   const { data: allowedMcpDomains = null } = useAllowedMcpDomains()
   const availableEnvVars = useAvailableEnvVarKeys(workspaceId)
   const mcpDataLoading = mcpLoading || mcpServersLoading
@@ -2114,7 +2116,13 @@ export const ToolInput = memo(function ToolInput({
         onOpenChange={setMcpModalOpen}
         mode='add'
         onSubmit={async (config) => {
-          await createMcpServer.mutateAsync({ workspaceId, config: { ...config, enabled: true } })
+          const result = await createMcpServer.mutateAsync({
+            workspaceId,
+            config: { ...config, enabled: true },
+          })
+          if (result.authType === 'oauth') {
+            await startOauthForServer(result.serverId)
+          }
         }}
         workspaceId={workspaceId}
         availableEnvVars={availableEnvVars}
