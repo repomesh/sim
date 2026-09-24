@@ -1,32 +1,27 @@
 /**
  * @vitest-environment node
  */
-import { createMockRequest } from '@sim/testing'
+import { authMockFns, createMockRequest } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { OrchestrationError } from '@/lib/core/orchestration/types'
 
 const {
-  mockGetSession,
-  mockAssertWorkspaceAdminAccess,
+  mockAuthorizeWorkspaceOperation,
   mockGetForkParent,
   mockGetForkChildren,
   mockGetUndoableRunForTarget,
   mockGetEffectiveWorkspacePermission,
 } = vi.hoisted(() => ({
-  mockGetSession: vi.fn(),
-  mockAssertWorkspaceAdminAccess: vi.fn(),
+  mockAuthorizeWorkspaceOperation: vi.fn(),
   mockGetForkParent: vi.fn(),
   mockGetForkChildren: vi.fn(),
   mockGetUndoableRunForTarget: vi.fn(),
   mockGetEffectiveWorkspacePermission: vi.fn(),
 }))
 
-vi.mock('@/lib/auth', () => ({
-  auth: { api: { getSession: vi.fn() } },
-  getSession: mockGetSession,
-}))
-
 vi.mock('@/ee/workspace-forking/lib/lineage/authz', () => ({
-  assertWorkspaceAdminAccess: mockAssertWorkspaceAdminAccess,
+  assertForkingEnabled: vi.fn(),
+  ForkError: class extends Error {},
 }))
 
 vi.mock('@/ee/workspace-forking/lib/lineage/lineage', () => ({
@@ -38,11 +33,23 @@ vi.mock('@/ee/workspace-forking/lib/promote/promote-run-store', () => ({
   getUndoableRunForTarget: mockGetUndoableRunForTarget,
 }))
 
+vi.mock('@/lib/core/application/workspace-authorization', () => ({
+  authorizeWorkspaceOperation: mockAuthorizeWorkspaceOperation,
+  requireAllowedWorkspacePrincipal: vi.fn(),
+}))
+
 vi.mock('@/lib/workspaces/permissions/utils', () => ({
+  getWorkspaceWithOwner: vi.fn(async (id: string) => ({
+    id,
+    organizationId: null,
+    allowPersonalApiKeys: true,
+  })),
   getEffectiveWorkspacePermission: mockGetEffectiveWorkspacePermission,
 }))
 
 import { GET } from '@/app/api/workspaces/[id]/fork/lineage/route'
+
+const mockGetSession = authMockFns.mockGetSession
 
 const WORKSPACE_ID = 'workspace-1'
 const VIEWER_ID = 'user-1'
@@ -60,8 +67,8 @@ const childNode = (id: string, name: string) => ({
 describe('fork lineage route', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockGetSession.mockResolvedValue({ user: { id: VIEWER_ID } })
-    mockAssertWorkspaceAdminAccess.mockResolvedValue({ id: WORKSPACE_ID })
+    mockGetSession.mockResolvedValue({ user: { id: VIEWER_ID }, session: { id: 'session-1' } })
+    mockAuthorizeWorkspaceOperation.mockResolvedValue(undefined)
     mockGetForkParent.mockResolvedValue(null)
     mockGetForkChildren.mockResolvedValue([])
     mockGetUndoableRunForTarget.mockResolvedValue(null)
@@ -74,13 +81,34 @@ describe('fork lineage route', () => {
     const res = await GET(createMockRequest('GET'), routeContext)
 
     expect(res.status).toBe(401)
-    expect(mockAssertWorkspaceAdminAccess).not.toHaveBeenCalled()
+    expect(mockAuthorizeWorkspaceOperation).not.toHaveBeenCalled()
   })
 
   it('requires admin on the current workspace before loading lineage', async () => {
     await GET(createMockRequest('GET'), routeContext)
 
-    expect(mockAssertWorkspaceAdminAccess).toHaveBeenCalledWith(WORKSPACE_ID, VIEWER_ID)
+    expect(mockAuthorizeWorkspaceOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'session', userId: VIEWER_ID }),
+      expect.objectContaining({ id: 'workspaces.fork.discover', minimumRole: 'admin' }),
+      expect.objectContaining({ workspaceId: WORKSPACE_ID }),
+      {}
+    )
+    expect(mockAuthorizeWorkspaceOperation.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGetForkParent.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('does not read lineage when current workspace authorization is refused', async () => {
+    mockAuthorizeWorkspaceOperation.mockRejectedValue(
+      new OrchestrationError('forbidden', 'Admin access required')
+    )
+
+    const response = await GET(createMockRequest('GET'), routeContext)
+
+    expect(response.status).toBe(403)
+    expect(mockGetForkParent).not.toHaveBeenCalled()
+    expect(mockGetForkChildren).not.toHaveBeenCalled()
+    expect(mockGetUndoableRunForTarget).not.toHaveBeenCalled()
   })
 
   it('marks accessible and inaccessible nodes via the canonical permission resolver', async () => {

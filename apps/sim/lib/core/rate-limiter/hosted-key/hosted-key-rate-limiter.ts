@@ -1,5 +1,5 @@
 import { createLogger } from '@sim/logger'
-import { sleep } from '@sim/utils/helpers'
+import { interruptibleSleep } from '@sim/utils/helpers'
 import { generateShortId } from '@sim/utils/id'
 import { getMaxExecutionTimeout } from '@/lib/core/execution-limits'
 import {
@@ -54,36 +54,17 @@ const MIN_QUEUE_RETRY_DELAY_MS = 50
 const QUEUE_HEAD_POLL_MS = 200
 
 /**
- * Sleep for `ms`, resolving early if `signal` aborts. Cleans up its own timer and listener
- * so neither leaks. Callers don't need to distinguish an early (aborted) return from a normal
- * one — the surrounding wait loop re-checks its budget immediately after and bails when the
- * signal has fired. Falls back to a plain sleep when no signal is provided.
- */
-function interruptibleSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (!signal) return sleep(ms)
-  if (signal.aborted) return Promise.resolve()
-  return new Promise<void>((resolve) => {
-    const onAbort = () => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    signal.addEventListener('abort', onAbort, { once: true })
-    // Catch an abort that fired between the guard above and addEventListener.
-    if (signal.aborted) onAbort()
-  })
-}
-
-/**
- * Resolves env var names for a numbered key prefix using a `{PREFIX}_COUNT` env var.
- * E.g. with `EXA_API_KEY_COUNT=5`, returns `['EXA_API_KEY_1', ..., 'EXA_API_KEY_5']`.
+ * Resolves env var names for a hosted-key prefix. Numbered pools use a
+ * `{PREFIX}_COUNT` env var. Deployments that still provide one legacy singular
+ * `{PREFIX}` key remain supported when no count is configured.
  */
 function resolveEnvKeys(prefix: string): string[] {
-  const count = Number.parseInt(process.env[`${prefix}_COUNT`] || '0', 10)
+  const countValue = process.env[`${prefix}_COUNT`]
+  if (countValue === undefined) {
+    return process.env[prefix] ? [prefix] : []
+  }
+
+  const count = Number.parseInt(countValue, 10)
   const names: string[] = []
   for (let i = 1; i <= count; i++) {
     names.push(`${prefix}_${i}`)
@@ -272,7 +253,8 @@ export class HostedKeyRateLimiter {
    * back to `MAX_QUEUE_WAIT_MS`. On exhaustion the call returns today's 429 result. The
    * ticket is removed from the queue on exit regardless of success or failure.
    *
-   * @param envKeyPrefix - Env var prefix (e.g. 'EXA_API_KEY'). Keys resolved via `{prefix}_COUNT`.
+   * @param envKeyPrefix - Env var prefix (e.g. 'EXA_API_KEY'). Uses a numbered
+   * pool via `{prefix}_COUNT`, or the singular prefix when no count is set.
    * @param billingActorId - The billing actor (typically workspace ID) to rate limit against
    * @param signal - Optional execution `AbortSignal`; bounds the queue wait to the run's budget.
    */

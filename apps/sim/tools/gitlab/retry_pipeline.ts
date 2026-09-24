@@ -7,6 +7,7 @@ export const gitlabRetryPipelineTool: ToolConfig<
   GitLabRetryPipelineResponse
 > = {
   id: 'gitlab_retry_pipeline',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Retry Pipeline',
   description: 'Retry a failed GitLab pipeline',
   version: '1.0.0',
@@ -28,7 +29,7 @@ export const gitlabRetryPipelineTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     pipelineId: {
       type: 'number',

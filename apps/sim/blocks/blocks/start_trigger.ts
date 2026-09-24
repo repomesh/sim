@@ -25,6 +25,15 @@ export const StartTriggerBlock: BlockConfig = {
       type: 'input-format',
       description: 'Add custom fields beyond the built-in input, conversationId, and files fields.',
     },
+    {
+      id: 'runMetadata',
+      title: 'Add run metadata',
+      type: 'switch',
+      mode: 'advanced',
+      defaultValue: false,
+      description:
+        'Expose trusted, server-injected run metadata under <start.metadata>: subject, workspaceId, workflowId, executionId, executionType, executionMode, startTime. The subject identifies the authenticated Sim user, chat email, or external provider user without exposing credentials.',
+    },
   ],
   tools: {
     access: [],

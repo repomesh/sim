@@ -1,9 +1,17 @@
+import {
+  type WorkspaceSearchFilters,
+  workspaceSearchFiltersSchema,
+} from '@/lib/api/contracts/knowledge/search'
 /**
  * Safe localStorage utilities with SSR support
  * Provides clean error handling and type safety for browser storage operations
  */
 
 import { createLogger } from '@sim/logger'
+import type {
+  ChatRequestMode,
+  FileAttachmentForApi,
+} from '@/app/workspace/[workspaceId]/home/types'
 import type { ChatContext } from '@/stores/panel'
 
 const logger = createLogger('BrowserStorage')
@@ -109,11 +117,39 @@ export const STORAGE_KEYS = {
 
 export class WorkspaceRecencyStorage {
   private static readonly KEY = STORAGE_KEYS.WORKSPACE_RECENCY
+  private static readonly CHANGE_EVENT = 'workspace-recency-changed'
+
+  static subscribe(onChange: () => void): () => void {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === WorkspaceRecencyStorage.KEY || event.key === null) onChange()
+    }
+    window.addEventListener('storage', onStorage)
+    window.addEventListener(WorkspaceRecencyStorage.CHANGE_EVENT, onChange)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener(WorkspaceRecencyStorage.CHANGE_EVENT, onChange)
+    }
+  }
+
+  /** A stable snapshot lets both sidebars follow visits without render-time writes. */
+  static getSnapshot(): string | null {
+    try {
+      return window.localStorage.getItem(WorkspaceRecencyStorage.KEY)
+    } catch {
+      return null
+    }
+  }
+
+  private static save(map: Record<string, number>): void {
+    if (BrowserStorage.setItem(WorkspaceRecencyStorage.KEY, map)) {
+      window.dispatchEvent(new Event(WorkspaceRecencyStorage.CHANGE_EVENT))
+    }
+  }
 
   static touch(workspaceId: string): void {
     const map = WorkspaceRecencyStorage.getAll()
     map[workspaceId] = Date.now()
-    BrowserStorage.setItem(WorkspaceRecencyStorage.KEY, map)
+    WorkspaceRecencyStorage.save(map)
   }
 
   static getAll(): Record<string, number> {
@@ -131,7 +167,7 @@ export class WorkspaceRecencyStorage {
   static remove(workspaceId: string): void {
     const map = WorkspaceRecencyStorage.getAll()
     delete map[workspaceId]
-    BrowserStorage.setItem(WorkspaceRecencyStorage.KEY, map)
+    WorkspaceRecencyStorage.save(map)
   }
 
   /**
@@ -148,7 +184,7 @@ export class WorkspaceRecencyStorage {
       }
     }
     if (pruned) {
-      BrowserStorage.setItem(WorkspaceRecencyStorage.KEY, map)
+      WorkspaceRecencyStorage.save(map)
     }
   }
 
@@ -300,17 +336,43 @@ export class LandingWorkflowSeedStorage {
 }
 
 export interface MothershipHandoff {
-  /** The message to auto-send to Chat once the home surface mounts. */
-  message: string
+  /**
+   * Message to auto-send once the home surface mounts. Omit for a chip-only
+   * handoff, which seeds `contexts` into the input and waits for the user.
+   */
+  message?: string
   /** Structured contexts to attach — e.g. a `logs` mention tagging a run. */
   contexts?: ChatContext[]
+  /** Already-uploaded attachment references riding along with the message. */
+  fileAttachments?: FileAttachmentForApi[]
+  /**
+   * Set only when this handoff is the recovery of a send an unmount cleanup
+   * withdrew: that attempt's message id. The consuming chat reuses it so the
+   * server deduplicates against the first attempt instead of opening a second
+   * chat and billing a second turn.
+   */
+  resumeUserMessageId?: string
+  /** The request mode the withdrawn send asked for, so a retry stays the same kind of turn. */
+  requestMode?: ChatRequestMode
+  assistantSearch?: WorkspaceSearchFilters
+}
+
+type MothershipHandoffOwner = string | { organizationId: string }
+
+interface StoredHandoff extends MothershipHandoff {
+  workspaceId?: string
+  organizationId?: string
+  timestamp?: number
 }
 
 /**
- * One-shot handoff that seeds an auto-sent Chat (mothership) message when the
- * user is routed to the workspace home from elsewhere in the app — e.g. the
- * "Troubleshoot in Chat" action on an errored log, which tags the failed run
- * and asks Sim to fix it.
+ * One-shot handoff that seeds Chat (mothership) when the user is routed to the
+ * workspace home from elsewhere in the app. Two shapes share this slot:
+ *
+ * - **With a message** — auto-sent on mount, e.g. the "Troubleshoot in Chat"
+ *   action on an errored log, which tags the failed run and asks Sim to fix it.
+ * - **Chips only** — the highlight-to-chat action on the standalone Files and
+ *   Tables pages, which attaches reference chips and sends nothing.
  *
  * The home surface consumes this exactly once on mount. A short max-age guards
  * against a stale handoff firing on a later, unrelated visit, and `consume`
@@ -319,23 +381,67 @@ export interface MothershipHandoff {
 export class MothershipHandoffStorage {
   private static readonly KEY = STORAGE_KEYS.MOTHERSHIP_HANDOFF
 
+  /** How long a stored handoff stays eligible to fire, in milliseconds. */
+  static readonly MAX_AGE_MS = 60 * 1000
+
   /**
-   * Store a handoff to be auto-sent on the next home-surface mount, scoped to
-   * the workspace it targets so a different workspace never claims it.
-   * @returns True if stored, false when the message or workspace is empty.
+   * Store a handoff for the next home-surface mount, scoped to the workspace it
+   * targets so a different workspace never claims it. Chip-only handoffs
+   * accumulate — "Add to chat" can fire twice before the route swap completes,
+   * and the second write must not drop the first.
+   * @returns True if stored, false when the workspace is empty or the handoff
+   * carries no message, context, or attachment.
    */
-  static store(handoff: MothershipHandoff, workspaceId: string): boolean {
-    const message = handoff.message.trim()
-    if (!message || !workspaceId) {
+  static store(handoff: MothershipHandoff, owner: MothershipHandoffOwner): boolean {
+    const workspaceId = typeof owner === 'string' ? owner : undefined
+    const organizationId = typeof owner === 'string' ? undefined : owner.organizationId
+    const message = handoff.message?.trim()
+    const hasAttachments = Boolean(handoff.fileAttachments?.length)
+    const contexts = handoff.contexts ?? []
+    if (
+      !(workspaceId || organizationId) ||
+      (!message && !hasAttachments && contexts.length === 0)
+    ) {
       return false
     }
 
     return BrowserStorage.setItem(MothershipHandoffStorage.KEY, {
-      message,
-      contexts: handoff.contexts,
+      ...(message || hasAttachments ? { message: message ?? '' } : {}),
+      contexts:
+        message || hasAttachments
+          ? contexts
+          : [...MothershipHandoffStorage.pendingContexts(owner), ...contexts],
+      ...(handoff.fileAttachments?.length ? { fileAttachments: handoff.fileAttachments } : {}),
+      ...(handoff.resumeUserMessageId ? { resumeUserMessageId: handoff.resumeUserMessageId } : {}),
+      ...(handoff.requestMode ? { requestMode: handoff.requestMode } : {}),
+      ...(handoff.assistantSearch ? { assistantSearch: handoff.assistantSearch } : {}),
       workspaceId,
+      organizationId,
       timestamp: Date.now(),
     })
+  }
+
+  /**
+   * Contexts of an un-consumed chip-only handoff for `workspaceId`, else empty.
+   *
+   * Applies the same freshness bar as {@link consume}: accumulating carries the
+   * old contexts onto a write that stamps a new `timestamp`, so without this an
+   * abandoned handoff that had already aged out would ride along on the next
+   * "Add to chat" and reappear as if it were current.
+   */
+  private static pendingContexts(owner: MothershipHandoffOwner): ChatContext[] {
+    const data = BrowserStorage.getItem<StoredHandoff | null>(MothershipHandoffStorage.KEY, null)
+    if (
+      !data ||
+      data.message ||
+      data.fileAttachments?.length ||
+      !MothershipHandoffStorage.belongsTo(data, owner)
+    )
+      return []
+    if (!data.timestamp || Date.now() - data.timestamp > MothershipHandoffStorage.MAX_AGE_MS) {
+      return []
+    }
+    return Array.isArray(data.contexts) ? data.contexts : []
   }
 
   /**
@@ -344,36 +450,60 @@ export class MothershipHandoffStorage {
    * only resolves in its own workspace, so misfiring it elsewhere would drop the
    * context. The owner (and any legacy/corrupt entry) is tombstoned via `clear`
    * before the validity/expiry checks so it fires at most once and never lingers.
-   * @param maxAge - Maximum age in milliseconds (default: 60 seconds)
+   * @param maxAge - Maximum age in milliseconds (default: {@link MAX_AGE_MS})
    */
-  static consume(workspaceId: string, maxAge: number = 60 * 1000): MothershipHandoff | null {
-    const data = BrowserStorage.getItem<{
-      message?: string
-      contexts?: ChatContext[]
-      workspaceId?: string
-      timestamp?: number
-    } | null>(MothershipHandoffStorage.KEY, null)
+  static consume(
+    owner: MothershipHandoffOwner,
+    maxAge: number = MothershipHandoffStorage.MAX_AGE_MS
+  ): MothershipHandoff | null {
+    const data = BrowserStorage.getItem<StoredHandoff | null>(MothershipHandoffStorage.KEY, null)
 
     if (!data) {
       return null
     }
 
-    if (data.workspaceId && data.workspaceId !== workspaceId) {
+    if (
+      (data.workspaceId || data.organizationId) &&
+      !MothershipHandoffStorage.belongsTo(data, owner)
+    ) {
       return null
     }
 
     MothershipHandoffStorage.clear()
 
+    const contexts = Array.isArray(data.contexts) ? data.contexts : []
+    const hasAttachments = Array.isArray(data.fileAttachments) && data.fileAttachments.length > 0
     if (
-      !data.workspaceId ||
-      !data.message ||
+      !(data.workspaceId || data.organizationId) ||
+      Boolean(data.workspaceId && data.organizationId) ||
+      (!data.message && !hasAttachments && contexts.length === 0) ||
       !data.timestamp ||
       Date.now() - data.timestamp > maxAge
     ) {
       return null
     }
 
-    return { message: data.message, contexts: data.contexts }
+    const assistantSearch = workspaceSearchFiltersSchema.safeParse(data.assistantSearch ?? {})
+    if (!assistantSearch.success) return null
+
+    return {
+      ...(data.message || hasAttachments ? { message: data.message ?? '' } : {}),
+      contexts,
+      ...(data.requestMode === 'assistant' ? { requestMode: 'assistant' as const } : {}),
+      ...(data.assistantSearch ? { assistantSearch: assistantSearch.data } : {}),
+      ...(Array.isArray(data.fileAttachments) && data.fileAttachments.length > 0
+        ? { fileAttachments: data.fileAttachments }
+        : {}),
+      ...(typeof data.resumeUserMessageId === 'string' && data.resumeUserMessageId
+        ? { resumeUserMessageId: data.resumeUserMessageId }
+        : {}),
+    }
+  }
+
+  private static belongsTo(data: StoredHandoff, owner: MothershipHandoffOwner): boolean {
+    return typeof owner === 'string'
+      ? data.workspaceId === owner && !data.organizationId
+      : data.organizationId === owner.organizationId && !data.workspaceId
   }
 
   static clear(): boolean {

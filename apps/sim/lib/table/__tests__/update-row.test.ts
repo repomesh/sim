@@ -1,20 +1,22 @@
 /**
  * @vitest-environment node
  */
-import { dbChainMock, dbChainMockFns, resetDbChainMock } from '@sim/testing'
+import { tableRowExecutions, userTableRows } from '@sim/db/schema'
+import { dbChainMockFns, queueTableRows, resetDbChainMock } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { deleteColumn, renameColumn } from '@/lib/table/columns/service'
 import {
   batchInsertRows,
+  batchUpdateRows,
+  getRowById,
+  getRowSummaryById,
   insertRow,
   replaceTableRows,
   updateRow,
   upsertRow,
 } from '@/lib/table/rows/service'
 import type { TableDefinition } from '@/lib/table/types'
-import { getUniqueColumns } from '@/lib/table/validation'
-
-vi.mock('@sim/db', () => dbChainMock)
+import { checkUniqueConstraintsDb, getUniqueColumns } from '@/lib/table/validation'
 
 // Capacity is exercised in billing.test.ts; here it's a no-op so the timeout-scaling
 // suites can use large synthetic row counts without tripping the plan limit.
@@ -66,6 +68,42 @@ function findExecutedRawSql(substring: string): string | undefined {
   return undefined
 }
 
+/** Every string reachable from a drizzle `sql` fragment — its literal chunks AND its bound values. */
+function collectStrings(node: unknown, out: string[] = []): string[] {
+  if (typeof node === 'string') out.push(node)
+  else if (Array.isArray(node)) for (const entry of node) collectStrings(entry, out)
+  else if (node && typeof node === 'object')
+    for (const entry of Object.values(node as Record<string, unknown>)) collectStrings(entry, out)
+  return out
+}
+
+/**
+ * Whether one `set_config(<setting>, '<value>', true)` guard was executed.
+ *
+ * The guards bind their values as parameters, so the setting name lives in the statement's
+ * literal chunks while the duration lives in its bound values — asserting on a rendered string
+ * would only re-check the placeholder.
+ */
+function executedTxTimeout(setting: string, value: string): boolean {
+  return dbChainMockFns.execute.mock.calls.some(([arg]) => {
+    const strings = collectStrings(arg)
+    return (
+      strings.some((entry) => entry.includes(`set_config('${setting}'`)) && strings.includes(value)
+    )
+  })
+}
+
+/**
+ * The `data` payload of the last `.set(...)` row write. `updateRow` always writes a JSONB merge
+ * (`data = data || {changed}::jsonb`), so this is a `sql` fragment exposing `{ strings, values }`.
+ */
+function lastSetDataSql(): { strings?: string[]; values?: unknown[] } | undefined {
+  const payload = dbChainMockFns.set.mock.calls.at(-1)?.[0] as
+    | { data?: { strings?: string[]; values?: unknown[] } }
+    | undefined
+  return payload?.data
+}
+
 const EXISTING_ROW = {
   id: 'row-1',
   tableId: 'tbl-1',
@@ -75,6 +113,7 @@ const EXISTING_ROW = {
   createdAt: new Date('2024-01-01'),
   updatedAt: new Date('2024-01-01'),
 }
+const PERSISTED_UPDATED_AT = new Date('2024-01-01T00:00:00.001Z')
 
 const TABLE: TableDefinition = {
   id: 'tbl-1',
@@ -91,6 +130,7 @@ const TABLE: TableDefinition = {
   maxRows: 1000,
   workspaceId: 'ws-1',
   createdBy: 'user-1',
+  locks: { schemaLocked: false, insertLocked: false, updateLocked: false, deleteLocked: false },
   archivedAt: null,
   createdAt: new Date('2024-01-01'),
   updatedAt: new Date('2024-01-01'),
@@ -101,22 +141,72 @@ describe('updateRow — partial merge', () => {
     vi.clearAllMocks()
     resetDbChainMock()
     dbChainMockFns.limit.mockResolvedValue([EXISTING_ROW])
+    dbChainMockFns.returning.mockResolvedValue([
+      { id: EXISTING_ROW.id, updatedAt: PERSISTED_UPDATED_AT },
+    ])
   })
 
   it('preserves columns not included in the partial update', async () => {
+    dbChainMockFns.returning.mockResolvedValueOnce([
+      { ...EXISTING_ROW, data: { name: 'Alice', age: 31 }, updatedAt: PERSISTED_UPDATED_AT },
+    ])
     const result = await updateRow(
       { tableId: 'tbl-1', rowId: 'row-1', data: { age: 31 }, workspaceId: 'ws-1' },
       TABLE,
       'req-1'
     )
 
+    // The returned row is the full merge…
     expect(result.data).toEqual({ name: 'Alice', age: 31 })
-    expect(dbChainMockFns.set).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { name: 'Alice', age: 31 } })
+    expect(result.updatedAt).toEqual(PERSISTED_UPDATED_AT)
+    // …but the WRITE is a JSONB merge of only the changed cell (`data = data || {age:31}`), so the
+    // unchanged `name` column is never re-written — that's what keeps concurrent edits to different
+    // cells of the same row from clobbering each other.
+    const data = lastSetDataSql()
+    expect(data?.strings?.join('')).toContain(' || ')
+    expect(data?.values).toContain(JSON.stringify({ age: 31 }))
+    expect(data?.values).not.toContain(JSON.stringify({ name: 'Alice', age: 31 }))
+  })
+
+  it('blanks an uncoercible cell for a first-party caller, as it always has', async () => {
+    const { coerceRowToSchema } = await import('@/lib/table/validation')
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { age: 31 }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    expect(coerceRowToSchema).toHaveBeenCalledWith(
+      { name: 'Alice', age: 31 },
+      TABLE.schema,
+      undefined,
+      ['age']
+    )
+  })
+
+  it('holds only the patched keys to the strict policy a v2 caller opts into', async () => {
+    // The merged row carries cells this request never sent. A legacy value in one
+    // of them belongs to an earlier write and must not decide this one.
+    const { coerceRowToSchema } = await import('@/lib/table/validation')
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { age: 31 }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1',
+      { uncoercibleValues: 'reject' }
+    )
+
+    expect(coerceRowToSchema).toHaveBeenCalledWith(
+      { name: 'Alice', age: 31 },
+      TABLE.schema,
+      'reject',
+      ['age']
     )
   })
 
   it('allows updating a single column without affecting others', async () => {
+    dbChainMockFns.returning.mockResolvedValueOnce([
+      { ...EXISTING_ROW, data: { name: 'Bob', age: 30 }, updatedAt: PERSISTED_UPDATED_AT },
+    ])
     const result = await updateRow(
       { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Bob' }, workspaceId: 'ws-1' },
       TABLE,
@@ -124,12 +214,13 @@ describe('updateRow — partial merge', () => {
     )
 
     expect(result.data).toEqual({ name: 'Bob', age: 30 })
-    expect(dbChainMockFns.set).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { name: 'Bob', age: 30 } })
-    )
+    expect(lastSetDataSql()?.values).toContain(JSON.stringify({ name: 'Bob' }))
   })
 
   it('allows explicitly nulling a field while preserving others', async () => {
+    dbChainMockFns.returning.mockResolvedValueOnce([
+      { ...EXISTING_ROW, data: { name: 'Alice', age: null }, updatedAt: PERSISTED_UPDATED_AT },
+    ])
     const result = await updateRow(
       { tableId: 'tbl-1', rowId: 'row-1', data: { age: null }, workspaceId: 'ws-1' },
       TABLE,
@@ -137,12 +228,14 @@ describe('updateRow — partial merge', () => {
     )
 
     expect(result.data).toEqual({ name: 'Alice', age: null })
-    expect(dbChainMockFns.set).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { name: 'Alice', age: null } })
-    )
+    // A cleared cell is written as present-with-null, not dropped.
+    expect(lastSetDataSql()?.values).toContain(JSON.stringify({ age: null }))
   })
 
   it('handles a full-row update correctly (idempotent merge)', async () => {
+    dbChainMockFns.returning.mockResolvedValueOnce([
+      { ...EXISTING_ROW, data: { name: 'Bob', age: 25 }, updatedAt: PERSISTED_UPDATED_AT },
+    ])
     const result = await updateRow(
       { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Bob', age: 25 }, workspaceId: 'ws-1' },
       TABLE,
@@ -150,23 +243,6 @@ describe('updateRow — partial merge', () => {
     )
 
     expect(result.data).toEqual({ name: 'Bob', age: 25 })
-  })
-
-  it('sends only changed keys in JSONB patch mode while returning merged data', async () => {
-    const result = await updateRow(
-      { tableId: 'tbl-1', rowId: 'row-1', data: { age: 31 }, workspaceId: 'ws-1' },
-      TABLE,
-      'req-1',
-      { dataWriteMode: 'patch' }
-    )
-
-    expect(result?.data).toEqual({ name: 'Alice', age: 31 })
-    const setPayload = dbChainMockFns.set.mock.calls.at(-1)?.[0] as
-      | { data?: { strings?: string[]; values?: unknown[] } }
-      | undefined
-    expect(setPayload?.data?.strings?.join('')).toContain(' || ')
-    expect(setPayload?.data?.values).toContain(JSON.stringify({ age: 31 }))
-    expect(setPayload?.data?.values).not.toContain(JSON.stringify({ name: 'Alice', age: 31 }))
   })
 
   it('throws when the row does not exist', async () => {
@@ -263,6 +339,39 @@ describe('insertRow — position race safety (migration 0198 + advisory lock)', 
     expect(findExecutedSqlContaining('pg_advisory_xact_lock')).toBe(false)
   })
 
+  /**
+   * The v2 surface is column-NAME-keyed and resolves `conflictTarget` to its
+   * storage id before this call, so the rejection has to translate back — a
+   * caller that sent `email` cannot act on a `col_…` id it has never seen.
+   */
+  it('upsertRow names the conflict column the caller does, not its storage id', async () => {
+    const table: TableDefinition = {
+      ...TABLE,
+      schema: {
+        columns: [
+          { id: 'col_9934c202', name: 'email', type: 'string' },
+          { id: 'col_2f1a', name: 'slug', type: 'string', unique: true },
+        ],
+      },
+    }
+    vi.mocked(getUniqueColumns).mockReturnValue([
+      { id: 'col_2f1a', name: 'slug', type: 'string', unique: true },
+    ])
+
+    await expect(
+      upsertRow(
+        {
+          tableId: 'tbl-1',
+          workspaceId: 'ws-1',
+          data: { col_9934c202: 'a@b.test' },
+          conflictTarget: 'col_9934c202',
+        },
+        table,
+        'req-1'
+      )
+    ).rejects.toThrow('Column "email" is not a unique column. Available unique columns: slug')
+  })
+
   it('upsertRow acquires the advisory lock on the insert path (no match)', async () => {
     vi.mocked(getUniqueColumns).mockReturnValue([{ name: 'name', type: 'string', unique: true }])
     // Initial existing-row check + post-lock re-check both find no match.
@@ -328,6 +437,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+    dbChainMockFns.execute.mockResolvedValue([{ count: 0 }])
   })
 
   it('insertRow sets the default 10s/3s/5s timeouts', async () => {
@@ -335,11 +445,9 @@ describe('mutation paths — SET LOCAL timeouts', () => {
       insertRow({ tableId: 'tbl-1', data: { name: 'a' }, workspaceId: 'ws-1' }, TABLE, 'req-1')
     ).rejects.toBeDefined()
 
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '10000ms'")).toBeDefined()
-    expect(findExecutedRawSql("SET LOCAL lock_timeout = '3000ms'")).toBeDefined()
-    expect(
-      findExecutedRawSql("SET LOCAL idle_in_transaction_session_timeout = '5000ms'")
-    ).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '10000ms')).toBe(true)
+    expect(executedTxTimeout('lock_timeout', '3000ms')).toBe(true)
+    expect(executedTxTimeout('idle_in_transaction_session_timeout', '5000ms')).toBe(true)
   })
 
   it('batchInsertRows raises statement_timeout to 60s', async () => {
@@ -351,7 +459,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
       )
     ).rejects.toBeDefined()
 
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '60000ms'")).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '60000ms')).toBe(true)
   })
 
   it('replaceTableRows scales statement_timeout with (existing + new) row count', async () => {
@@ -365,7 +473,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
     )
 
     // (100_000 + 50_000) × 3ms/row = 450_000ms; above 120_000 floor, below 600_000 cap
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '450000ms'")).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '450000ms')).toBe(true)
   })
 
   it('replaceTableRows caps scaled timeout at 10 minutes for very large tables', async () => {
@@ -374,7 +482,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
     await replaceTableRows({ tableId: 'tbl-1', workspaceId: 'ws-1', rows: [] }, hugeTable, 'req-1')
 
     // 10M × 3ms = 30M ms, capped at 600_000ms (10 min)
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '600000ms'")).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '600000ms')).toBe(true)
   })
 
   it('replaceTableRows uses the 120s floor on small tables', async () => {
@@ -387,7 +495,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
     )
 
     // 12 × 3ms = 36ms → floored at 120_000ms
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '120000ms'")).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '120000ms')).toBe(true)
   })
 
   it('renameColumn is metadata-only — no per-row JSONB rewrite regardless of row count', async () => {
@@ -406,7 +514,7 @@ describe('mutation paths — SET LOCAL timeouts', () => {
     await deleteColumn({ tableId: 'tbl-1', columnName: 'age' }, 'req-1')
 
     // 100 × 2ms = 200ms → floored at 60_000ms
-    expect(findExecutedRawSql("SET LOCAL statement_timeout = '60000ms'")).toBeDefined()
+    expect(executedTxTimeout('statement_timeout', '60000ms')).toBe(true)
   })
 
   it('replaceTableRows acquires the per-table advisory lock to serialize concurrent replaces', async () => {
@@ -418,5 +526,206 @@ describe('mutation paths — SET LOCAL timeouts', () => {
 
     expect(findExecutedSqlContaining('pg_advisory_xact_lock')).toBe(true)
     expect(findExecutedSqlContaining('hashtextextended')).toBe(true)
+  })
+
+  it('replaceTableRows reports the authoritative bounded delete count', async () => {
+    dbChainMockFns.execute.mockResolvedValue([{ count: 7 }])
+
+    const result = await replaceTableRows(
+      { tableId: 'tbl-1', workspaceId: 'ws-1', rows: [] },
+      { ...TABLE, rowCount: 7 },
+      'req-1'
+    )
+
+    expect(result).toEqual({ deletedCount: 7, insertedCount: 0 })
+    expect(findExecutedSqlContaining('DELETE FROM')).toBe(true)
+    expect(findExecutedSqlContaining('SELECT count(*)::integer AS count FROM deleted')).toBe(true)
+  })
+})
+
+describe('batchUpdateRows — per-row partial merge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+  })
+
+  it('writes each row as a JSONB merge of only its changed cells', async () => {
+    queueTableRows(userTableRows, [
+      { id: 'row-1', data: { name: 'Alice', age: 30 } },
+      { id: 'row-2', data: { name: 'Carol', age: 40 } },
+    ])
+    queueTableRows(tableRowExecutions, []) // loadExecutionsByRow → no sidecar rows
+
+    await batchUpdateRows(
+      {
+        tableId: 'tbl-1',
+        workspaceId: 'ws-1',
+        updates: [
+          { rowId: 'row-1', data: { age: 31 } },
+          { rowId: 'row-2', data: { name: 'Dave' } },
+        ],
+      },
+      TABLE,
+      'req-1'
+    )
+
+    // Each row write is `data || {changed}::jsonb`, carrying ONLY that row's changed cell — so a
+    // batch edit can't clobber a concurrent edit to another cell of the same row.
+    const writes = dbChainMockFns.set.mock.calls
+      .map((c) => c[0] as { data?: { strings?: string[]; values?: unknown[] } })
+      .filter((p) => Array.isArray(p?.data?.strings))
+    expect(writes.length).toBe(2)
+    for (const w of writes) {
+      expect(w.data?.strings?.join('')).toContain(' || ')
+    }
+    const values = writes.flatMap((w) => w.data?.values ?? [])
+    expect(values).toContain(JSON.stringify({ age: 31 }))
+    expect(values).toContain(JSON.stringify({ name: 'Dave' }))
+    // Never the whole row.
+    expect(values).not.toContain(JSON.stringify({ name: 'Alice', age: 31 }))
+  })
+})
+
+/**
+ * The uniqueness probe opens its own transaction and queries once per unique
+ * column, so on a table that has any unique column it used to cost several
+ * round trips on every edit — including edits nowhere near one. It is now
+ * scoped to the columns the patch actually writes.
+ *
+ * The safety argument is that a merge cannot newly violate uniqueness on a
+ * column it leaves alone: that value is the one already stored, and it
+ * satisfied the constraint when it was written.
+ *
+ * The one case that does not cover is a unique constraint added to a column
+ * that already held duplicates — such a row is no longer blocked from edits
+ * elsewhere in it, which is the intended outcome.
+ */
+describe('updateRow — uniqueness probe scoping', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    // The common case: one unique column. The two tests that need a different
+    // shape override this.
+    vi.mocked(getUniqueColumns).mockReturnValue([{ name: 'name', type: 'string', unique: true }])
+    dbChainMockFns.limit.mockResolvedValue([EXISTING_ROW])
+    dbChainMockFns.returning.mockResolvedValue([
+      { id: EXISTING_ROW.id, updatedAt: PERSISTED_UPDATED_AT },
+    ])
+  })
+
+  it('does not probe when the patch touches no unique column', async () => {
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { age: 31 }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    expect(checkUniqueConstraintsDb).not.toHaveBeenCalled()
+  })
+
+  it('still probes when the patch touches a unique column', async () => {
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Grace' }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    expect(checkUniqueConstraintsDb).toHaveBeenCalledTimes(1)
+  })
+
+  it('probes against the merged row, so the excluded row is still the one being edited', async () => {
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Grace' }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    // The merged row is what gets probed, the excluded row is the one being
+    // edited, and the schema is narrowed to the unique columns this patch
+    // touched — the probe issues one query per column it is handed.
+    expect(checkUniqueConstraintsDb).toHaveBeenCalledWith(
+      'tbl-1',
+      { name: 'Grace', age: 30 },
+      { ...TABLE.schema, columns: [{ name: 'name', type: 'string', unique: true }] },
+      'row-1'
+    )
+  })
+
+  it('hands the probe only the unique columns the patch touched', async () => {
+    vi.mocked(getUniqueColumns).mockReturnValue([
+      { name: 'name', type: 'string', unique: true },
+      { name: 'email', type: 'string', unique: true },
+    ])
+
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Grace' }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    const schemaArg = vi.mocked(checkUniqueConstraintsDb).mock.calls[0][2]
+    expect(schemaArg.columns).toEqual([{ name: 'name', type: 'string', unique: true }])
+  })
+
+  it('surfaces a duplicate on a column the patch does write', async () => {
+    vi.mocked(getUniqueColumns).mockReturnValue([{ name: 'name', type: 'string', unique: true }])
+    vi.mocked(checkUniqueConstraintsDb).mockResolvedValueOnce({
+      valid: false,
+      errors: ['Duplicate value for name'],
+    })
+
+    await expect(
+      updateRow(
+        { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Grace' }, workspaceId: 'ws-1' },
+        TABLE,
+        'req-1'
+      )
+    ).rejects.toThrow(/Duplicate value for name/)
+  })
+
+  it('does not probe on a table with no unique columns at all', async () => {
+    vi.mocked(getUniqueColumns).mockReturnValue([])
+
+    await updateRow(
+      { tableId: 'tbl-1', rowId: 'row-1', data: { name: 'Grace' }, workspaceId: 'ws-1' },
+      TABLE,
+      'req-1'
+    )
+
+    expect(checkUniqueConstraintsDb).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The read surfaces never put the executions sidecar on the wire, so loading it
+ * for them is a query whose result is discarded. Two readers rather than a flag:
+ * a caller that forgets a flag reads an empty sidecar and cannot tell that from
+ * a row that has none, whereas here the field is not on the type.
+ */
+describe('row readers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    dbChainMockFns.limit.mockResolvedValue([EXISTING_ROW])
+  })
+
+  it('getRowSummaryById issues one select and returns no sidecar', async () => {
+    const row = await getRowSummaryById('tbl-1', 'row-1', 'ws-1')
+
+    expect(row).not.toHaveProperty('executions')
+    expect(dbChainMockFns.select).toHaveBeenCalledTimes(1)
+  })
+
+  it('getRowById issues the extra select the sidecar needs', async () => {
+    const row = await getRowById('tbl-1', 'row-1', 'ws-1')
+
+    expect(row).toHaveProperty('executions')
+    expect(dbChainMockFns.select).toHaveBeenCalledTimes(2)
+  })
+
+  it('getRowSummaryById returns null for a missing row', async () => {
+    dbChainMockFns.limit.mockResolvedValue([])
+
+    await expect(getRowSummaryById('tbl-1', 'nope', 'ws-1')).resolves.toBeNull()
   })
 })

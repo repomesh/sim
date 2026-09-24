@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
 import * as schema from '@sim/db'
 import {
@@ -8,6 +9,7 @@ import {
   workflowEdges,
   workflowSubflows,
 } from '@sim/db'
+import { withUtcTimestamps } from '@sim/db/timestamps'
 import { createLogger } from '@sim/logger'
 import { getActiveWorkflowContext } from '@sim/platform-authz/workflow'
 import {
@@ -24,6 +26,7 @@ import {
 import { randomFloat } from '@sim/utils/random'
 import { loadWorkflowFromNormalizedTablesRaw } from '@sim/workflow-persistence/load'
 import { mergeSubBlockValues } from '@sim/workflow-persistence/subblocks'
+import type { DbOrTx } from '@sim/workflow-persistence/types'
 import {
   filterAcyclicEdges,
   filterUniqueWorkflowEdges,
@@ -32,6 +35,8 @@ import {
   isKnownWorkflowTriggerBlock,
   isWorkflowAnnotationOnlyBlockType,
   isWorkflowBlockProtected,
+  normalizeWorkflowEdgeSourceHandle,
+  normalizeWorkflowEdgeTargetHandle,
 } from '@sim/workflow-types/workflow'
 import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/postgres-js'
@@ -57,11 +62,19 @@ function toEdgeHandles(edge: PersistedEdgeRecord) {
 }
 
 interface EdgeAddCandidate {
-  id?: string
+  id: string
   source: string
   target: string
   sourceHandle?: string | null
   targetHandle?: string | null
+}
+
+function canonicalizeEdgeAddCandidate(edge: EdgeAddCandidate): EdgeAddCandidate {
+  return {
+    ...edge,
+    sourceHandle: normalizeWorkflowEdgeSourceHandle(edge.sourceHandle),
+    targetHandle: normalizeWorkflowEdgeTargetHandle(edge.targetHandle),
+  }
 }
 
 interface FilterEdgesForPersistResult<T> {
@@ -212,14 +225,20 @@ const connectionString =
 // Realtime process footprint = this socketDb pool + the shared @sim/db pool.
 const socketDb = drizzle(
   instrumentPoolClient(
-    postgres(connectionString, {
-      prepare: false,
-      idle_timeout: 10,
-      connect_timeout: 20,
-      max: 10,
-      onnotice: () => {},
-      connection: { application_name: process.env.DB_APP_NAME ?? 'sim-realtime' },
-    }),
+    postgres(
+      connectionString,
+      // `withUtcTimestamps` — see `packages/db/timestamps.ts`.
+      withUtcTimestamps({
+        prepare: false,
+        // See `packages/db/db.ts` — skips the per-connection pg_type roundtrip.
+        fetch_types: false,
+        idle_timeout: 10,
+        connect_timeout: 20,
+        max: 10,
+        onnotice: () => {},
+        connection: { application_name: process.env.DB_APP_NAME ?? 'sim-realtime' },
+      })
+    ),
     'socketDb'
   ),
   { schema }
@@ -259,34 +278,6 @@ function findDbDescendants(containerId: string, allBlocks: DbBlockRef[]): string
     }
   }
   return descendants
-}
-
-/**
- * Shared function to handle auto-connect edge insertion
- * @param tx - Database transaction
- * @param workflowId - The workflow ID
- * @param autoConnectEdge - The auto-connect edge data
- * @param logger - Logger instance
- */
-async function insertAutoConnectEdge(
-  tx: any,
-  workflowId: string,
-  autoConnectEdge: any,
-  logger: any
-) {
-  if (!autoConnectEdge) return
-
-  await tx.insert(workflowEdges).values({
-    id: autoConnectEdge.id,
-    workflowId,
-    sourceBlockId: autoConnectEdge.source,
-    targetBlockId: autoConnectEdge.target,
-    sourceHandle: autoConnectEdge.sourceHandle || null,
-    targetHandle: autoConnectEdge.targetHandle || null,
-  })
-  logger.debug(
-    `Added auto-connect edge ${autoConnectEdge.id}: ${autoConnectEdge.source} -> ${autoConnectEdge.target}`
-  )
 }
 
 enum SubflowType {
@@ -734,6 +725,57 @@ async function handleBlockOperationTx(
       break
     }
 
+    case BLOCK_OPERATIONS.UPDATE_ERROR_ENABLED: {
+      if (!payload.id || payload.errorEnabled === undefined) {
+        throw new Error('Missing required fields for update error enabled operation')
+      }
+
+      const updateResult = await tx
+        .update(workflowBlocks)
+        .set({
+          errorEnabled: payload.errorEnabled,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(workflowBlocks.id, payload.id), eq(workflowBlocks.workflowId, workflowId)))
+        .returning({ id: workflowBlocks.id })
+
+      if (updateResult.length === 0) {
+        throw new Error(`Block ${payload.id} not found in workflow ${workflowId}`)
+      }
+
+      logger.debug(`Updated block error output: ${payload.id} -> ${payload.errorEnabled}`)
+      break
+    }
+
+    case BLOCK_OPERATIONS.UPDATE_RETRY: {
+      if (!payload.id || payload.retry === undefined) {
+        throw new Error('Missing required fields for update retry operation')
+      }
+
+      const updateResult = await tx
+        .update(workflowBlocks)
+        .set({
+          /**
+           * Persisted verbatim, including a disabled policy, so the numbers a
+           * builder configured survive switching retry off and back on. NULL stays
+           * reserved for a block that never had a policy at all; whether a stored
+           * policy actually runs is decided by `resolveBlockRetryConfig` at
+           * execution time, never by the column being present.
+           */
+          retry: payload.retry,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(workflowBlocks.id, payload.id), eq(workflowBlocks.workflowId, workflowId)))
+        .returning({ id: workflowBlocks.id })
+
+      if (updateResult.length === 0) {
+        throw new Error(`Block ${payload.id} not found in workflow ${workflowId}`)
+      }
+
+      logger.debug(`Updated block retry: ${payload.id} -> ${payload.retry.enabled}`)
+      break
+    }
+
     case BLOCK_OPERATIONS.UPDATE_CANONICAL_MODE: {
       if (!payload.id || !payload.canonicalId || !payload.canonicalMode) {
         throw new Error('Missing required fields for update canonical mode operation')
@@ -920,13 +962,15 @@ async function handleBlocksOperationTx(
             name: block.name as string,
             positionX: (block.position as { x: number; y: number }).x,
             positionY: (block.position as { x: number; y: number }).y,
-            data: (block.data as Record<string, unknown>) || {},
+            data: (block.data as Record<string, unknown> | undefined) || {},
             subBlocks: mergedSubBlocks,
             outputs: (block.outputs as Record<string, unknown>) || {},
             enabled: (block.enabled as boolean) ?? true,
             horizontalHandles: (block.horizontalHandles as boolean) ?? true,
             advancedMode: (block.advancedMode as boolean) ?? false,
             triggerMode: (block.triggerMode as boolean) ?? false,
+            errorEnabled: (block.errorEnabled as boolean) ?? false,
+            retry: (block.retry as Record<string, unknown> | undefined) ?? null,
             height: (block.height as number) || 0,
             locked: (block.locked as boolean) ?? false,
           }
@@ -946,6 +990,8 @@ async function handleBlocksOperationTx(
               horizontalHandles: sql`excluded.horizontal_handles`,
               advancedMode: sql`excluded.advanced_mode`,
               triggerMode: sql`excluded.trigger_mode`,
+              errorEnabled: sql`excluded.error_enabled`,
+              retry: sql`excluded.retry`,
               locked: sql`excluded.locked`,
               height: sql`excluded.height`,
               subBlocks: sql`excluded.sub_blocks`,
@@ -1022,8 +1068,8 @@ async function handleBlocksOperationTx(
         // blocksById lookup (a plain `tx.select` from `workflowBlocks`) also
         // sees the blocks this same batch just inserted — reads observe a
         // transaction's own prior writes.
-        const candidates: EdgeAddCandidate[] = (edges as Array<Record<string, unknown>>).map(
-          (e) => ({
+        const candidates: EdgeAddCandidate[] = (edges as Array<Record<string, unknown>>).map((e) =>
+          canonicalizeEdgeAddCandidate({
             id: e.id as string,
             source: e.source as string,
             target: e.target as string,
@@ -1049,8 +1095,8 @@ async function handleBlocksOperationTx(
             workflowId,
             sourceBlockId: edge.source,
             targetBlockId: edge.target,
-            sourceHandle: edge.sourceHandle || null,
-            targetHandle: edge.targetHandle || null,
+            sourceHandle: normalizeWorkflowEdgeSourceHandle(edge.sourceHandle),
+            targetHandle: normalizeWorkflowEdgeTargetHandle(edge.targetHandle),
           }))
 
           await tx
@@ -1507,18 +1553,17 @@ async function handleEdgeOperationTx(tx: any, workflowId: string, operation: str
         throw new Error('Missing required fields for add edge operation')
       }
 
+      const candidate = canonicalizeEdgeAddCandidate({
+        id: payload.id,
+        source: payload.source,
+        target: payload.target,
+        sourceHandle: payload.sourceHandle ?? null,
+        targetHandle: payload.targetHandle ?? null,
+      })
       const { safeEdges, droppedCounts, droppedDuplicates } = await filterEdgesForPersist(
         tx,
         workflowId,
-        [
-          {
-            id: payload.id,
-            source: payload.source,
-            target: payload.target,
-            sourceHandle: payload.sourceHandle ?? null,
-            targetHandle: payload.targetHandle ?? null,
-          },
-        ]
+        [candidate]
       )
 
       if (safeEdges.length === 0) {
@@ -1532,13 +1577,14 @@ async function handleEdgeOperationTx(tx: any, workflowId: string, operation: str
         break
       }
 
+      const [safeEdge] = safeEdges
       await tx.insert(workflowEdges).values({
-        id: payload.id,
+        id: safeEdge.id,
         workflowId,
-        sourceBlockId: payload.source,
-        targetBlockId: payload.target,
-        sourceHandle: payload.sourceHandle || null,
-        targetHandle: payload.targetHandle || null,
+        sourceBlockId: safeEdge.source,
+        targetBlockId: safeEdge.target,
+        sourceHandle: normalizeWorkflowEdgeSourceHandle(safeEdge.sourceHandle),
+        targetHandle: normalizeWorkflowEdgeTargetHandle(safeEdge.targetHandle),
       })
 
       logger.debug(`Added edge ${payload.id}: ${payload.source} -> ${payload.target}`)
@@ -1753,13 +1799,15 @@ async function handleEdgesOperationTx(
 
       logger.info(`Batch adding ${edges.length} edges to workflow ${workflowId}`)
 
-      const candidates: EdgeAddCandidate[] = (edges as Array<Record<string, unknown>>).map((e) => ({
-        id: e.id as string,
-        source: e.source as string,
-        target: e.target as string,
-        sourceHandle: (e.sourceHandle as string | null) ?? null,
-        targetHandle: (e.targetHandle as string | null) ?? null,
-      }))
+      const candidates: EdgeAddCandidate[] = (edges as Array<Record<string, unknown>>).map((e) =>
+        canonicalizeEdgeAddCandidate({
+          id: e.id as string,
+          source: e.source as string,
+          target: e.target as string,
+          sourceHandle: (e.sourceHandle as string | null) ?? null,
+          targetHandle: (e.targetHandle as string | null) ?? null,
+        })
+      )
 
       const { safeEdges, droppedCounts, droppedDuplicates, droppedCyclic } =
         await filterEdgesForPersist(tx, workflowId, candidates)
@@ -1782,8 +1830,8 @@ async function handleEdgesOperationTx(
         workflowId,
         sourceBlockId: edge.source,
         targetBlockId: edge.target,
-        sourceHandle: edge.sourceHandle || null,
-        targetHandle: edge.targetHandle || null,
+        sourceHandle: normalizeWorkflowEdgeSourceHandle(edge.sourceHandle),
+        targetHandle: normalizeWorkflowEdgeTargetHandle(edge.targetHandle),
       }))
 
       await tx
@@ -1942,8 +1990,36 @@ async function handleSubflowOperationTx(
   }
 }
 
-function valuesEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+/** Every block in the workflow by id, for the locked-container check subblock writes need. */
+async function loadSubblockUpdateBlocks(tx: DbOrTx, workflowId: string) {
+  const allBlocks = await tx
+    .select({
+      id: workflowBlocks.id,
+      subBlocks: workflowBlocks.subBlocks,
+      locked: workflowBlocks.locked,
+      data: workflowBlocks.data,
+    })
+    .from(workflowBlocks)
+    .where(eq(workflowBlocks.workflowId, workflowId))
+  return Object.fromEntries(allBlocks.map((block) => [block.id, block]))
+}
+
+/**
+ * The block a subblock write targets, rejecting one that is missing, locked, or in a locked
+ * container.
+ */
+function getWritableSubblockUpdateBlock(
+  blocksById: Awaited<ReturnType<typeof loadSubblockUpdateBlocks>>,
+  blockId: string
+) {
+  const block = blocksById[blockId]
+  if (!block) {
+    throw new Error(`Block ${blockId} not found`)
+  }
+  if (isWorkflowBlockProtected(blockId, blocksById)) {
+    throw new Error(`Block ${blockId} is locked or inside a locked container`)
+  }
+  return block
 }
 
 // Subblock operations - targeted value updates without replacing workflow state
@@ -1960,20 +2036,7 @@ async function handleSubblockOperationTx(
         return
       }
 
-      const allBlocks = await tx
-        .select({
-          id: workflowBlocks.id,
-          subBlocks: workflowBlocks.subBlocks,
-          locked: workflowBlocks.locked,
-          data: workflowBlocks.data,
-        })
-        .from(workflowBlocks)
-        .where(eq(workflowBlocks.workflowId, workflowId))
-
-      type SubblockUpdateBlockRecord = (typeof allBlocks)[number]
-      const blocksById: Record<string, SubblockUpdateBlockRecord> = Object.fromEntries(
-        allBlocks.map((block: SubblockUpdateBlockRecord) => [block.id, block])
-      )
+      const blocksById = await loadSubblockUpdateBlocks(tx, workflowId)
 
       for (const update of updates) {
         const { blockId, subblockId, value, expectedValue } = update
@@ -1981,19 +2044,13 @@ async function handleSubblockOperationTx(
           throw new Error('Missing required fields for subblock batch update')
         }
 
-        const block = blocksById[blockId]
-        if (!block) {
-          throw new Error(`Block ${blockId} not found`)
-        }
-
-        if (isWorkflowBlockProtected(blockId, blocksById)) {
-          throw new Error(`Block ${blockId} is locked or inside a locked container`)
-        }
+        const block = getWritableSubblockUpdateBlock(blocksById, blockId)
 
         const subBlocks = { ...((block.subBlocks as Record<string, any>) || {}) }
         const currentSubBlock = subBlocks[subblockId]
         const currentValue = currentSubBlock?.value
-        if (expectedValue !== undefined && !valuesEqual(currentValue, expectedValue)) {
+        /** JSONB can reorder object keys; changed values and array order must still conflict. */
+        if (expectedValue !== undefined && !isDeepStrictEqual(currentValue, expectedValue)) {
           throw new Error(`Subblock ${blockId}.${subblockId} changed since replacement was planned`)
         }
 
@@ -2013,6 +2070,36 @@ async function handleSubblockOperationTx(
       }
 
       logger.debug(`Batch updated ${updates.length} subblocks for workflow ${workflowId}`)
+      break
+    }
+
+    case SUBBLOCK_OPERATIONS.UPDATE_WITH_CANONICAL_MODES: {
+      const { blockId, subblockId, value, canonicalModes } = payload
+      if (!blockId || !subblockId || !canonicalModes) {
+        throw new Error('Missing required fields for subblock update with canonical modes')
+      }
+
+      const blocksById = await loadSubblockUpdateBlocks(tx, workflowId)
+      const block = getWritableSubblockUpdateBlock(blocksById, blockId)
+
+      const subBlocks = {
+        ...((block.subBlocks as Record<string, Record<string, unknown>> | null) || {}),
+      }
+      const currentSubBlock = subBlocks[subblockId]
+      subBlocks[subblockId] = currentSubBlock
+        ? { ...currentSubBlock, value }
+        : { id: subblockId, type: 'unknown', value }
+
+      await tx
+        .update(workflowBlocks)
+        .set({
+          subBlocks,
+          data: { ...((block.data as Record<string, unknown>) || {}), canonicalModes },
+          updatedAt: new Date(),
+        })
+        .where(and(eq(workflowBlocks.id, blockId), eq(workflowBlocks.workflowId, workflowId)))
+
+      logger.debug(`Updated subblock ${blockId}.${subblockId} with canonical modes`)
       break
     }
 
@@ -2134,6 +2221,8 @@ async function handleWorkflowOperationTx(
           name: block.name,
           positionX: block.position.x,
           positionY: block.position.y,
+          errorEnabled: block.errorEnabled ?? false,
+          retry: block.retry ?? null,
           data: block.data || {},
           subBlocks: block.subBlocks || {},
           outputs: block.outputs || {},
@@ -2150,16 +2239,34 @@ async function handleWorkflowOperationTx(
 
       // Insert all edges from the new state
       if (edges && edges.length > 0) {
-        const edgeValues = edges.map((edge: any) => ({
+        const canonicalEdges = (edges as Array<Record<string, unknown>>).map((edge) =>
+          canonicalizeEdgeAddCandidate({
+            id: edge.id as string,
+            source: edge.source as string,
+            target: edge.target as string,
+            sourceHandle: (edge.sourceHandle as string | null) ?? null,
+            targetHandle: (edge.targetHandle as string | null) ?? null,
+          })
+        )
+        const uniqueEdges = filterUniqueWorkflowEdges(canonicalEdges, [])
+        const edgeValues = uniqueEdges.map((edge) => ({
           id: edge.id,
           workflowId,
           sourceBlockId: edge.source,
           targetBlockId: edge.target,
-          sourceHandle: edge.sourceHandle || null,
-          targetHandle: edge.targetHandle || null,
+          sourceHandle: edge.sourceHandle ?? null,
+          targetHandle: edge.targetHandle ?? null,
         }))
 
-        await tx.insert(workflowEdges).values(edgeValues)
+        if (uniqueEdges.length < edges.length) {
+          logger.info(`Dropped ${edges.length - uniqueEdges.length} duplicate edge(s)`, {
+            operation: WORKFLOW_OPERATIONS.REPLACE_STATE,
+          })
+        }
+
+        if (edgeValues.length > 0) {
+          await tx.insert(workflowEdges).values(edgeValues)
+        }
       }
 
       // Insert all loops from the new state

@@ -1,12 +1,27 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
+import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+  recordProviderConversationUsage,
+} from '@/providers/conversation-history'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { createOpenAICompatAssistantHistory } from '@/providers/openai-compat/assistant-history'
+import { getChatCompletionConversationUsage } from '@/providers/openai-compat/conversation-usage'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import {
   checkForForcedToolUsage,
   createReadableStreamFromOpenAIStream,
@@ -14,6 +29,7 @@ import {
 } from '@/providers/together/utils'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
+import { openAICompatTransport } from '@/providers/transport'
 import type {
   FunctionCallResponse,
   Message,
@@ -26,11 +42,11 @@ import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
   generateSchemaInstructions,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('TogetherProvider')
 
@@ -81,11 +97,12 @@ export const togetherProvider: ProviderConfig = {
     }
 
     const client = new OpenAI({
+      ...openAICompatTransport(),
       apiKey: request.apiKey,
       baseURL: 'https://api.together.ai/v1',
     })
 
-    const requestedModel = request.model.replace(/^together\//, '')
+    const requestedModel = request.model.replace(/^together\//i, '')
 
     logger.info('Preparing Together request', {
       model: requestedModel,
@@ -156,7 +173,7 @@ export const togetherProvider: ProviderConfig = {
           stream_options: { include_usage: true },
         }
         const streamResponse = await client.chat.completions.create(
-          streamingParams,
+          await prepareConversationGeneration(request, 'chat-completions', streamingParams),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
 
@@ -167,28 +184,33 @@ export const togetherProvider: ProviderConfig = {
           timing: { kind: 'simple', segmentName: request.model },
           initialTokens: { input: 0, output: 0, total: 0 },
           initialCost: { input: 0, output: 0, total: 0 },
+          streamFormat: 'agent-events-v1',
           createStream: ({ output, finalizeTiming }) =>
-            createReadableStreamFromOpenAIStream(streamResponse, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: usage.total_tokens,
-              }
+            createReadableStreamFromOpenAIStream(
+              streamResponse,
+              (content, usage) => {
+                output.content = content
+                output.tokens = {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  total: usage.total_tokens,
+                }
 
-              const costResult = calculateCost(
-                requestedModel,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              output.cost = {
-                input: costResult.input,
-                output: costResult.output,
-                total: costResult.total,
-              }
+                const costResult = calculateCost(
+                  requestedModel,
+                  usage.prompt_tokens,
+                  usage.completion_tokens
+                )
+                output.cost = {
+                  input: costResult.input,
+                  output: costResult.output,
+                  total: costResult.total,
+                }
 
-              finalizeTiming()
-            }),
+                finalizeTiming()
+              },
+              request
+            ),
         })
 
         return streamingResult
@@ -200,9 +222,17 @@ export const togetherProvider: ProviderConfig = {
       let usedForcedTools: string[] = []
 
       let currentResponse = await client.chat.completions.create(
-        payload,
+        await prepareConversationGeneration(request, 'chat-completions', payload),
         request.abortSignal ? { signal: request.abortSignal } : undefined
       )
+      if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
+      }
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = currentResponse.choices[0]?.message?.content || ''
@@ -242,7 +272,8 @@ export const togetherProvider: ProviderConfig = {
           content = currentResponse.choices[0].message.content
         }
 
-        const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+        const toolCallsInResponse =
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
 
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
@@ -257,32 +288,78 @@ export const togetherProvider: ProviderConfig = {
 
         const toolsStartTime = Date.now()
 
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
         const toolExecutionPromises = toolCallsInResponse.map(async (toolCall) => {
           const toolCallStartTime = Date.now()
           const toolName = toolCall.function.name
 
           try {
-            const toolArgs = JSON.parse(toolCall.function.arguments)
+            const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
             const tool = request.tools?.find((t) => t.id === toolName)
 
-            if (!tool) return null
+            if (!tool) {
+              await recordProviderConversationToolError(
+                request,
+                toolCall.id,
+                toolName,
+                `Tool "${toolName}" is not available`
+              )
+              const toolCallEndTime = Date.now()
+              return {
+                toolCall,
+                toolName,
+                toolParams: {},
+                result: {
+                  success: false,
+                  output: undefined,
+                  error: `Tool "${toolName}" is not available`,
+                },
+                startTime: toolCallStartTime,
+                endTime: toolCallEndTime,
+                duration: toolCallEndTime - toolCallStartTime,
+              }
+            }
 
-            const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-            const result = await executeTool(toolName, executionParams, {
-              signal: request.abortSignal,
-            })
+            const { toolParams, executionParams } = prepareToolExecution(
+              tool,
+              toolArgs,
+              request,
+              toolCall.id
+            )
+            const { rawResponse, modelResponse } = await executeProviderTool(
+              toolName,
+              executionParams,
+              {
+                signal: request.abortSignal,
+              }
+            )
             const toolCallEndTime = Date.now()
 
             return {
               toolCall,
               toolName,
               toolParams,
-              result,
+              result: rawResponse,
+              modelResult: modelResponse,
               startTime: toolCallStartTime,
               endTime: toolCallEndTime,
               duration: toolCallEndTime - toolCallStartTime,
             }
           } catch (error) {
+            if (isAbortError(error) || request.abortSignal?.aborted) {
+              throw error
+            }
+            await recordProviderConversationToolError(
+              request,
+              toolCall.id,
+              toolName,
+              getErrorMessage(error, 'Tool execution failed')
+            )
             const toolCallEndTime = Date.now()
             logger.error('Error processing tool call (Together):', {
               error: toError(error).message,
@@ -305,26 +382,23 @@ export const togetherProvider: ProviderConfig = {
           }
         })
 
-        const executionResults = await Promise.allSettled(toolExecutionPromises)
+        const executionResults = await Promise.all(toolExecutionPromises)
+        const assistantMessage = currentResponse.choices[0]?.message
+        if (assistantMessage) {
+          currentMessages.push(
+            createOpenAICompatAssistantHistory({
+              message: assistantMessage,
+              toolCalls: toolCallsInResponse,
+              reasoningFields: ['reasoning', 'reasoning_content'],
+            })
+          )
+        }
 
-        currentMessages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: toolCallsInResponse.map((tc) => ({
-            id: tc.id,
-            type: 'function',
-            function: {
-              name: tc.function.name,
-              arguments: tc.function.arguments,
-            },
-          })),
-        })
-
-        for (const settledResult of executionResults) {
-          if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+        for (const executionResult of executionResults) {
           const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-            settledResult.value
+            executionResult
+          const modelResult =
+            'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
           timeSegments.push({
             type: 'tool',
@@ -335,10 +409,12 @@ export const togetherProvider: ProviderConfig = {
             toolCallId: toolCall.id,
           })
 
-          let resultContent: any
+          let resultContent: unknown
           if (result.success) {
-            toolResults.push(result.output!)
-            resultContent = result.output
+            if (isRecordLike(result.output)) {
+              toolResults.push(result.output)
+            }
+            resultContent = result.output ?? null
           } else {
             resultContent = {
               error: true,
@@ -346,6 +422,13 @@ export const togetherProvider: ProviderConfig = {
               tool: toolName,
             }
           }
+          const modelResultContent = modelResult.success
+            ? (modelResult.output ?? null)
+            : {
+                error: true,
+                message: modelResult.error || 'Tool execution failed',
+                tool: toolName,
+              }
 
           toolCalls.push({
             name: toolName,
@@ -360,7 +443,7 @@ export const togetherProvider: ProviderConfig = {
           currentMessages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
-            content: JSON.stringify(resultContent),
+            content: JSON.stringify(modelResultContent),
           })
         }
 
@@ -383,9 +466,17 @@ export const togetherProvider: ProviderConfig = {
 
         const nextModelStartTime = Date.now()
         currentResponse = await client.chat.completions.create(
-          nextPayload,
+          await prepareConversationGeneration(request, 'chat-completions', nextPayload),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
+        if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+          await captureProviderConversationStep(
+            request,
+            'chat-completions',
+            currentResponse.choices[0]?.message,
+            getChatCompletionConversationUsage(currentResponse.usage)
+          )
+        }
         const nextForcedToolResult = checkForForcedToolUsage(
           currentResponse,
           nextPayload.tool_choice,
@@ -416,84 +507,76 @@ export const togetherProvider: ProviderConfig = {
       }
 
       if (iterationCount === MAX_TOOL_ITERATIONS) {
-        enrichLastModelSegmentFromChatCompletions(
-          timeSegments,
-          currentResponse,
-          currentResponse.choices[0]?.message?.tool_calls,
-          { model: request.model, provider: 'together' }
-        )
-      }
-
-      if (request.stream) {
-        const accumulatedCost = calculateCost(requestedModel, tokens.input, tokens.output)
-
-        const streamingParams: ChatCompletionCreateParamsStreaming = {
-          ...payload,
-          messages: [...currentMessages],
-          tool_choice: 'none',
-          stream: true,
-          stream_options: { include_usage: true },
-        }
-
-        if (request.responseFormat) {
-          ;(streamingParams as any).messages = await applyResponseFormat(
-            streamingParams as any,
-            streamingParams.messages,
-            request.responseFormat,
-            requestedModel
+        if (currentResponse.choices[0]?.message?.tool_calls?.length) {
+          await recordProviderConversationUsage(
+            request,
+            getChatCompletionConversationUsage(currentResponse.usage)
           )
         }
-
-        const streamResponse = await client.chat.completions.create(
-          streamingParams,
-          request.abortSignal ? { signal: request.abortSignal } : undefined
-        )
-
-        const streamingResult = createStreamingExecution({
-          model: requestedModel,
-          providerStartTime,
-          providerStartTimeISO,
-          timing: {
-            kind: 'accumulated',
-            modelTime,
-            toolsTime,
-            firstResponseTime,
-            iterations: iterationCount + 1,
-            timeSegments,
-          },
-          initialTokens: { input: tokens.input, output: tokens.output, total: tokens.total },
-          initialCost: {
-            input: accumulatedCost.input,
-            output: accumulatedCost.output,
-            total: accumulatedCost.total,
-          },
-          toolCalls:
-            toolCalls.length > 0 ? { list: toolCalls, count: toolCalls.length } : undefined,
-          createStream: ({ output }) =>
-            createReadableStreamFromOpenAIStream(streamResponse, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: tokens.input + usage.prompt_tokens,
-                output: tokens.output + usage.completion_tokens,
-                total: tokens.total + usage.total_tokens,
-              }
-
-              const streamCost = calculateCost(
-                requestedModel,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-              }
-            }),
+        const pendingToolCalls =
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+        enrichLastModelSegmentFromChatCompletions(timeSegments, currentResponse, pendingToolCalls, {
+          model: request.model,
+          provider: 'together',
         })
 
-        return streamingResult
+        if (pendingToolCalls?.length && !(request.responseFormat && hasActiveTools)) {
+          const finalPayload: any = {
+            ...payload,
+            messages: [...currentMessages],
+            tool_choice: 'none',
+          }
+
+          if (request.responseFormat) {
+            finalPayload.messages = await applyResponseFormat(
+              finalPayload,
+              finalPayload.messages,
+              request.responseFormat,
+              requestedModel
+            )
+          }
+
+          const finalStartTime = Date.now()
+          const finalResponse = await client.chat.completions.create(
+            await prepareConversationGeneration(request, 'chat-completions', finalPayload),
+            request.abortSignal ? { signal: request.abortSignal } : undefined
+          )
+          if (!finalResponse.choices[0]?.message?.tool_calls?.length) {
+            await captureProviderConversationStep(
+              request,
+              'chat-completions',
+              finalResponse.choices[0]?.message,
+              getChatCompletionConversationUsage(finalResponse.usage)
+            )
+          }
+          const finalEndTime = Date.now()
+          const finalDuration = finalEndTime - finalStartTime
+
+          timeSegments.push({
+            type: 'model',
+            name: 'Final answer after tool iteration limit',
+            startTime: finalStartTime,
+            endTime: finalEndTime,
+            duration: finalDuration,
+          })
+          modelTime += finalDuration
+
+          if (finalResponse.choices[0]?.message?.content) {
+            content = finalResponse.choices[0].message.content
+          }
+          if (finalResponse.usage) {
+            tokens.input += finalResponse.usage.prompt_tokens || 0
+            tokens.output += finalResponse.usage.completion_tokens || 0
+            tokens.total += finalResponse.usage.total_tokens || 0
+          }
+
+          enrichLastModelSegmentFromChatCompletions(
+            timeSegments,
+            finalResponse,
+            finalResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+            { model: request.model, provider: 'together' }
+          )
+        }
       }
 
       if (request.responseFormat && hasActiveTools) {
@@ -517,9 +600,17 @@ export const togetherProvider: ProviderConfig = {
 
         const finalStartTime = Date.now()
         const finalResponse = await client.chat.completions.create(
-          finalPayload,
+          await prepareConversationGeneration(request, 'chat-completions', finalPayload),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
+        if (!finalResponse.choices[0]?.message?.tool_calls?.length) {
+          await captureProviderConversationStep(
+            request,
+            'chat-completions',
+            finalResponse.choices[0]?.message,
+            getChatCompletionConversationUsage(finalResponse.usage)
+          )
+        }
         const finalEndTime = Date.now()
         const finalDuration = finalEndTime - finalStartTime
 
@@ -544,9 +635,48 @@ export const togetherProvider: ProviderConfig = {
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
           finalResponse,
-          finalResponse.choices[0]?.message?.tool_calls,
+          finalResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
           { model: request.model, provider: 'together' }
         )
+      }
+
+      if (request.stream) {
+        const accumulatedCost = calculateCost(requestedModel, tokens.input, tokens.output)
+        const toolCost = sumToolCosts(toolResults)
+        const finalCost = {
+          input: accumulatedCost.input,
+          output: accumulatedCost.output,
+          toolCost: toolCost || undefined,
+          total: accumulatedCost.total + toolCost,
+        }
+
+        const streamingResult = createStreamingExecution({
+          model: requestedModel,
+          providerStartTime,
+          providerStartTimeISO,
+          timing: {
+            kind: 'accumulated',
+            modelTime,
+            toolsTime,
+            firstResponseTime,
+            iterations: timeSegments.filter((segment) => segment.type === 'model').length,
+            timeSegments,
+          },
+          initialTokens: { input: tokens.input, output: tokens.output, total: tokens.total },
+          initialCost: finalCost,
+          toolCalls:
+            toolCalls.length > 0 ? { list: toolCalls, count: toolCalls.length } : undefined,
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            output.tokens = { input: tokens.input, output: tokens.output, total: tokens.total }
+            output.cost = finalCost
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
+        })
+
+        return streamingResult
       }
 
       const providerEndTime = Date.now()
@@ -566,7 +696,7 @@ export const togetherProvider: ProviderConfig = {
           modelTime: modelTime,
           toolsTime: toolsTime,
           firstResponseTime: firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments: timeSegments,
         },
       }
@@ -589,6 +719,14 @@ export const togetherProvider: ProviderConfig = {
       }
 
       logger.error('Error in Together request:', errorDetails)
+      if (
+        isAbortError(error) ||
+        request.abortSignal?.aborted ||
+        isConversationContextError(error)
+      ) {
+        throw error
+      }
+
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,
         endTime: providerEndTimeISO,

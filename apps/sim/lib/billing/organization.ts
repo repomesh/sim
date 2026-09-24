@@ -4,7 +4,7 @@ import { createLogger } from '@sim/logger'
 import { isOrgAdminRole } from '@sim/platform-authz/workspace'
 import { generateId } from '@sim/utils/id'
 import { and, eq, inArray, ne, sql } from 'drizzle-orm'
-import { getPlanPricing } from '@/lib/billing/core/billing'
+import { getPlanPricing, isSubscriptionOrgScoped } from '@/lib/billing/core/billing'
 import { getOrganizationIdForSubscriptionReference } from '@/lib/billing/core/subscription'
 import { syncUsageLimitsFromSubscription } from '@/lib/billing/core/usage'
 import { assertNoCompetingEnterpriseIssuance } from '@/lib/billing/enterprise-outbox'
@@ -108,25 +108,26 @@ export async function ensureOrganizationForTeamSubscription(
     return subscription
   }
 
-  const referencedOrganizationId = await getOrganizationIdForSubscriptionReference(
-    subscription.referenceId
-  )
-
-  if (referencedOrganizationId) {
+  if (await isSubscriptionOrgScoped(subscription)) {
     await db.transaction(async (tx) => {
-      await acquireOrganizationMutationLock(tx, referencedOrganizationId)
+      await acquireOrganizationMutationLock(tx, subscription.referenceId)
       await assertNoCompetingEnterpriseIssuance(
         tx,
-        referencedOrganizationId,
+        subscription.referenceId,
         subscription.enterpriseOperationId ?? null
       )
     })
-    return {
-      ...subscription,
-      referenceId: referencedOrganizationId,
-    }
+    return subscription
   }
 
+  /**
+   * The subscription references a user. Team/Enterprise subscriptions must be
+   * org-referenced, so fall through to the membership resolution below: it
+   * transfers the row onto the org the user administers (with duplicate
+   * checks under the org mutation lock) or creates a new organization. This
+   * keeps re-homing deterministic in the webhook flow instead of depending on
+   * a client-side transfer call after checkout.
+   */
   const userId = subscription.referenceId
 
   logger.info('Creating organization for team subscription', {
@@ -165,10 +166,29 @@ export async function ensureOrganizationForTeamSubscription(
           subscription.enterpriseOperationId ?? null
         )
 
+        /**
+         * Re-verify the pre-transaction membership read under the org
+         * mutation lock: a concurrent removal or role change must not let a
+         * stale admin membership authorize the transfer.
+         */
+        const [lockedMembership] = await tx
+          .select({ organizationId: member.organizationId, role: member.role })
+          .from(member)
+          .where(
+            and(eq(member.userId, userId), eq(member.organizationId, membership.organizationId))
+          )
+          .limit(1)
+        if (!lockedMembership || !isOrgAdminRole(lockedMembership.role)) {
+          throw new Error(
+            `User ${userId} no longer administers organization ${membership.organizationId}`
+          )
+        }
+
         const [lockedSub] = await tx
           .select({
             id: subscriptionTable.id,
             referenceId: subscriptionTable.referenceId,
+            plan: subscriptionTable.plan,
           })
           .from(subscriptionTable)
           .where(eq(subscriptionTable.id, subscription.id))
@@ -180,6 +200,12 @@ export async function ensureOrganizationForTeamSubscription(
 
         if (lockedSub.referenceId === membership.organizationId) {
           return
+        }
+
+        if (!isOrgPlan(lockedSub.plan)) {
+          throw new Error(
+            `Subscription ${subscription.id} is no longer a team/enterprise plan (${lockedSub.plan})`
+          )
         }
 
         const [lockedOrg] = await tx
@@ -227,6 +253,7 @@ export async function ensureOrganizationForTeamSubscription(
         ownerUserId: userId,
         organizationId: membership.organizationId,
         externalMemberPolicy: 'keep-external',
+        includeArchived: true,
       })
 
       return { ...subscription, referenceId: membership.organizationId }
@@ -300,6 +327,7 @@ export async function ensureOrganizationForTeamSubscription(
     ownerUserId: userId,
     organizationId: orgId,
     externalMemberPolicy: 'keep-external',
+    includeArchived: true,
   })
 
   logger.info('Created organization and updated subscription referenceId', {
@@ -449,6 +477,7 @@ export async function ensureOrganizationForTeamSubscriptionTx(
     ownerUserId: userId,
     organizationId,
     workspaceIds: subscription.workspaceIdsToAttach,
+    includeArchived: true,
   })
 
   return {
@@ -459,8 +488,8 @@ export async function ensureOrganizationForTeamSubscriptionTx(
 }
 
 /**
- * Sync usage limits for subscription members
- * Updates usage limits for all users associated with the subscription
+ * Syncs the billing pool directly referenced by the subscription.
+ * Organization membership does not select or reset a personal billing pool.
  */
 export async function syncSubscriptionUsageLimits(subscription: SubscriptionData) {
   try {
@@ -485,7 +514,6 @@ export async function syncSubscriptionUsageLimits(subscription: SubscriptionData
         )
       }
 
-      // Individual user subscription - sync their usage limits
       await syncUsageLimitsFromSubscription(subscription.referenceId)
 
       logger.info('Synced usage limits for individual user subscription', {
@@ -494,11 +522,7 @@ export async function syncSubscriptionUsageLimits(subscription: SubscriptionData
         plan: subscription.plan,
       })
     } else {
-      // Organization subscription - set org usage limit and sync member limits
-      // Set orgUsageLimit for any paid non-enterprise plan attached to
-      // the org. Enterprise is set via webhook with custom pricing.
-      // Min = (basePrice × seats) + prepaid balance. Prepaid credits are
-      // additive headroom and must not be absorbed by a later seat increase.
+      /** Enterprise has custom pricing; other paid pools retain prepaid headroom when seats increase. */
       if (isPaid(subscription.plan) && !isEnterprise(subscription.plan)) {
         const { basePrice } = getPlanPricing(subscription.plan)
         const seats = subscription.seats || 1
@@ -524,40 +548,6 @@ export async function syncSubscriptionUsageLimits(subscription: SubscriptionData
           seats,
           basePrice,
         })
-      }
-
-      // Sync usage limits for all members
-      const members = await db
-        .select({ userId: member.userId })
-        .from(member)
-        .where(eq(member.organizationId, organizationId))
-
-      if (members.length > 0) {
-        for (const m of members) {
-          try {
-            await syncUsageLimitsFromSubscription(m.userId)
-          } catch (memberError) {
-            logger.error('Failed to sync usage limits for organization member', {
-              userId: m.userId,
-              organizationId,
-              subscriptionId: subscription.id,
-              error: memberError,
-            })
-          }
-        }
-
-        logger.info('Synced usage limits for organization members', {
-          organizationId,
-          memberCount: members.length,
-          subscriptionId: subscription.id,
-          plan: subscription.plan,
-        })
-
-        /**
-         * Storage is workspace-routed, not membership-routed. Workspace payer
-         * changes transfer the workspace's own durable byte ledger atomically;
-         * subscription sync must not move an account-wide user counter.
-         */
       }
     }
   } catch (error) {

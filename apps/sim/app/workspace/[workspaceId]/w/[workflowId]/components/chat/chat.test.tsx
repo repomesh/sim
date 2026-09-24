@@ -80,6 +80,14 @@ vi.mock('@sim/emcn', () => ({
     <button {...props}>{children}</button>
   ),
   cn: (...values: unknown[]) => values.filter(Boolean).join(' '),
+  ComposerActionButton: ({
+    children,
+    size: _size,
+    active: _active,
+    ...props
+  }: ButtonHTMLAttributes<HTMLButtonElement> & { size?: string; active?: boolean }) => (
+    <button {...props}>{children}</button>
+  ),
   Input: ({
     ref,
     className: _className,
@@ -103,12 +111,9 @@ vi.mock('@sim/emcn', () => ({
 }))
 
 vi.mock('@sim/emcn/icons', () => ({
-  Download: () => <span data-icon='Download' />,
-}))
-
-vi.mock('lucide-react', () => ({
-  AlertCircle: () => <span data-icon='AlertCircle' />,
   ArrowUp: () => <span data-icon='ArrowUp' />,
+  CircleAlert: () => <span data-icon='CircleAlert' />,
+  Download: () => <span data-icon='Download' />,
   MoreVertical: () => <span data-icon='MoreVertical' />,
   Paperclip: () => <span data-icon='Paperclip' />,
   Square: () => <span data-icon='Square' />,

@@ -1,5 +1,6 @@
 import type { PersistedStreamEventEnvelope } from '@/lib/copilot/request/session/contract'
 import {
+  resolveIntegrationToolDisplayTitle,
   resolveStreamingToolDisplayTitle,
   resolveToolDisplayTitle,
 } from '@/app/workspace/[workspaceId]/home/hooks/stream/stream-helpers'
@@ -36,12 +37,22 @@ function toolStatusToNode(status: ToolCallStatus): NodeStatus {
   return status
 }
 
+/** Statuses a snapshot replay must NOT close with a synthetic result. */
+function isOpenToolStatus(status: ToolCallStatus): boolean {
+  return status === ToolCallStatus.executing || status === ToolCallStatus.awaiting_approval
+}
+
 /**
  * Resolves a tool row's display title with the same precedence the live handler
- * used: the streaming-args title wins while args stream, then the arg-derived
- * title, then the explicit `ui.title`.
+ * used: the per-call model-authored activity description, then the legacy
+ * integration gateway description (live even mid-argument-stream), then
+ * the streaming-args title while args stream, then the arg-derived title, then
+ * the explicit `ui.title`.
  */
 function toolDisplayTitle(node: ToolNode): string | undefined {
+  if (node.activityDescription) return node.activityDescription
+  const integrationTitle = resolveIntegrationToolDisplayTitle(node)
+  if (integrationTitle) return integrationTitle
   const streamingTitle = node.streamingArgs
     ? resolveStreamingToolDisplayTitle(node.name, node.streamingArgs)
     : undefined
@@ -126,6 +137,10 @@ export function modelToContentBlocks(model: TurnModel): ContentBlock[] {
             name: node.name,
             status: nodeToToolStatus(node.status),
             ...(displayTitle ? { displayTitle } : {}),
+            ...(node.activityDescription ? { activityDescription: node.activityDescription } : {}),
+            ...(node.integrationDescription
+              ? { integrationDescription: node.integrationDescription }
+              : {}),
             ...(node.args ? { params: node.args } : {}),
             ...(node.streamingArgs ? { streamingArgs: node.streamingArgs } : {}),
             ...(node.result
@@ -138,6 +153,7 @@ export function modelToContentBlocks(model: TurnModel): ContentBlock[] {
                 }
               : {}),
             ...(isSub && ownerAgent ? { calledBy: ownerAgent.agentId } : {}),
+            ...(node.startedAtMs !== undefined ? { startedAtMs: node.startedAtMs } : {}),
           },
           ...spanFields,
           // Wall-clock when available (uniform with text); falls back to seq.
@@ -153,6 +169,7 @@ export function modelToContentBlocks(model: TurnModel): ContentBlock[] {
       block: {
         type: 'subagent',
         content: node.agentId,
+        ...(node.displayName ? { subagentName: node.displayName } : {}),
         spanId: node.spanId,
         parentSpanId: node.parentSpanId,
         ...(node.triggerToolCallId ? { parentToolCallId: node.triggerToolCallId } : {}),
@@ -217,16 +234,31 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
       // double-cast-allowed: synthetic replay envelope rebuilt from ContentBlocks for reduceEvent only; payloads are intentionally the minimal shape the reducer reads (no executor/mode), never provider-parsed or re-emitted on the wire
     }) as unknown as PersistedStreamEventEnvelope
 
-  const scopeFor = (block: ContentBlock): Record<string, unknown> | undefined =>
-    block.spanId
+  const scopeFor = (block: ContentBlock): Record<string, unknown> | undefined => {
+    // Legacy/degraded snapshots (older persisted rows, pre-span stop payloads)
+    // can carry lane linkage without spanId. Fall back to the deterministic
+    // `span:${parentToolCallId}` id — the same convention reduceEvent uses for
+    // scope-less span starts — so the lane survives the rebuild instead of
+    // collapsing into the main lane (subagent text at root, flat layout).
+    const laneLinked =
+      block.type === 'subagent' ||
+      block.type === 'subagent_text' ||
+      block.type === 'subagent_thinking' ||
+      Boolean(block.subagent) ||
+      Boolean(block.toolCall?.calledBy)
+    const spanId =
+      block.spanId ??
+      (laneLinked && block.parentToolCallId ? `span:${block.parentToolCallId}` : undefined)
+    return spanId
       ? {
           lane: 'subagent',
-          spanId: block.spanId,
+          spanId,
           ...(block.parentSpanId ? { parentSpanId: block.parentSpanId } : {}),
           ...(block.parentToolCallId ? { parentToolCallId: block.parentToolCallId } : {}),
           ...(block.subagent ? { agentId: block.subagent } : {}),
         }
       : undefined
+  }
 
   for (const block of blocks) {
     if (block.type === 'subagent') {
@@ -238,7 +270,10 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
             kind: 'subagent',
             event: 'start',
             agent: block.content,
-            data: block.parentToolCallId ? { tool_call_id: block.parentToolCallId } : {},
+            data: {
+              ...(block.parentToolCallId ? { tool_call_id: block.parentToolCallId } : {}),
+              ...(block.subagentName ? { name: block.subagentName } : {}),
+            },
           },
           scopeFor(block),
           block.timestamp
@@ -275,14 +310,25 @@ export function contentBlocksToModel(blocks: ContentBlock[]): TurnModel {
             toolCallId: tc.id,
             toolName: tc.name,
             arguments: tc.params,
+            ...(tc.activityDescription ? { activityDescription: tc.activityDescription } : {}),
+            // Carries an unanswered permission prompt across a snapshot rebuild
+            // so the reloaded row is still actionable rather than a spinner.
+            ...(tc.status === ToolCallStatus.awaiting_approval
+              ? { status: ToolCallStatus.awaiting_approval }
+              : {}),
             // Preserve a server-provided title that isn't derivable from args.
             ...(tc.displayTitle ? { ui: { title: tc.displayTitle } } : {}),
+            // Rebound gateway rows keep their model-authored activity phrase
+            // across a snapshot rebuild (the resolved args no longer carry it).
+            ...(tc.integrationDescription
+              ? { integrationDescription: tc.integrationDescription }
+              : {}),
           },
           scopeFor(block),
           block.timestamp
         )
       )
-      if (tc.status !== ToolCallStatus.executing) {
+      if (!isOpenToolStatus(tc.status)) {
         const node = toolStatusToNode(tc.status)
         reduceEvent(
           model,

@@ -4,10 +4,60 @@
 import { describe, expect, it } from 'vitest'
 import type { StoredTool } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tool-input/types'
 import {
+  isAgentToolBlock,
   isCustomToolAlreadySelected,
   isMcpToolAlreadySelected,
   isWorkflowAlreadySelected,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/editor/components/sub-block/components/tool-input/utils'
+
+describe('isAgentToolBlock', () => {
+  it('includes the current File block', () => {
+    expect(isAgentToolBlock({ type: 'file_v5', category: 'blocks', hideFromToolbar: false })).toBe(
+      true
+    )
+  })
+
+  it('excludes hidden blocks such as the legacy File block', () => {
+    expect(isAgentToolBlock({ type: 'file', category: 'blocks', hideFromToolbar: true })).toBe(
+      false
+    )
+  })
+
+  it('does not make every visible core block agent-callable', () => {
+    expect(isAgentToolBlock({ type: 'memory', category: 'blocks', hideFromToolbar: false })).toBe(
+      false
+    )
+  })
+
+  /**
+   * The set stores base types, so a superseded version does not have to be
+   * re-listed at cutover time. `table_v2` shipped while the set still named
+   * only `table`, which kept it out of the picker entirely.
+   */
+  it('includes a versioned core block whose base type is listed', () => {
+    expect(isAgentToolBlock({ type: 'table_v2', category: 'blocks', hideFromToolbar: false })).toBe(
+      true
+    )
+  })
+
+  it('excludes a superseded version of a listed core block', () => {
+    expect(isAgentToolBlock({ type: 'table', category: 'blocks', hideFromToolbar: true })).toBe(
+      false
+    )
+  })
+
+  it('does not admit a versioned block whose base type is unlisted', () => {
+    expect(
+      isAgentToolBlock({ type: 'memory_v2', category: 'blocks', hideFromToolbar: false })
+    ).toBe(false)
+  })
+
+  it('includes every tools-category block regardless of version', () => {
+    expect(
+      isAgentToolBlock({ type: 'confluence_v2', category: 'tools', hideFromToolbar: false })
+    ).toBe(true)
+  })
+})
 
 describe('isMcpToolAlreadySelected', () => {
   describe('basic functionality', () => {

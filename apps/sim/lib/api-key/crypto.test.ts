@@ -9,19 +9,22 @@
  * @vitest-environment node
  */
 import { randomBytes } from 'crypto'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { resetEnvMock, setEnv } from '@sim/testing'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockEnv } = vi.hoisted(() => ({
-  mockEnv: { API_ENCRYPTION_KEY: undefined as string | undefined },
-}))
+const { mockGenerateSecureToken } = vi.hoisted(() => ({ mockGenerateSecureToken: vi.fn() }))
+vi.mock('@sim/security/tokens', () => ({ generateSecureToken: mockGenerateSecureToken }))
 
-vi.mock('@/lib/core/config/env', () => ({
-  env: mockEnv,
-}))
+beforeAll(() => {
+  setEnv({ API_ENCRYPTION_KEY: undefined })
+})
+
+afterAll(resetEnvMock)
 
 import {
   decryptApiKey,
   encryptApiKey,
+  generateApiKey,
   hashApiKey,
   isEncryptedApiKeyFormat,
   isLegacyApiKeyFormat,
@@ -52,7 +55,7 @@ describe('hashApiKey', () => {
 
 describe('backfill idempotency — encrypted round-trip', () => {
   beforeEach(() => {
-    mockEnv.API_ENCRYPTION_KEY = FIXED_ENCRYPTION_KEY
+    setEnv({ API_ENCRYPTION_KEY: FIXED_ENCRYPTION_KEY })
   })
 
   it('re-running the backfill on the same row yields the same keyHash', async () => {
@@ -85,5 +88,13 @@ describe('api-key format helpers', () => {
   it('treats sim_ prefix as the legacy format', () => {
     expect(isLegacyApiKeyFormat('sim_abc')).toBe(true)
     expect(isEncryptedApiKeyFormat('sim_abc')).toBe(false)
+  })
+})
+
+describe('generateApiKey', () => {
+  it('never issues a legacy key that reads as an OAuth access token', () => {
+    mockGenerateSecureToken.mockReturnValueOnce('oat_collision').mockReturnValueOnce('plain_token')
+    expect(generateApiKey()).toBe('sim_plain_token')
+    expect(mockGenerateSecureToken).toHaveBeenCalledTimes(2)
   })
 })

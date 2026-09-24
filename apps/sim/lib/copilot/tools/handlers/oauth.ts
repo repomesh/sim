@@ -1,53 +1,103 @@
-import { toError } from '@sim/utils/errors'
+import { messageForCopilotApplicationError } from '@/lib/copilot/application/error'
+import { executeCopilotCredentialUseCase } from '@/lib/copilot/application/execute-credential-use-case'
 import type { ExecutionContext, ToolCallResult } from '@/lib/copilot/request/types'
-import { ensureWorkspaceAccess } from '@/lib/copilot/tools/handlers/access'
 import { getBaseUrl } from '@/lib/core/utils/urls'
-import { getAllOAuthServices } from '@/lib/oauth/utils'
+import { prepareCredentialConnection } from '@/lib/credentials/application/prepare-credential-connection'
+import { isServiceAccountProviderId } from '@/lib/credentials/service-account-provider-ids'
+import { APP_ENTRY_PATH } from '@/lib/navigation/paths'
 
 export async function executeOAuthGetAuthLink(
   rawParams: Record<string, unknown>,
   context: ExecutionContext
 ): Promise<ToolCallResult> {
   const providerName = String(rawParams.providerName || rawParams.provider_name || '')
+  const rawCredentialId = rawParams.credentialId || rawParams.credential_id
+  const credentialId = rawCredentialId ? String(rawCredentialId) : undefined
   const baseUrl = getBaseUrl()
-  try {
-    if (!context.workspaceId || !context.userId) {
-      throw new Error('workspaceId and userId are required to generate an OAuth link')
+
+  /** Reject service-account aliases before the provider resolver's fuzzy OAuth match. */
+  const serviceAccountId = providerName
+    .toLowerCase()
+    .trim()
+    .replace(/[\s_]+/g, '-')
+  if (isServiceAccountProviderId(serviceAccountId)) {
+    if (context.requestMode === 'assistant') {
+      const message =
+        'Assistant uses your own connected accounts. A service account cannot be used here.'
+      return { success: false, error: message, output: { message } }
     }
-    await ensureWorkspaceAccess(context.workspaceId, context.userId, 'write')
-    const result = await generateOAuthLink(
-      context.workspaceId,
-      context.workflowId,
-      context.chatId,
+    const message =
+      `"${providerName}" is a service account, not an OAuth provider. ` +
+      `Emit a service_account credential tag with the service's OAuth provider ` +
+      `value instead (e.g. "slack") — it opens the service account setup form in chat.`
+    return { success: false, error: message, output: { message } }
+  }
+  const workspaceId = context.workspaceId
+  if (!workspaceId) return { success: false, error: 'workspaceId is required' }
+
+  try {
+    const result = await executeCopilotCredentialUseCase(context, prepareCredentialConnection, {
+      workspaceId,
       providerName,
-      baseUrl
-    )
+      credentialId,
+      ...(context.requestMode === 'assistant' ? { personalOnly: true } : {}),
+    })
+    if (context.requestMode === 'assistant') {
+      return {
+        success: true,
+        output: {
+          message: `Connect your ${result.serviceName} account using the in-chat connection card.`,
+          provider: result.serviceName,
+          providerId: result.providerId,
+          instructions: `End your response with <credential>${JSON.stringify({ type: 'link', provider: result.providerId })}</credential>. The card connects the signed-in person's account to Connected accounts. Wait for the connection status before continuing.`,
+        },
+      }
+    }
+    const callbackURL = context.workflowId
+      ? `${baseUrl}/workspace/${workspaceId}/w/${context.workflowId}`
+      : context.chatId
+        ? `${baseUrl}/workspace/${workspaceId}/chat/${context.chatId}`
+        : `${baseUrl}/workspace/${workspaceId}`
+    const authorizeUrl = new URL(`${baseUrl}/api/auth/oauth2/authorize`)
+    authorizeUrl.searchParams.set('providerId', result.providerId)
+    authorizeUrl.searchParams.set('workspaceId', workspaceId)
+    authorizeUrl.searchParams.set('callbackURL', callbackURL)
+    if (result.credentialId) authorizeUrl.searchParams.set('credentialId', result.credentialId)
+
+    const action = credentialId ? 'reconnect' : 'connect'
     return {
       success: true,
       output: {
-        message: `Authorization URL generated for ${result.serviceName}.`,
-        oauth_url: result.url,
-        instructions: `Open this URL in your browser to connect ${result.serviceName}: ${result.url}`,
+        message: credentialId
+          ? `Reconnect authorization URL generated for ${result.serviceName}. Completing it re-authorizes credential ${credentialId} in place — its id stays the same.`
+          : `Authorization URL generated for ${result.serviceName}.`,
+        oauth_url: authorizeUrl.toString(),
+        instructions: `Open this URL in your browser to ${action} ${result.serviceName}: ${authorizeUrl.toString()}`,
         provider: result.serviceName,
         providerId: result.providerId,
       },
     }
   } catch (err) {
+    const message = messageForCopilotApplicationError(err)
+    if (context.requestMode === 'assistant') {
+      return { success: false, error: message, output: { message } }
+    }
     const workspaceUrl = context.workspaceId
       ? `${baseUrl}/workspace/${context.workspaceId}`
-      : `${baseUrl}/workspace`
+      : `${baseUrl}${APP_ENTRY_PATH}`
     return {
       success: false,
-      error: toError(err).message,
+      error: message,
       output: {
         message: `Could not generate a direct OAuth link for ${providerName}. Connect manually from the workspace.`,
         oauth_url: workspaceUrl,
-        error: toError(err).message,
+        error: message,
       },
     }
   }
 }
 
+/** Compatibility executor for older Mothership calls and persisted checkpoints. */
 export async function executeOAuthRequestAccess(
   rawParams: Record<string, unknown>,
   _context: ExecutionContext
@@ -61,89 +111,4 @@ export async function executeOAuthRequestAccess(
       message: `Requested ${providerName} OAuth connection.`,
     },
   }
-}
-
-/**
- * Resolves a human-friendly provider name to a providerId and returns a
- * browser-initiated authorize URL the user opens to connect the service.
- *
- * Steps: resolve provider → return the Sim `/api/auth/oauth2/authorize` URL.
- * That endpoint (not this server-side handler) creates the credential draft and
- * calls Better Auth, so the draft's TTL starts at click and the signed `state`
- * cookie is planted in the user's browser and the OAuth callback's state check
- * passes.
- */
-async function generateOAuthLink(
-  workspaceId: string | undefined,
-  workflowId: string | undefined,
-  chatId: string | undefined,
-  providerName: string,
-  baseUrl: string
-): Promise<{ url: string; providerId: string; serviceName: string }> {
-  if (!workspaceId) {
-    throw new Error('workspaceId is required to generate an OAuth link')
-  }
-
-  const allServices = getAllOAuthServices()
-  const normalizedInput = providerName.toLowerCase().trim()
-
-  const matched =
-    allServices.find((s) => s.providerId === normalizedInput) ||
-    allServices.find((s) => s.name.toLowerCase() === normalizedInput) ||
-    allServices.find(
-      (s) =>
-        s.name.toLowerCase().includes(normalizedInput) ||
-        normalizedInput.includes(s.name.toLowerCase())
-    ) ||
-    allServices.find(
-      (s) => s.providerId.includes(normalizedInput) || normalizedInput.includes(s.providerId)
-    )
-
-  if (!matched) {
-    const available = allServices.map((s) => s.name).join(', ')
-    throw new Error(`Provider "${providerName}" not found. Available providers: ${available}`)
-  }
-
-  const { providerId, name: serviceName } = matched
-  const callbackURL =
-    workflowId && workspaceId
-      ? `${baseUrl}/workspace/${workspaceId}/w/${workflowId}`
-      : chatId && workspaceId
-        ? `${baseUrl}/workspace/${workspaceId}/chat/${chatId}`
-        : `${baseUrl}/workspace/${workspaceId}`
-
-  if (providerId === 'trello') {
-    return { url: `${baseUrl}/api/auth/trello/authorize`, providerId, serviceName }
-  }
-  if (providerId === 'instagram') {
-    const authorizeUrl = new URL(`${baseUrl}/api/auth/instagram/authorize`)
-    authorizeUrl.searchParams.set('returnUrl', callbackURL)
-    authorizeUrl.searchParams.set('workspaceId', workspaceId)
-    return { url: authorizeUrl.toString(), providerId, serviceName }
-  }
-  if (providerId === 'shopify') {
-    const returnUrl = encodeURIComponent(callbackURL)
-    return {
-      url: `${baseUrl}/api/auth/shopify/authorize?returnUrl=${returnUrl}`,
-      providerId,
-      serviceName,
-    }
-  }
-
-  // Hand back a browser-initiated authorize URL rather than calling
-  // oAuth2LinkAccount here. Generating the link server-side would set Better
-  // Auth's signed `state` cookie on this server-to-server response instead of the
-  // user's browser, so the OAuth callback would fail with `state_mismatch`. The
-  // authorize endpoint runs the link inside the user's browser, planting the
-  // cookie correctly while keeping the callback's state check enabled.
-  //
-  // The pending credential draft is created by that authorize endpoint at click
-  // time (not here), so the draft's TTL starts when the user actually initiates
-  // the connect and reliably outlives the OAuth round-trip.
-  const authorizeUrl = new URL(`${baseUrl}/api/auth/oauth2/authorize`)
-  authorizeUrl.searchParams.set('providerId', providerId)
-  authorizeUrl.searchParams.set('workspaceId', workspaceId)
-  authorizeUrl.searchParams.set('callbackURL', callbackURL)
-
-  return { url: authorizeUrl.toString(), providerId, serviceName }
 }

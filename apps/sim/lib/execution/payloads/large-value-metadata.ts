@@ -1,14 +1,18 @@
-import { db } from '@sim/db'
+import { db, dbFor } from '@sim/db'
 import {
   executionLargeValueDependencies,
   executionLargeValueReferences,
   executionLargeValues,
+  memory,
+  memoryArtifact,
   pausedExecutions,
   workflowExecutionLogs,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { chunkArray } from '@sim/utils/helpers'
 import { and, eq, inArray, notInArray, sql } from 'drizzle-orm'
-import { chunkArray } from '@/lib/cleanup/batch-delete'
+import { consumeRowBudget } from '@/lib/cleanup/batch-delete'
+import type { CleanupBudgets } from '@/lib/cleanup/limits'
 import { collectLargeValueKeys } from '@/lib/execution/payloads/large-execution-value'
 
 const logger = createLogger('LargeValueMetadata')
@@ -50,10 +54,13 @@ export interface LargeValueMetadataPruneResult {
 }
 
 interface PruneLargeValueMetadataOptions {
+  budgets?: CleanupBudgets
   workspaceIds: string[]
   tombstonesDeletedBefore: Date
   batchSize?: number
   maxRowsPerTable?: number
+  /** Client the prune DELETEs run on. Defaults to the global pool; cleanup jobs pass `dbFor('cleanup')`. */
+  dbClient?: LargeValueMetadataClient
 }
 
 function parseLargeValueStorageKey(key: string): LargeValueStorageKeyParts | null {
@@ -186,7 +193,7 @@ export async function registerLargeValueOwner(
     return false
   }
 
-  await db.transaction(async (tx) => {
+  await dbFor('exec').transaction(async (tx) => {
     await tx
       .insert(executionLargeValues)
       .values({
@@ -223,22 +230,6 @@ export async function registerLargeValueOwner(
   })
 
   return true
-}
-
-export async function replaceLargeValueReferencesWithClient(
-  client: LargeValueMetadataClient,
-  scope: LargeValueReferenceScope,
-  value: unknown
-): Promise<void> {
-  if (!scope.workspaceId || !scope.executionId) {
-    return
-  }
-
-  await replaceLargeValueReferenceKeysWithClient(
-    client,
-    scope,
-    collectLargeValueReferenceKeys(value, scope.workspaceId)
-  )
 }
 
 export async function replaceLargeValueReferenceKeysWithClient(
@@ -309,7 +300,8 @@ export async function addLargeValueReference(
     return
   }
 
-  const [existingRef] = await db
+  const execDb = dbFor('exec')
+  const [existingRef] = await execDb
     .select({ key: executionLargeValueReferences.key })
     .from(executionLargeValueReferences)
     .where(
@@ -326,7 +318,7 @@ export async function addLargeValueReference(
     return
   }
 
-  const existingRefs = await db
+  const existingRefs = await execDb
     .select({ key: executionLargeValueReferences.key })
     .from(executionLargeValueReferences)
     .where(
@@ -344,7 +336,7 @@ export async function addLargeValueReference(
     )
   }
 
-  await db
+  await execDb
     .insert(executionLargeValueReferences)
     .values({
       key: boundedKey,
@@ -356,37 +348,35 @@ export async function addLargeValueReference(
     .onConflictDoNothing()
 }
 
-export async function replaceLargeValueReferences(
-  scope: LargeValueReferenceScope,
-  value: unknown
+export async function markLargeValuesDeleted(
+  keys: string[],
+  dbClient: LargeValueMetadataClient = db
 ): Promise<void> {
-  const referenceKeys = scope.workspaceId
-    ? collectLargeValueReferenceKeys(value, scope.workspaceId)
-    : []
-  await db.transaction(async (tx) => {
-    await replaceLargeValueReferenceKeysWithClient(tx, scope, referenceKeys)
-  })
-}
-
-export async function markLargeValuesDeleted(keys: string[]): Promise<void> {
   if (keys.length === 0) {
     return
   }
 
-  await db
+  await dbClient
     .update(executionLargeValues)
     .set({ deletedAt: new Date() })
     .where(inArray(executionLargeValues.key, keys))
 }
 
-async function pruneStaleReferences(workspaceIds: string[], batchSize: number): Promise<number> {
-  const rows = await db.execute<{ count: number }>(sql`
+async function pruneStaleReferences(
+  workspaceIds: string[],
+  batchSize: number,
+  dbClient: LargeValueMetadataClient
+): Promise<number> {
+  // Empty input is a valid no-op, and `IN ()` is a syntax error whose failure the
+  // cleanup job swallows — keep these total rather than relying on the caller.
+  if (workspaceIds.length === 0) return 0
+  const rows = await dbClient.execute<{ count: number }>(sql`
     WITH deleted AS (
       DELETE FROM ${executionLargeValueReferences} AS ref
       WHERE ref.ctid IN (
         SELECT ref.ctid
         FROM ${executionLargeValueReferences} AS ref
-        WHERE ref.workspace_id = ANY(${workspaceIds}::text[])
+        WHERE ref.workspace_id IN ${workspaceIds}
           AND (
             (
               ref.source = 'execution_log'
@@ -402,7 +392,7 @@ async function pruneStaleReferences(workspaceIds: string[], batchSize: number): 
                 SELECT 1
                 FROM ${pausedExecutions} AS pe
                 WHERE pe.execution_id = ref.execution_id
-                  AND pe.status = ANY(${LIVE_PAUSED_REFERENCE_STATUSES}::text[])
+                  AND pe.status IN ${LIVE_PAUSED_REFERENCE_STATUSES}
               )
             )
             OR ref.source NOT IN ('execution_log', 'paused_snapshot')
@@ -418,15 +408,19 @@ async function pruneStaleReferences(workspaceIds: string[], batchSize: number): 
 
 async function pruneDeletedParentDependencies(
   workspaceIds: string[],
-  batchSize: number
+  batchSize: number,
+  dbClient: LargeValueMetadataClient
 ): Promise<number> {
-  const rows = await db.execute<{ count: number }>(sql`
+  // Empty input is a valid no-op, and `IN ()` is a syntax error whose failure the
+  // cleanup job swallows — keep these total rather than relying on the caller.
+  if (workspaceIds.length === 0) return 0
+  const rows = await dbClient.execute<{ count: number }>(sql`
     WITH deleted AS (
       DELETE FROM ${executionLargeValueDependencies} AS dependency
       WHERE dependency.ctid IN (
         SELECT dependency.ctid
         FROM ${executionLargeValueDependencies} AS dependency
-        WHERE dependency.workspace_id = ANY(${workspaceIds}::text[])
+        WHERE dependency.workspace_id IN ${workspaceIds}
           AND (
             EXISTS (
               SELECT 1
@@ -452,17 +446,21 @@ async function pruneDeletedParentDependencies(
 async function pruneDeletedLargeValueTombstones(
   workspaceIds: string[],
   deletedBefore: Date,
-  batchSize: number
+  batchSize: number,
+  dbClient: LargeValueMetadataClient
 ): Promise<number> {
-  const rows = await db.execute<{ count: number }>(sql`
+  // Empty input is a valid no-op, and `IN ()` is a syntax error whose failure the
+  // cleanup job swallows — keep these total rather than relying on the caller.
+  if (workspaceIds.length === 0) return 0
+  const rows = await dbClient.execute<{ count: number }>(sql`
     WITH deleted AS (
       DELETE FROM ${executionLargeValues} AS value
       WHERE value.ctid IN (
         SELECT value.ctid
         FROM ${executionLargeValues} AS value
-        WHERE value.workspace_id = ANY(${workspaceIds}::text[])
+        WHERE value.workspace_id IN ${workspaceIds}
           AND value.deleted_at IS NOT NULL
-          AND value.deleted_at < ${deletedBefore}
+          AND value.deleted_at < ${sql.param(deletedBefore, executionLargeValues.deletedAt)}
           AND NOT EXISTS (
             SELECT 1
             FROM ${executionLargeValueDependencies} AS dependency
@@ -480,8 +478,10 @@ async function pruneDeletedLargeValueTombstones(
 export async function pruneLargeValueMetadata({
   workspaceIds,
   tombstonesDeletedBefore,
+  budgets,
   batchSize = LARGE_VALUE_METADATA_PRUNE_BATCH_SIZE,
   maxRowsPerTable = LARGE_VALUE_METADATA_PRUNE_MAX_ROWS_PER_TABLE,
+  dbClient = db,
 }: PruneLargeValueMetadataOptions): Promise<LargeValueMetadataPruneResult> {
   const result: LargeValueMetadataPruneResult = {
     referencesDeleted: 0,
@@ -494,29 +494,47 @@ export async function pruneLargeValueMetadata({
     workspaceIds,
     LARGE_VALUE_METADATA_WORKSPACE_CHUNK_SIZE
   )) {
-    const referencesRemaining = maxRowsPerTable - result.referencesDeleted
+    const referencesRemaining = Math.min(
+      maxRowsPerTable - result.referencesDeleted,
+      budgets?.staleReferences.remaining ?? maxRowsPerTable
+    )
     if (referencesRemaining > 0) {
-      result.referencesDeleted += await pruneStaleReferences(
+      const deleted = await pruneStaleReferences(
         workspaceChunk,
-        Math.min(batchSize, referencesRemaining)
+        Math.min(batchSize, referencesRemaining),
+        dbClient
       )
+      consumeRowBudget(budgets?.staleReferences, deleted)
+      result.referencesDeleted += deleted
     }
 
-    const dependenciesRemaining = maxRowsPerTable - result.dependenciesDeleted
+    const dependenciesRemaining = Math.min(
+      maxRowsPerTable - result.dependenciesDeleted,
+      budgets?.staleDependencies.remaining ?? maxRowsPerTable
+    )
     if (dependenciesRemaining > 0) {
-      result.dependenciesDeleted += await pruneDeletedParentDependencies(
+      const deleted = await pruneDeletedParentDependencies(
         workspaceChunk,
-        Math.min(batchSize, dependenciesRemaining)
+        Math.min(batchSize, dependenciesRemaining),
+        dbClient
       )
+      consumeRowBudget(budgets?.staleDependencies, deleted)
+      result.dependenciesDeleted += deleted
     }
 
-    const tombstonesRemaining = maxRowsPerTable - result.tombstonesDeleted
+    const tombstonesRemaining = Math.min(
+      maxRowsPerTable - result.tombstonesDeleted,
+      budgets?.largeValueTombstones.remaining ?? maxRowsPerTable
+    )
     if (tombstonesRemaining > 0) {
-      result.tombstonesDeleted += await pruneDeletedLargeValueTombstones(
+      const deleted = await pruneDeletedLargeValueTombstones(
         workspaceChunk,
         tombstonesDeletedBefore,
-        Math.min(batchSize, tombstonesRemaining)
+        Math.min(batchSize, tombstonesRemaining),
+        dbClient
       )
+      consumeRowBudget(budgets?.largeValueTombstones, deleted)
+      result.tombstonesDeleted += deleted
     }
 
     if (
@@ -533,6 +551,15 @@ export async function pruneLargeValueMetadata({
 
 export function unreferencedLargeValuePredicate() {
   return sql`
+    NOT EXISTS (
+      SELECT 1
+      FROM ${memoryArtifact} AS memory_artifact
+      INNER JOIN ${memory} AS conversation ON conversation.id = memory_artifact.memory_id
+      WHERE memory_artifact.key = ${executionLargeValues.key}
+        AND conversation.workspace_id = ${executionLargeValues.workspaceId}
+        AND conversation.deleted_at IS NULL
+    )
+    AND
     NOT EXISTS (
       SELECT 1
       FROM ${executionLargeValueReferences} AS elvr
@@ -552,7 +579,7 @@ export function unreferencedLargeValuePredicate() {
               SELECT 1
               FROM ${pausedExecutions} AS pe
               WHERE pe.execution_id = elvr.execution_id
-                AND pe.status = ANY(${LIVE_PAUSED_REFERENCE_STATUSES}::text[])
+                AND pe.status IN ${LIVE_PAUSED_REFERENCE_STATUSES}
             )
           )
         )
@@ -566,7 +593,7 @@ export function unreferencedLargeValuePredicate() {
       SELECT 1
       FROM ${pausedExecutions} AS owner_pe
       WHERE owner_pe.execution_id = ${executionLargeValues.ownerExecutionId}
-        AND owner_pe.status = ANY(${LIVE_PAUSED_REFERENCE_STATUSES}::text[])
+        AND owner_pe.status IN ${LIVE_PAUSED_REFERENCE_STATUSES}
     )
     AND NOT EXISTS (
       SELECT 1
@@ -579,6 +606,16 @@ export function unreferencedLargeValuePredicate() {
         AND (
           EXISTS (
             SELECT 1
+            FROM ${memoryArtifact} AS parent_memory_artifact
+            INNER JOIN ${memory} AS parent_conversation
+              ON parent_conversation.id = parent_memory_artifact.memory_id
+            WHERE parent_memory_artifact.key = parent_value.key
+              AND parent_conversation.workspace_id = parent_value.workspace_id
+              AND parent_conversation.deleted_at IS NULL
+          )
+          OR
+          EXISTS (
+            SELECT 1
             FROM ${workflowExecutionLogs} AS parent_owner_wel
             WHERE parent_owner_wel.execution_id = parent_value.owner_execution_id
           )
@@ -586,7 +623,7 @@ export function unreferencedLargeValuePredicate() {
             SELECT 1
             FROM ${pausedExecutions} AS parent_owner_pe
             WHERE parent_owner_pe.execution_id = parent_value.owner_execution_id
-              AND parent_owner_pe.status = ANY(${LIVE_PAUSED_REFERENCE_STATUSES}::text[])
+              AND parent_owner_pe.status IN ${LIVE_PAUSED_REFERENCE_STATUSES}
           )
           OR EXISTS (
             SELECT 1
@@ -607,7 +644,7 @@ export function unreferencedLargeValuePredicate() {
                     SELECT 1
                     FROM ${pausedExecutions} AS parent_ref_pe
                     WHERE parent_ref_pe.execution_id = parent_ref.execution_id
-                      AND parent_ref_pe.status = ANY(${LIVE_PAUSED_REFERENCE_STATUSES}::text[])
+                      AND parent_ref_pe.status IN ${LIVE_PAUSED_REFERENCE_STATUSES}
                   )
                 )
               )

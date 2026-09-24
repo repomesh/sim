@@ -1,11 +1,46 @@
 import { BookOpen, ClipboardList, File, Table, Users } from '@sim/emcn/icons'
-import { GoogleTranslateIcon, GreptileIcon, LinearIcon, SlackIcon } from '@/components/icons'
+import { GoogleTranslateIcon, GreptileIcon, SlackIcon } from '@/components/icons'
 import { getScopesForService } from '@/lib/oauth/utils'
 import type { BlockConfig, BlockMeta, SubBlockConfig } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
 import { normalizeFileInput } from '@/blocks/utils'
 import type { SlackResponse } from '@/tools/slack/types'
 import { getTrigger } from '@/triggers'
+
+/**
+ * Canonical basic/advanced pair for the channel target, shared by the card
+ * sentences below. Listing both members is what keeps the sentence working for
+ * an advanced-mode user, who has only the manual field filled.
+ */
+/** The operations that offer a channel/DM switch, and so honour it. */
+const DESTINATION_SWITCH_OPERATIONS = ['send', 'read', 'schedule_message'] as const
+
+const SLACK_V2_AGENT_OPERATIONS = [
+  'set_agent_suggested_prompts',
+  'set_agent_session_status',
+  'rename_agent_session',
+] as const
+
+const SLACK_V2_SESSION_OPERATIONS = ['set_agent_session_status', 'rename_agent_session'] as const
+
+const CHANNEL_FIELD = ['channel', 'manualChannel'] as const
+
+/**
+ * Where a message lands, for the three operations that offer a channel/DM
+ * switch. Both canonical pairs are listed in full; `destinationType` keeps
+ * exactly one of them visible, so the first match is always the real target.
+ */
+const DESTINATION_FIELD = ['channel', 'manualChannel', 'dmUserId', 'manualDmUserId'] as const
+
+/** Message body, whichever `messageFormat` the user picked. */
+const MESSAGE_BODY_FIELD = ['text', 'blocks'] as const
+
+/**
+ * The channel filter on the `slack_oauth` trigger (slack_v2 only). Both members
+ * of the canonical pair, so the trigger sentence keeps working for a user who
+ * pasted channel IDs into the advanced field instead of picking them.
+ */
+const SLACK_TRIGGER_CHANNEL_FIELD = ['channelFilter', 'manualChannelFilter'] as const
 
 export const SlackBlock: BlockConfig<SlackResponse> = {
   type: 'slack',
@@ -15,15 +50,264 @@ export const SlackBlock: BlockConfig<SlackResponse> = {
   authMode: AuthMode.OAuth,
   longDescription:
     'Integrate Slack into the workflow. Can send, update, and delete messages, send ephemeral messages visible only to a specific user, open/update/push modal views, publish Home tab views, create canvases, read messages, and add or remove reactions. Requires Bot Token instead of OAuth in advanced mode. Can be used in trigger mode to trigger a workflow when a message is sent to a channel.',
+  bestPractices:
+    'For Slack trigger response streaming, select current-workflow outputs as `<blockName>.<outputPath>` and child-workflow outputs as `<childWorkflowId>.<blockName>.<outputPath>`. Use the normalized block reference name shown by the workflow catalog. Selecting a child workflow applies to every invocation of that workflow in the run.',
   docsLink: 'https://docs.sim.ai/integrations/slack',
   category: 'tools',
   integrationType: IntegrationType.Communication,
   bgColor: '#611f69',
   icon: SlackIcon,
   triggerAllowed: true,
-  // Superseded by slack_v2, but stays discoverable until v2 GAs — hiding both
-  // would leave no Slack block in the toolbar while v2 is preview-gated. At v2
-  // GA this becomes `hideFromToolbar: true` (superseded-version paradigm).
+  canvasPresentation: {
+    defaultTitle: 'Slack',
+    /*
+     * The legacy webhook trigger fires on whatever the user's own Slack app
+     * subscribes to, and everything it configures — Request URL, signing secret,
+     * bot token, setup wizard — is plumbing. So the sentence names the events
+     * rather than echoing the header with the trigger's registry name.
+     */
+    triggerSentences: {
+      default: ['Run on a message, mention, or reaction'],
+    },
+    sentences: {
+      byOperation: {
+        send: [
+          { text: 'Post', field: MESSAGE_BODY_FIELD, core: true },
+          { text: 'to', field: DESTINATION_FIELD, core: true },
+          { text: ', in thread', field: 'threadTs' },
+        ],
+        ephemeral: [
+          { text: 'Post', field: MESSAGE_BODY_FIELD, core: true },
+          {
+            text: 'visible only to',
+            field: ['ephemeralUser', 'manualEphemeralUser'],
+            core: true,
+          },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+        schedule_message: [
+          { text: 'Schedule', field: MESSAGE_BODY_FIELD, core: true },
+          { text: 'to', field: DESTINATION_FIELD, core: true },
+          { text: 'at', field: 'scheduleAt' },
+        ],
+        update: [
+          { text: 'Update message', field: 'updateTimestamp', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+          { text: ', with', field: ['updateText', 'blocks'] },
+        ],
+        delete: [
+          { text: 'Delete message', field: 'deleteTimestamp', core: true },
+          { text: 'from', field: CHANNEL_FIELD },
+        ],
+        read: [
+          {
+            text: 'Read the latest',
+            field: 'limit',
+            after: 'messages',
+            core: true,
+          },
+          { text: 'from', field: DESTINATION_FIELD, core: true },
+          { text: ', since', field: 'oldest' },
+        ],
+        get_message: [
+          { text: 'Fetch message', field: 'getMessageTimestamp', core: true },
+          { text: 'from', field: CHANNEL_FIELD },
+        ],
+        get_permalink: [
+          { text: 'Get a permalink to message', field: 'getMessageTimestamp', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+        get_thread: [
+          { text: 'Fetch thread', field: 'getThreadTimestamp', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+          { text: ', up to', field: 'threadLimit', after: 'messages' },
+        ],
+        get_thread_replies: [
+          { text: 'Fetch every message in thread', field: 'getThreadTimestamp', core: true },
+          { text: 'from', field: CHANNEL_FIELD },
+          { text: ', since', field: 'historyOldest' },
+        ],
+        get_channel_history: [
+          {
+            text: 'Fetch full message history from',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+          { text: ', since', field: 'historyOldest' },
+          { text: ', until', field: 'historyLatest' },
+        ],
+        react: [
+          { text: 'Add reaction', field: 'emojiName', core: true },
+          { text: 'to message', field: 'reactionTimestamp', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+        unreact: [
+          { text: 'Remove reaction', field: 'emojiName', core: true },
+          { text: 'from message', field: 'reactionTimestamp', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+        set_status: [
+          {
+            text: 'Set assistant status to',
+            field: 'status',
+            core: true,
+          },
+          { text: 'on thread', field: 'getThreadTimestamp', core: true },
+        ],
+        set_title: [
+          { text: 'Set assistant title to', field: 'assistantTitle', core: true },
+          { text: 'on thread', field: 'getThreadTimestamp' },
+        ],
+        set_suggested_prompts: [
+          { text: 'Set suggested prompts on thread', field: 'getThreadTimestamp', core: true },
+          { text: ', with heading', field: 'promptsTitle' },
+        ],
+        list_channels: [
+          'List Slack conversations',
+          {
+            text: ', in pages of',
+            field: 'channelLimit',
+            after: 'items',
+          },
+        ],
+        list_members: [
+          {
+            text: 'List up to',
+            field: 'memberLimit',
+            after: 'members of',
+            core: true,
+          },
+          { field: CHANNEL_FIELD, core: true },
+        ],
+        list_users: [
+          {
+            text: 'List up to',
+            field: 'userLimit',
+            after: 'workspace users',
+            core: true,
+          },
+        ],
+        get_user: [{ text: 'Read the profile of', field: ['userId', 'manualUserId'], core: true }],
+        get_user_presence: [
+          {
+            text: 'Check whether',
+            field: ['presenceUserId', 'manualPresenceUserId'],
+            after: 'is active',
+            core: true,
+          },
+        ],
+        get_channel_info: [
+          {
+            text: 'Read details of',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+        ],
+        download: [
+          { text: 'Download file', field: 'fileId', core: true },
+          { text: ', saved as', field: 'downloadFileName' },
+        ],
+        canvas: [
+          { text: 'Create canvas', field: 'title', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+        create_channel_canvas: [
+          {
+            text: 'Create a channel canvas in',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+          { text: ', titled', field: 'channelCanvasTitle' },
+        ],
+        edit_canvas: [
+          { text: 'Edit canvas', field: 'editCanvasId', core: true },
+          { text: 'at section', field: 'sectionId' },
+          { text: ', with', field: 'canvasContent' },
+        ],
+        get_canvas: [{ text: 'Read metadata for canvas', field: 'getCanvasId', core: true }],
+        list_canvases: [
+          'List canvases',
+          { text: ', up to', field: 'canvasListCount', after: 'at a time' },
+          { text: ', created by', field: 'canvasListUser' },
+        ],
+        lookup_canvas_sections: [
+          { text: 'Find sections in canvas', field: 'lookupCanvasId', core: true },
+          { text: 'matching', field: 'sectionCriteria' },
+        ],
+        delete_canvas: [{ text: 'Delete canvas', field: 'deleteCanvasId', core: true }],
+        create_conversation: [{ text: 'Create channel', field: 'conversationName', core: true }],
+        invite_to_conversation: [
+          { text: 'Invite', field: 'inviteUsers', core: true },
+          { text: 'to', field: CHANNEL_FIELD, core: true },
+        ],
+        archive_conversation: [
+          {
+            text: 'Archive',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+        ],
+        rename_conversation: [
+          {
+            text: 'Rename',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+          { text: 'to', field: 'renameChannelName' },
+        ],
+        set_conversation_topic: [
+          {
+            text: 'Set the topic of',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+          { text: 'to', field: 'conversationTopic' },
+        ],
+        set_conversation_purpose: [
+          {
+            text: 'Set the purpose of',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+          { text: 'to', field: 'conversationPurpose' },
+        ],
+        open_view: [
+          { text: 'Open a modal for trigger', field: 'viewTriggerId', core: true },
+          { text: ', with', field: 'viewPayload' },
+        ],
+        push_view: [
+          { text: 'Push another modal for trigger', field: 'viewTriggerId', core: true },
+          { text: ', with', field: 'viewPayload' },
+        ],
+        update_view: [
+          { text: 'Update modal', field: ['viewId', 'viewExternalId'], core: true },
+          { text: ', with', field: 'viewPayload' },
+        ],
+        publish_view: [
+          {
+            text: 'Publish the Home tab for',
+            field: ['publishUserId', 'manualPublishUserId'],
+            core: true,
+          },
+          { text: ', with', field: 'viewPayload' },
+        ],
+        list_scheduled_messages: [
+          {
+            text: 'List scheduled messages in',
+            field: CHANNEL_FIELD,
+            core: true,
+          },
+        ],
+        delete_scheduled_message: [
+          { text: 'Delete scheduled message', field: 'scheduledMessageId', core: true },
+          { text: 'in', field: CHANNEL_FIELD },
+        ],
+      },
+    },
+  },
+  /** Existing workflows keep resolving v1 while discovery uses the released successor. */
+  hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'slack_v2' },
   subBlocks: [
     {
       id: 'operation',
@@ -97,7 +381,7 @@ export const SlackBlock: BlockConfig<SlackResponse> = {
       value: () => 'channel',
       condition: {
         field: 'operation',
-        value: ['send', 'read', 'schedule_message'],
+        value: [...DESTINATION_SWITCH_OPERATIONS],
       },
     },
     {
@@ -158,6 +442,20 @@ export const SlackBlock: BlockConfig<SlackResponse> = {
         if (op === 'ephemeral') {
           return { field: 'operation', value: 'ephemeral' }
         }
+        /*
+         * Only the three operations that offer the channel/DM switch defer to
+         * it. Deferring everywhere left a stale `destinationType: 'dm'` — set
+         * under `send`, never cleared by an operation change — hiding the
+         * channel field on operations that have no DM mode at all, so their
+         * cards silently lost their only clause.
+         */
+        if (DESTINATION_SWITCH_OPERATIONS.includes(op as never)) {
+          return {
+            field: 'destinationType',
+            value: 'dm',
+            not: true,
+          }
+        }
         return {
           field: 'operation',
           value: [
@@ -176,11 +474,6 @@ export const SlackBlock: BlockConfig<SlackResponse> = {
             'publish_view',
           ],
           not: true,
-          and: {
-            field: 'destinationType',
-            value: 'dm',
-            not: true,
-          },
         }
       },
       required: {
@@ -469,13 +762,14 @@ Do not include any explanations, markdown formatting, or other text outside the 
     },
     {
       id: 'channelLimit',
-      title: 'Channel Limit',
+      title: 'Conversations Per Page',
       type: 'short-input',
       placeholder: '100',
       condition: {
         field: 'operation',
         value: 'list_channels',
       },
+      mode: 'advanced',
     },
     // List Members specific fields
     {
@@ -518,7 +812,7 @@ Do not include any explanations, markdown formatting, or other text outside the 
       id: 'paginationCursor',
       title: 'Pagination Cursor',
       type: 'short-input',
-      placeholder: 'next_cursor from a previous response',
+      placeholder: 'nextCursor from a previous response',
       condition: {
         field: 'operation',
         value: ['list_channels', 'list_members', 'list_users'],
@@ -1834,7 +2128,15 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
           case 'list_channels': {
             baseParams.includePrivate = includePrivate !== 'false'
             baseParams.excludeArchived = true
-            baseParams.limit = channelLimit ? Number.parseInt(channelLimit, 10) : 100
+            const hasChannelLimit =
+              channelLimit !== undefined &&
+              channelLimit !== null &&
+              (typeof channelLimit !== 'string' || Boolean(channelLimit.trim()))
+            const parsedLimit = hasChannelLimit ? Number(channelLimit) : 100
+            if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 200) {
+              throw new Error('Conversations per page must be an integer between 1 and 200')
+            }
+            baseParams.limit = parsedLimit
             if (paginationCursor) {
               baseParams.cursor = String(paginationCursor).trim()
             }
@@ -2100,7 +2402,7 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
     thread_ts: { type: 'string', description: 'Thread timestamp for reply' },
     // List Channels inputs
     includePrivate: { type: 'string', description: 'Include private channels (true/false)' },
-    channelLimit: { type: 'string', description: 'Maximum number of channels to return' },
+    channelLimit: { type: 'string', description: 'Conversations to request per Slack page' },
     // List Members inputs
     memberLimit: { type: 'string', description: 'Maximum number of members to return' },
     // List Users inputs
@@ -2109,7 +2411,7 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
     // Shared pagination input
     paginationCursor: {
       type: 'string',
-      description: 'Pagination cursor (next_cursor) for list_channels/list_members/list_users',
+      description: 'Pagination cursor (nextCursor) for list_channels/list_members/list_users',
     },
     // Ephemeral message inputs
     ephemeralUser: { type: 'string', description: 'User ID who will see the ephemeral message' },
@@ -2276,6 +2578,14 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
       type: 'boolean',
       description: 'Whether Slack completed the canvas operation successfully',
     },
+    status: {
+      type: 'string',
+      description: 'Agent session status requested from Slack',
+    },
+    agentStatus: {
+      type: 'string',
+      description: 'Agent session status recorded by Slack',
+    },
 
     // slack_message_reader outputs (read operation)
     messages: {
@@ -2299,13 +2609,14 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
     },
     hasMore: {
       type: 'boolean',
-      description: 'Whether there are more messages in the thread',
+      description:
+        'Whether more thread messages or provider pages remain beyond the fetched window',
     },
 
     // slack_get_channel_history / slack_get_thread_replies pagination outputs
     pages: {
       type: 'number',
-      description: 'Number of pages fetched during a paginated history/replies read',
+      description: 'Number of provider pages fetched during a paginated read',
     },
     threadTs: {
       type: 'string',
@@ -2322,7 +2633,7 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
     channels: {
       type: 'json',
       description:
-        'Array of channel objects with properties: id, name, is_private, is_archived, is_member, num_members, topic, purpose, created, creator',
+        'One page of accessible public and private channel objects, including conversation type and membership fields.',
     },
     count: {
       type: 'number',
@@ -2465,9 +2776,7 @@ Return ONLY the integer Unix timestamp - no explanations, no quotes, no extra te
     team_id: { type: 'string', description: 'Slack workspace/team ID' },
     event_id: { type: 'string', description: 'Unique event identifier for the trigger' },
   },
-  // Trigger capabilities moved to slack_v2 so the trigger surfaces once.
-  // Legacy webhook trigger stays available while slack_v2 (which hosts the
-  // redesigned slack_oauth trigger) is preview-gated; drops at v2 GA.
+  /** Keeps saved v1 webhook-trigger workflows executable after slack_v2 is released. */
   triggers: {
     enabled: true,
     available: ['slack_webhook'],
@@ -2490,7 +2799,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: Table,
-      title: 'Churn risk detector',
+      title: 'Slack churn risk alerts',
       prompt:
         'Create a workflow that monitors customer activity — support ticket frequency, response sentiment, usage patterns — scores each account for churn risk in a table, and triggers a Slack alert to the account team when a customer crosses the risk threshold.',
       modules: ['tables', 'scheduled', 'agent', 'workflows'],
@@ -2498,8 +2807,8 @@ export const SlackBlockMeta = {
       tags: ['support', 'sales', 'monitoring', 'analysis'],
     },
     {
-      icon: LinearIcon,
-      title: 'Incident postmortem writer',
+      icon: SlackIcon,
+      title: 'Slack incident postmortem writer',
       prompt:
         'Create a workflow that when triggered after an incident, pulls the Slack thread from the incident channel, gathers relevant Sentry errors and deployment logs, and drafts a structured postmortem with timeline, root cause, and action items.',
       modules: ['agent', 'files', 'workflows'],
@@ -2528,7 +2837,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: File,
-      title: 'Automated narrative report',
+      title: 'Slack narrative report',
       prompt:
         'Build a scheduled workflow that pulls key data from my tables every week, analyzes trends and anomalies, and writes a narrative report — not just charts and numbers, but written insights explaining what changed, why it matters, and what to do next. Save it as a document and send a summary to Slack.',
       modules: ['tables', 'scheduled', 'agent', 'files', 'workflows'],
@@ -2537,7 +2846,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: BookOpen,
-      title: 'Email digest curator',
+      title: 'Slack reading digest',
       prompt:
         'Create a scheduled daily workflow that searches the web for the latest articles, papers, and news on topics I care about, picks the top 5 most relevant pieces, writes a one-paragraph summary for each, and delivers a curated reading digest to my inbox or Slack.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],
@@ -2546,7 +2855,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: ClipboardList,
-      title: 'Daily standup summary',
+      title: 'Slack standup summary',
       prompt:
         'Create a scheduled workflow that reads the #standup Slack channel each morning, summarizes what everyone is working on, identifies blockers, and posts a structured recap to a Google Docs document.',
       modules: ['scheduled', 'agent', 'files', 'workflows'],
@@ -2556,7 +2865,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: Users,
-      title: 'New hire onboarding automation',
+      title: 'Slack onboarding automation',
       prompt:
         "Build a workflow that when triggered with a new hire's info, creates their accounts, sends a personalized welcome message in Slack, schedules 1:1s with their team on Google Calendar, shares relevant onboarding docs from the knowledge base, and tracks completion in a table.",
       modules: ['knowledge-base', 'tables', 'agent', 'workflows'],
@@ -2566,7 +2875,7 @@ export const SlackBlockMeta = {
     },
     {
       icon: Table,
-      title: 'Customer 360 view',
+      title: 'Slack customer 360 alerts',
       prompt:
         'Create a comprehensive customer table that aggregates data from my CRM, support tickets, billing history, and product usage into a single unified view per customer. Schedule it to sync daily and send a Slack alert when any customer shows signs of trouble across multiple signals.',
       modules: ['tables', 'scheduled', 'agent', 'workflows'],
@@ -2627,69 +2936,482 @@ export const SlackBlockMeta = {
   ],
 } as const satisfies BlockMeta
 
-/**
- * Custom Bot picker used by slack_v2 in place of v1's raw bot-token field — a
- * canonical basic/advanced pair (dropdown + manual credential-ID paste),
- * mirroring the OAuth `credential`/`manualCredential` pair.
- */
-const SLACK_CUSTOM_BOT_SUBBLOCKS: SubBlockConfig[] = [
-  {
-    id: 'customBotCredential',
-    title: 'Slack Bot',
-    type: 'oauth-input',
-    canonicalParamId: 'botCredential',
-    mode: 'basic',
-    serviceId: 'slack',
-    credentialKind: 'custom-bot',
-    requiredScopes: getScopesForService('slack'),
-    placeholder: 'Select a connected bot',
-    dependsOn: ['authMethod'],
-    condition: { field: 'authMethod', value: 'bot_token' },
-    required: true,
-  },
-  {
-    id: 'manualCustomBotCredential',
-    title: 'Bot Credential ID',
-    type: 'short-input',
-    canonicalParamId: 'botCredential',
-    mode: 'advanced',
-    placeholder: 'Enter bot credential ID',
-    dependsOn: ['authMethod'],
-    condition: { field: 'authMethod', value: 'bot_token' },
-    required: true,
-  },
-]
+export const SlackV2BlockMeta = {
+  tags: ['messaging', 'webhooks', 'automation'],
+  url: 'https://slack.com',
+} as const satisfies BlockMeta
 
 const SLACK_WEBHOOK_TRIGGER_SUBBLOCK_IDS = new Set(
   getTrigger('slack_webhook').subBlocks.map((sb) => sb.id)
 )
 
 /**
+ * Adapts a v1 subblock for slack_v2's merged credential picker: fields gated on
+ * the removed `authMethod` dropdown now depend on the single `credential` field.
+ */
+function adaptSubBlockForV2(sb: SubBlockConfig): SubBlockConfig {
+  const { dependsOn, condition, ...rest } = sb
+  if (sb.id === 'credential') {
+    return {
+      ...rest,
+      credentialKind: 'any',
+      placeholder: 'Select Slack account or bot',
+      credentialLabels: {
+        oauthGroup: 'Sim app',
+        oauthConnect: 'Connect the Sim app',
+        serviceAccountGroup: 'Custom bots',
+        serviceAccountConnect: 'Set up a custom bot',
+      },
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS], not: true },
+    }
+  }
+  if (sb.id === 'manualCredential') {
+    return {
+      ...rest,
+      placeholder: 'Enter credential ID',
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS], not: true },
+    }
+  }
+  if (sb.id === 'channel' || sb.id === 'manualChannel') {
+    return {
+      ...sb,
+      dependsOn: ['credential'],
+      condition: (values?: Record<string, unknown>) => {
+        if (SLACK_V2_AGENT_OPERATIONS.includes(values?.operation as never)) {
+          return { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS], not: true }
+        }
+        if (typeof condition !== 'function') {
+          throw new Error(`Slack ${sb.id} condition must be a function`)
+        }
+        return condition(values)
+      },
+      required: {
+        field: 'operation',
+        value: ['list_canvases', 'list_scheduled_messages', ...SLACK_V2_AGENT_OPERATIONS],
+        not: true,
+      },
+    }
+  }
+  if (sb.id === 'getThreadTimestamp') {
+    return {
+      ...sb,
+      condition: {
+        field: 'operation',
+        value: [
+          'get_thread',
+          'get_thread_replies',
+          'set_status',
+          'set_title',
+          'set_suggested_prompts',
+        ],
+      },
+      required: true,
+    }
+  }
+  if (sb.id === 'suggestedPrompts' || sb.id === 'promptsTitle') {
+    return {
+      ...sb,
+      condition: {
+        field: 'operation',
+        value: ['set_suggested_prompts', 'set_agent_suggested_prompts'],
+      },
+    }
+  }
+  if (dependsOn && !Array.isArray(dependsOn) && dependsOn.all?.includes('authMethod')) {
+    return { ...sb, dependsOn: ['credential'] }
+  }
+  return sb
+}
+
+function getSlackV2AgentSubBlocks(): SubBlockConfig[] {
+  return [
+    {
+      id: 'agentBotCredential',
+      title: 'Custom Slack Bot',
+      type: 'oauth-input',
+      canonicalParamId: 'agentCredentialId',
+      serviceId: 'slack',
+      credentialKind: 'service-account',
+      requiredScopes: getScopesForService('slack'),
+      placeholder: 'Select custom Slack bot',
+      credentialLabels: {
+        serviceAccountGroup: 'Custom bots',
+        serviceAccountConnect: 'Set up a custom bot',
+      },
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS] },
+      required: true,
+      mode: 'basic',
+    },
+    {
+      id: 'manualAgentBotCredential',
+      title: 'Custom Slack Bot Credential ID',
+      type: 'short-input',
+      canonicalParamId: 'agentCredentialId',
+      placeholder: 'Enter custom bot credential ID',
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS] },
+      required: true,
+      mode: 'advanced',
+    },
+    {
+      id: 'agentChannel',
+      title: 'Channel',
+      type: 'channel-selector',
+      canonicalParamId: 'agentChannelId',
+      serviceId: 'slack',
+      selectorKey: 'slack.channels',
+      placeholder: 'Select Slack channel',
+      dependsOn: ['agentBotCredential'],
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS] },
+      required: true,
+      mode: 'basic',
+    },
+    {
+      id: 'manualAgentChannel',
+      title: 'Channel ID',
+      type: 'short-input',
+      canonicalParamId: 'agentChannelId',
+      placeholder: 'Enter Slack channel ID',
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS] },
+      required: true,
+      mode: 'advanced',
+    },
+    {
+      id: 'agentThreadTs',
+      title: 'Thread Timestamp',
+      type: 'short-input',
+      placeholder: 'Thread timestamp (thread_ts)',
+      condition: { field: 'operation', value: [...SLACK_V2_AGENT_OPERATIONS] },
+      required: {
+        field: 'operation',
+        value: ['set_agent_session_status', 'rename_agent_session'],
+      },
+    },
+    {
+      id: 'agentSessionStatus',
+      title: 'Session Status',
+      type: 'dropdown',
+      options: [
+        { label: 'Active', id: 'active' },
+        { label: 'Processing', id: 'processing' },
+        { label: 'Suspended', id: 'suspended' },
+        { label: 'Closed', id: 'closed' },
+      ],
+      value: () => 'processing',
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: true,
+    },
+    {
+      id: 'agentSessionTitle',
+      title: 'Session Title',
+      type: 'short-input',
+      placeholder: 'Enter a title (max 200 characters)',
+      condition: {
+        field: 'operation',
+        value: ['set_agent_session_status', 'rename_agent_session'],
+      },
+      required: { field: 'operation', value: 'rename_agent_session' },
+    },
+    {
+      id: 'agentInitiatorUser',
+      title: 'Initiator',
+      type: 'user-selector',
+      canonicalParamId: 'agentInitiatorUserId',
+      serviceId: 'slack',
+      selectorKey: 'slack.users',
+      placeholder: 'Select initiating user',
+      dependsOn: ['agentBotCredential'],
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: false,
+      mode: 'basic',
+    },
+    {
+      id: 'manualAgentInitiatorUser',
+      title: 'Initiator User ID',
+      type: 'short-input',
+      canonicalParamId: 'agentInitiatorUserId',
+      placeholder: 'Enter Slack user ID',
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: false,
+      mode: 'advanced',
+    },
+    {
+      id: 'agentIconEmoji',
+      title: 'Agent Icon Emoji',
+      type: 'short-input',
+      placeholder: ':robot_face:',
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: false,
+      mode: 'advanced',
+    },
+    {
+      id: 'agentIconUrl',
+      title: 'Agent Icon URL',
+      type: 'short-input',
+      placeholder: 'https://example.com/icon.png',
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: false,
+      mode: 'advanced',
+    },
+    {
+      id: 'agentUsername',
+      title: 'Agent Username',
+      type: 'short-input',
+      placeholder: 'Research Agent',
+      condition: { field: 'operation', value: 'set_agent_session_status' },
+      required: false,
+      mode: 'advanced',
+    },
+  ]
+}
+
+export function getSlackV2ActionSubBlocks(): SubBlockConfig[] {
+  const sharedSubBlocks = SlackBlock.subBlocks.flatMap((sb) => {
+    if (SLACK_WEBHOOK_TRIGGER_SUBBLOCK_IDS.has(sb.id)) return []
+    if (sb.id === 'operation' || sb.id === 'authMethod') return []
+    return [adaptSubBlockForV2(sb)]
+  })
+  return [...sharedSubBlocks, ...getSlackV2AgentSubBlocks()]
+}
+
+export function getSlackV2ToolAccess(): string[] {
+  return [...SlackV2Block.tools.access]
+}
+
+export function getSlackV2OperationSentences() {
+  const operationSentences = SlackBlock.canvasPresentation?.sentences?.byOperation
+  if (!operationSentences) {
+    throw new Error('Slack action sentences must be defined before building slack_v2')
+  }
+  return {
+    ...operationSentences,
+    set_agent_suggested_prompts: [
+      {
+        text: 'Set agent suggested prompts in',
+        field: ['agentChannel', 'manualAgentChannel'],
+        core: true,
+      },
+      { text: ', for thread', field: 'agentThreadTs' },
+    ],
+    set_agent_session_status: [
+      { text: 'Set agent session to', field: 'agentSessionStatus', core: true },
+      { text: 'on thread', field: 'agentThreadTs', core: true },
+    ],
+    rename_agent_session: [
+      { text: 'Rename agent session to', field: 'agentSessionTitle', core: true },
+      { text: 'on thread', field: 'agentThreadTs', core: true },
+    ],
+  }
+}
+
+const {
+  authMethod: _authMethod,
+  botToken: _botToken,
+  botCredential: _botCredential,
+  ...slackV2Inputs
+} = SlackBlock.inputs
+
+/**
  * slack_v2 — the go-forward Slack action block. Identical operations, tools, and
- * outputs to v1 (shared by reference), but the "Custom Bot" auth method selects
- * a reusable bot credential set up once, instead of pasting a raw token. Also
- * hosts the redesigned slack_oauth trigger (v1 keeps the legacy slack_webhook).
+ * outputs to v1 (shared by reference), but auth is a single credential picker
+ * listing Sim OAuth accounts and reusable custom bots together — the credential's
+ * kind is resolved server-side, so no auth-method choice is needed. Also hosts
+ * the redesigned slack_oauth trigger (v1 keeps the legacy slack_webhook).
  */
 export const SlackV2Block: BlockConfig<SlackResponse> = {
   ...SlackBlock,
   type: 'slack_v2',
+  description:
+    'Send and manage Slack messages, Agent Sessions, streamed replies, views, reactions, conversations, and canvases',
+  longDescription:
+    'Integrate Slack messaging and administration into a workflow. Custom Slack bots can manage Agent Sessions, stream incremental Markdown or structured chunks, react to Agent Session events, and configure Agent View suggested prompts. Standard messaging and management operations support both the Sim app and custom bot credentials.',
   hideFromToolbar: false,
-  // Preview-gated: hidden from every discovery surface until revealed via the
-  // block-visibility AppConfig (hosted) or PREVIEW_BLOCKS=slack_v2 (dev /
-  // self-host). At GA: drop this flag, add SlackV2BlockMeta + docs, and set
-  // hideFromToolbar on v1.
-  preview: true,
+  sunset: undefined,
+  canvasPresentation: {
+    ...SlackBlock.canvasPresentation,
+    defaultTitle: 'Slack',
+    sentences: {
+      ...SlackBlock.canvasPresentation?.sentences,
+      byOperation: getSlackV2OperationSentences(),
+    },
+    /*
+     * Unlike v1, this trigger picks one event and scopes it, so the card names
+     * both. Each filter clause is gated on the events that expose it —
+     * `channelFilter` for channel-bound events, `emoji` for reactions,
+     * `nameContains` for channel creation — so at most one or two can ever show
+     * at once. `source` is left out on purpose: it is a multi-select dropdown,
+     * whose chip renders the stored ids (`im, group`) rather than the option
+     * labels, and it restates the channel scope the clause above already names.
+     */
+    triggerSentences: {
+      default: [
+        'Run on',
+        { field: 'eventType', core: true },
+        { text: 'in', field: SLACK_TRIGGER_CHANNEL_FIELD },
+        { text: 'with emoji', field: 'emoji' },
+        { text: 'whose name contains', field: 'nameContains' },
+      ],
+    },
+  },
   subBlocks: [
-    ...SlackBlock.subBlocks.flatMap((sb) => {
-      // Drop the legacy paste-secret trigger config (v1 hosts slack_webhook)
-      // and v1's raw bot-token auth field — the trigger set includes an
-      // id-colliding 'botToken', so the set check covers both.
-      if (SLACK_WEBHOOK_TRIGGER_SUBBLOCK_IDS.has(sb.id)) return []
-      if (sb.id === 'authMethod') return [sb, ...SLACK_CUSTOM_BOT_SUBBLOCKS]
-      return [sb]
-    }),
+    {
+      id: 'operation',
+      title: 'Operation',
+      type: 'dropdown',
+      options: [
+        { label: 'Send Message', id: 'send' },
+        { label: 'Send Ephemeral Message', id: 'ephemeral' },
+        { label: 'Create Canvas', id: 'canvas' },
+        { label: 'Read Messages', id: 'read' },
+        { label: 'Get Message', id: 'get_message' },
+        { label: 'Get Thread', id: 'get_thread' },
+        { label: 'Get Thread Replies', id: 'get_thread_replies' },
+        { label: 'Get Channel History', id: 'get_channel_history' },
+        { label: 'Get Message Permalink', id: 'get_permalink' },
+        { label: 'Set Assistant Status', id: 'set_status' },
+        { label: 'Set Assistant Title', id: 'set_title' },
+        { label: 'Set Assistant Suggested Prompts', id: 'set_suggested_prompts' },
+        { label: 'Set Agent Suggested Prompts', id: 'set_agent_suggested_prompts' },
+        { label: 'Set Agent Session Status', id: 'set_agent_session_status' },
+        { label: 'Rename Agent Session', id: 'rename_agent_session' },
+        { label: 'List Channels', id: 'list_channels' },
+        { label: 'List Channel Members', id: 'list_members' },
+        { label: 'List Users', id: 'list_users' },
+        { label: 'Get User Info', id: 'get_user' },
+        { label: 'Download File', id: 'download' },
+        { label: 'Update Message', id: 'update' },
+        { label: 'Delete Message', id: 'delete' },
+        { label: 'Add Reaction', id: 'react' },
+        { label: 'Remove Reaction', id: 'unreact' },
+        { label: 'Get Channel Info', id: 'get_channel_info' },
+        { label: 'Get User Presence', id: 'get_user_presence' },
+        { label: 'Edit Canvas', id: 'edit_canvas' },
+        { label: 'Create Channel Canvas', id: 'create_channel_canvas' },
+        { label: 'Get Canvas Info', id: 'get_canvas' },
+        { label: 'List Canvases', id: 'list_canvases' },
+        { label: 'Lookup Canvas Sections', id: 'lookup_canvas_sections' },
+        { label: 'Delete Canvas', id: 'delete_canvas' },
+        { label: 'Create Conversation', id: 'create_conversation' },
+        { label: 'Invite to Conversation', id: 'invite_to_conversation' },
+        { label: 'Open View', id: 'open_view' },
+        { label: 'Update View', id: 'update_view' },
+        { label: 'Push View', id: 'push_view' },
+        { label: 'Publish View', id: 'publish_view' },
+        { label: 'Schedule Message', id: 'schedule_message' },
+        { label: 'List Scheduled Messages', id: 'list_scheduled_messages' },
+        { label: 'Delete Scheduled Message', id: 'delete_scheduled_message' },
+        { label: 'Archive Conversation', id: 'archive_conversation' },
+        { label: 'Rename Conversation', id: 'rename_conversation' },
+        { label: 'Set Conversation Topic', id: 'set_conversation_topic' },
+        { label: 'Set Conversation Purpose', id: 'set_conversation_purpose' },
+      ],
+      value: () => 'send',
+    },
+    ...getSlackV2ActionSubBlocks(),
     ...getTrigger('slack_oauth').subBlocks,
   ],
+  tools: {
+    ...SlackBlock.tools,
+    access: [
+      'slack_message',
+      'slack_ephemeral_message',
+      'slack_canvas',
+      'slack_message_reader',
+      'slack_get_message',
+      'slack_get_thread',
+      'slack_get_thread_replies',
+      'slack_get_channel_history',
+      'slack_get_permalink',
+      'slack_set_status',
+      'slack_set_title',
+      'slack_set_suggested_prompts',
+      'slack_set_suggested_prompts_v2',
+      'slack_set_agent_session_status_v2',
+      'slack_rename_agent_session_v2',
+      'slack_list_channels',
+      'slack_list_members',
+      'slack_list_users',
+      'slack_get_user',
+      'slack_download',
+      'slack_update_message',
+      'slack_delete_message',
+      'slack_add_reaction',
+      'slack_remove_reaction',
+      'slack_get_channel_info',
+      'slack_get_user_presence',
+      'slack_edit_canvas',
+      'slack_create_channel_canvas',
+      'slack_get_canvas',
+      'slack_list_canvases',
+      'slack_lookup_canvas_sections',
+      'slack_delete_canvas',
+      'slack_create_conversation',
+      'slack_invite_to_conversation',
+      'slack_open_view',
+      'slack_update_view',
+      'slack_push_view',
+      'slack_publish_view',
+      'slack_schedule_message',
+      'slack_list_scheduled_messages',
+      'slack_delete_scheduled_message',
+      'slack_archive_conversation',
+      'slack_rename_conversation',
+      'slack_set_conversation_topic',
+      'slack_set_conversation_purpose',
+    ],
+    config: {
+      tool: (params) => {
+        switch (params.operation) {
+          case 'set_suggested_prompts':
+            return 'slack_set_suggested_prompts'
+          case 'set_agent_suggested_prompts':
+            return 'slack_set_suggested_prompts_v2'
+          case 'set_agent_session_status':
+            return 'slack_set_agent_session_status_v2'
+          case 'rename_agent_session':
+            return 'slack_rename_agent_session_v2'
+          default: {
+            const selectTool = SlackBlock.tools.config?.tool
+            if (!selectTool) throw new Error('Slack tool selector is required')
+            return selectTool(params)
+          }
+        }
+      },
+      params: (params) => {
+        const mapParams = SlackBlock.tools.config?.params
+        if (!mapParams) throw new Error('Slack parameter mapper is required')
+        const baseParams = mapParams(params)
+        if (!SLACK_V2_AGENT_OPERATIONS.includes(params.operation as never)) return baseParams
+
+        return {
+          ...baseParams,
+          credential: params.agentCredentialId,
+          channel: params.agentChannelId,
+          threadTs: params.agentThreadTs,
+          status: params.agentSessionStatus,
+          title: params.agentSessionTitle,
+          initiatorUserId: params.agentInitiatorUserId,
+          iconEmoji: params.agentIconEmoji,
+          iconUrl: params.agentIconUrl,
+          username: params.agentUsername,
+          prompts: params.suggestedPrompts,
+          promptsTitle: params.promptsTitle,
+        }
+      },
+    },
+  },
+  inputs: {
+    ...slackV2Inputs,
+    oauthCredential: { type: 'string', description: 'Slack credential (OAuth account or bot)' },
+    agentCredentialId: { type: 'string', description: 'Custom Slack bot credential ID' },
+    agentChannelId: { type: 'string', description: 'Agent session channel ID' },
+    agentThreadTs: { type: 'string', description: 'Agent session thread timestamp' },
+    agentSessionStatus: { type: 'string', description: 'Agent session status' },
+    agentSessionTitle: { type: 'string', description: 'Agent session title' },
+    agentInitiatorUserId: { type: 'string', description: 'Agent session initiator user ID' },
+    agentIconEmoji: { type: 'string', description: 'Custom agent icon emoji' },
+    agentIconUrl: { type: 'string', description: 'Custom agent icon URL' },
+    agentUsername: { type: 'string', description: 'Custom agent display name' },
+  },
   triggers: {
     enabled: true,
     available: ['slack_oauth'],

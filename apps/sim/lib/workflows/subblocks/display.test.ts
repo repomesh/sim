@@ -14,7 +14,10 @@ vi.mock('@/blocks', () => ({
 import {
   getDisplayValue,
   resolveDropdownLabel,
+  resolveFallbackModelsLabel,
   resolveFilterFieldLabel,
+  resolveFolderPathLabel,
+  resolveSandboxLabel,
   resolveSkillsLabel,
   resolveToolsLabel,
   resolveVariablesLabel,
@@ -33,6 +36,7 @@ const workflowMulti = {
 const variablesInput = { id: 'variables', type: 'variables-input' } as SubBlockConfig
 const toolInput = { id: 'tools', type: 'tool-input' } as SubBlockConfig
 const skillInput = { id: 'skills', type: 'skill-input' } as SubBlockConfig
+const sandboxPicker = { id: 'sandboxId', type: 'combobox' } as SubBlockConfig
 
 describe('summarizeNames', () => {
   it('formats 0, 1, 2, and 2+N name lists', () => {
@@ -184,6 +188,48 @@ describe('resolveSkillsLabel', () => {
   })
 })
 
+describe('resolveFallbackModelsLabel', () => {
+  const fallbackList = { id: 'fallbackModels', type: 'model-fallback-list' } as SubBlockConfig
+
+  it('lists the models in order and never the row keys', () => {
+    expect(
+      resolveFallbackModelsLabel(fallbackList, [
+        { id: 'a', model: 'gpt-5' },
+        { id: 'b', model: 'openrouter/x', apiKey: '{{OPENROUTER_API_KEY}}' },
+        { id: 'c', model: 'gemini-3.6-flash' },
+      ])
+    ).toBe('gpt-5, openrouter/x +1')
+  })
+
+  it('returns null for other subblocks and for an empty or model-less list', () => {
+    expect(resolveFallbackModelsLabel(skillInput, [{ model: 'gpt-5' }])).toBeNull()
+    expect(resolveFallbackModelsLabel(fallbackList, [])).toBeNull()
+    expect(resolveFallbackModelsLabel(fallbackList, [{ id: 'a', model: '' }])).toBeNull()
+  })
+})
+
+describe('resolveSandboxLabel', () => {
+  const sandboxes = [{ id: '443f4934-26ab-44ab-8000-000000000000', name: 'Test' }]
+
+  it('resolves the stored id to the name so the card never shows a uuid', () => {
+    expect(resolveSandboxLabel(sandboxPicker, sandboxes[0].id, sandboxes)).toBe('Test')
+  })
+
+  it('returns null for an id the workspace no longer has', () => {
+    expect(resolveSandboxLabel(sandboxPicker, 'sbx-deleted', sandboxes)).toBeNull()
+  })
+
+  it('returns null before the list loads, and for an empty selection', () => {
+    expect(resolveSandboxLabel(sandboxPicker, sandboxes[0].id, [])).toBeNull()
+    expect(resolveSandboxLabel(sandboxPicker, '', sandboxes)).toBeNull()
+  })
+
+  it('ignores other comboboxes so it cannot relabel an unrelated field', () => {
+    const other = { id: 'model', type: 'combobox' } as SubBlockConfig
+    expect(resolveSandboxLabel(other, sandboxes[0].id, sandboxes)).toBeNull()
+  })
+})
+
 describe('resolveDropdownLabel', () => {
   const dropdown = {
     id: 'mode',
@@ -195,6 +241,37 @@ describe('resolveDropdownLabel', () => {
     expect(resolveDropdownLabel(dropdown, 'opt-1')).toBe('Option One')
     expect(resolveDropdownLabel(dropdown, 'literal')).toBe('literal')
     expect(resolveDropdownLabel(dropdown, 'missing')).toBeNull()
+  })
+
+  it('summarizes a multi-select selection as labels, not stored ids', () => {
+    /* A `multiSelect` dropdown stores an array; rejecting it outright made the
+       card show raw ids ("chat, updates") where a single-select showed a label. */
+    const dropdown = {
+      id: 'labelIds',
+      type: 'dropdown',
+      multiSelect: true,
+      options: [
+        { id: 'chat', label: 'Chat' },
+        { id: 'updates', label: 'Updates' },
+        { id: 'social', label: 'Social' },
+      ],
+    } as unknown as SubBlockConfig
+
+    expect(resolveDropdownLabel(dropdown, ['chat'])).toBe('Chat')
+    expect(resolveDropdownLabel(dropdown, ['chat', 'updates'])).toBe('Chat, Updates')
+    expect(resolveDropdownLabel(dropdown, ['chat', 'updates', 'social'])).toBe('Chat, Updates +1')
+  })
+
+  it('falls through when any selection is unknown, rather than dropping it', () => {
+    /* Showing only the ids it recognised would hide the rest of the selection. */
+    const dropdown = {
+      id: 'labelIds',
+      type: 'dropdown',
+      options: [{ id: 'chat', label: 'Chat' }],
+    } as unknown as SubBlockConfig
+
+    expect(resolveDropdownLabel(dropdown, ['chat', 'gone'])).toBeNull()
+    expect(resolveDropdownLabel(dropdown, [])).toBeNull()
   })
 })
 
@@ -231,5 +308,73 @@ describe('getDisplayValue', () => {
       ])
     ).toBe('one, two +1')
     expect(getDisplayValue(['a', 'b'])).toBe('a, b')
+  })
+
+  it('keeps the full first message for renderer-owned clipping and tooltips', () => {
+    const content = `You are a research assistant. ${'Keep every instruction. '.repeat(4)}`.trim()
+    const messages = [{ role: 'system', content }]
+    const serializedMessages = JSON.stringify(messages)
+
+    expect(getDisplayValue(messages)).toBe(content)
+    expect(getDisplayValue(serializedMessages)).toBe(content)
+  })
+})
+
+/**
+ * A type listed in SELECTOR_TYPES_HYDRATION_REQUIRED with no resolver renders
+ * as the unset placeholder, so a folder picked in the editor showed as "-" on
+ * the canvas, indistinguishable from having picked nothing.
+ */
+describe('resolveFolderPathLabel', () => {
+  const folderSubBlock = {
+    id: 'createParentPath',
+    type: 'folder-selector',
+    resourceType: 'file',
+  } as any
+
+  it('names a folder from its canonical path', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Other')).toBe('Other')
+  })
+
+  it('reads a nested path as its names', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Other/Vik')).toBe('Other / Vik')
+  })
+
+  it('decodes an encoded name rather than showing the escape', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Reports/Q3%20Results')).toBe(
+      'Reports / Q3 Results'
+    )
+  })
+
+  it('keeps a slash inside a name out of the separator', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '/Q3%2FQ4')).toBe('Q3/Q4')
+  })
+
+  it('leaves an unset value to the placeholder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, '')).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, null)).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, '/')).toBeNull()
+  })
+
+  it('reads an array-shaped value the other readers accept', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, ['/Other/Vik'])).toBe('Other / Vik')
+    expect(resolveFolderPathLabel(folderSubBlock, '["/Other/Vik"]')).toBe('Other / Vik')
+  })
+
+  it('summarizes every selected folder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, ['/One', '/Two', '/Three'])).toBe('One, Two +1')
+  })
+
+  it('leaves an empty array to the placeholder', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, [])).toBeNull()
+    expect(resolveFolderPathLabel(folderSubBlock, '[]')).toBeNull()
+  })
+
+  it('ignores a subblock of another type', () => {
+    expect(resolveFolderPathLabel({ id: 'x', type: 'short-input' } as any, '/Other')).toBeNull()
+  })
+
+  it('shows a hand-typed path that will not parse as typed', () => {
+    expect(resolveFolderPathLabel(folderSubBlock, 'Other')).toBe('Other')
   })
 })

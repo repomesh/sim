@@ -21,6 +21,10 @@ import { parseRequest } from '@/lib/api/server'
 import { getSession } from '@/lib/auth'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import { expireStalePendingInvitationsForOrganization } from '@/lib/invitations/core'
+import {
+  capabilityRefusal,
+  isOrganizationCapabilityWithheld,
+} from '@/lib/permission-groups/capability-assertions'
 
 const logger = createLogger('OrganizationRosterAPI')
 
@@ -49,6 +53,27 @@ export const GET = withRouteHandler(
         )
       }
 
+      /**
+       * permission-group-enforced: organization.member_directory — an
+       * organization-scoped read with no workspace for the funnel to authorize.
+       *
+       * Admins and owners are exempt, for the reason the members route records:
+       * this feeds the page an admin would use to change the setting.
+       */
+      if (
+        !isOrgAdminRole(callerMembership.role) &&
+        (await isOrganizationCapabilityWithheld(organizationId, 'organization.member_directory'))
+      ) {
+        logger.warn('Organization roster blocked by permission group', {
+          organizationId,
+          userId: session.user.id,
+        })
+        return NextResponse.json(
+          { error: capabilityRefusal('organization.member_directory') },
+          { status: 403 }
+        )
+      }
+
       const memberRows = await db
         .select({
           memberId: member.id,
@@ -58,6 +83,7 @@ export const GET = withRouteHandler(
           userName: user.name,
           userEmail: user.email,
           userImage: user.image,
+          userSuspendedAt: user.suspendedAt,
         })
         .from(member)
         .innerJoin(user, eq(member.userId, user.id))
@@ -71,6 +97,7 @@ export const GET = withRouteHandler(
         name: row.userName,
         email: row.userEmail,
         image: row.userImage,
+        suspendedAt: row.userSuspendedAt?.toISOString() ?? null,
         workspaces: [] as RosterWorkspaceAccess[],
       }))
 
@@ -89,12 +116,17 @@ export const GET = withRouteHandler(
       await expireStalePendingInvitationsForOrganization(organizationId)
 
       const orgWorkspaces = await db
-        .select({ id: workspace.id, name: workspace.name })
+        .select({
+          id: workspace.id,
+          name: workspace.name,
+          ownerId: workspace.ownerId,
+          billedAccountUserId: workspace.billedAccountUserId,
+        })
         .from(workspace)
         .where(and(eq(workspace.organizationId, organizationId), isNull(workspace.archivedAt)))
 
       const orgWorkspaceIds = orgWorkspaces.map((ws) => ws.id)
-      const workspaceNameById = new Map(orgWorkspaces.map((ws) => [ws.id, ws.name]))
+      const workspaceById = new Map(orgWorkspaces.map((ws) => [ws.id, ws]))
       const memberUserIds = memberRows.map((row) => row.userId)
 
       const memberPermissions =
@@ -117,11 +149,14 @@ export const GET = withRouteHandler(
 
       const permissionsByUser = new Map<string, RosterWorkspaceAccess[]>()
       for (const row of memberPermissions) {
+        const ws = workspaceById.get(row.workspaceId)
         const list = permissionsByUser.get(row.userId) ?? []
         list.push({
           workspaceId: row.workspaceId,
-          workspaceName: workspaceNameById.get(row.workspaceId) ?? 'Workspace',
+          workspaceName: ws?.name ?? 'Workspace',
           permission: row.permission,
+          roleSource: ws?.ownerId === row.userId ? 'owner' : 'explicit',
+          isBilledAccount: ws?.billedAccountUserId === row.userId,
         })
         permissionsByUser.set(row.userId, list)
       }
@@ -135,6 +170,14 @@ export const GET = withRouteHandler(
                 workspaceId: ws.id,
                 workspaceName: ws.name,
                 permission: 'admin' as const,
+                /**
+                 * Owner wins over the derived organization grant, matching
+                 * `getUsersWithPermissions` — otherwise the same person reads as
+                 * `owner` in the teammates list and `org-admin` here.
+                 */
+                roleSource:
+                  ws.ownerId === rosterMember.userId ? ('owner' as const) : ('org-admin' as const),
+                isBilledAccount: ws.billedAccountUserId === rosterMember.userId,
               }))
             : (permissionsByUser.get(rosterMember.userId) ?? []),
         }
@@ -148,6 +191,7 @@ export const GET = withRouteHandler(
                 userName: user.name,
                 userEmail: user.email,
                 userImage: user.image,
+                userSuspendedAt: user.suspendedAt,
                 workspaceId: permissions.entityId,
                 permission: permissions.permissionType,
                 createdAt: permissions.createdAt,
@@ -177,16 +221,20 @@ export const GET = withRouteHandler(
           name: string
           email: string
           image: string | null
+          suspendedAt: string | null
           workspaces: RosterWorkspaceAccess[]
         }
       >()
 
       for (const row of externalPermissionRows) {
         const existing = externalMembersByUser.get(row.userId)
+        const externalWorkspace = workspaceById.get(row.workspaceId)
         const workspaceAccess: RosterWorkspaceAccess = {
           workspaceId: row.workspaceId,
-          workspaceName: workspaceNameById.get(row.workspaceId) ?? 'Workspace',
+          workspaceName: externalWorkspace?.name ?? 'Workspace',
           permission: row.permission,
+          roleSource: externalWorkspace?.ownerId === row.userId ? 'owner' : 'explicit',
+          isBilledAccount: externalWorkspace?.billedAccountUserId === row.userId,
         }
 
         if (existing) {
@@ -203,6 +251,7 @@ export const GET = withRouteHandler(
           name: row.userName,
           email: row.userEmail,
           image: row.userImage,
+          suspendedAt: row.userSuspendedAt?.toISOString() ?? null,
           workspaces: [workspaceAccess],
         })
       }
@@ -247,8 +296,11 @@ export const GET = withRouteHandler(
         const list = grantsByInvitation.get(row.invitationId) ?? []
         list.push({
           workspaceId: row.workspaceId,
-          workspaceName: workspaceNameById.get(row.workspaceId) ?? 'Workspace',
+          workspaceName: workspaceById.get(row.workspaceId)?.name ?? 'Workspace',
           permission: row.permission,
+          /** A pending invitee holds no row yet, so nothing is inherited. */
+          roleSource: 'explicit',
+          isBilledAccount: false,
         })
         grantsByInvitation.set(row.invitationId, list)
       }
@@ -269,7 +321,7 @@ export const GET = withRouteHandler(
       const data = {
         members: rosterMembers,
         pendingInvitations,
-        workspaces: orgWorkspaces,
+        workspaces: orgWorkspaces.map((ws) => ({ id: ws.id, name: ws.name })),
       } satisfies OrganizationRoster
       return NextResponse.json({
         success: true,

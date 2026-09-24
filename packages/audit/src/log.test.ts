@@ -1,13 +1,7 @@
 /**
  * @vitest-environment node
  */
-import {
-  auditMock,
-  dbChainMock,
-  dbChainMockFns,
-  requestUtilsMockFns,
-  resetDbChainMock,
-} from '@sim/testing'
+import { auditMock, dbChainMock, dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@sim/db', () => ({
@@ -21,6 +15,10 @@ vi.mock('drizzle-orm', () => ({
   or: vi.fn(),
   sql: vi.fn(),
 }))
+const { mockGetRequestContext } = vi.hoisted(() => ({
+  mockGetRequestContext: vi.fn(),
+}))
+
 vi.mock('@sim/logger', () => ({
   createLogger: () => ({
     info: vi.fn(),
@@ -28,6 +26,7 @@ vi.mock('@sim/logger', () => ({
     error: vi.fn(),
     debug: vi.fn(),
   }),
+  getRequestContext: mockGetRequestContext,
 }))
 vi.mock('@sim/utils/id', () => ({
   generateId: () => 'test-uuid-123',
@@ -37,7 +36,13 @@ vi.mock('@sim/utils/id', () => ({
 }))
 
 import { sleep } from '@sim/utils/helpers'
-import { AuditAction, AuditResourceType, recordAudit } from './index'
+import {
+  AuditAction,
+  AuditResourceType,
+  recordAudit,
+  recordAuditBatch,
+  recordAuditOnce,
+} from './index'
 
 const flush = () => sleep(10)
 
@@ -75,12 +80,6 @@ describe('recordAudit', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
-    requestUtilsMockFns.mockGetClientIp.mockImplementation(
-      (request: { headers: { get(name: string): string | null } }) =>
-        request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-        request.headers.get('x-real-ip')?.trim() ||
-        'unknown'
-    )
   })
 
   afterEach(() => {
@@ -112,6 +111,26 @@ describe('recordAudit', () => {
         metadata: {},
       })
     )
+  })
+
+  it('awaits an idempotent audit insert under the caller-owned ID', async () => {
+    await recordAuditOnce('admin-refund:operation-1', {
+      actorId: 'user-1',
+      actorName: 'Test User',
+      actorEmail: 'test@example.com',
+      action: AuditAction.SUBSCRIPTION_REFUNDED,
+      resourceType: AuditResourceType.SUBSCRIPTION,
+      resourceId: 'subscription-1',
+    })
+
+    expect(dbChainMockFns.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'admin-refund:operation-1',
+        action: 'subscription.refunded',
+        resourceId: 'subscription-1',
+      })
+    )
+    expect(dbChainMockFns.onConflictDoNothing).toHaveBeenCalledWith({ target: 'id' })
   })
 
   it('includes optional denormalized fields when provided', async () => {
@@ -161,13 +180,50 @@ describe('recordAudit', () => {
 
     expect(dbChainMockFns.values).toHaveBeenCalledWith(
       expect.objectContaining({
-        ipAddress: '1.2.3.4',
+        ipAddress: '5.6.7.8',
         userAgent: 'TestAgent/1.0',
       })
     )
   })
 
-  it('falls back to x-real-ip when x-forwarded-for is absent', async () => {
+  it('records the surface the request came from', async () => {
+    mockGetRequestContext.mockReturnValueOnce({
+      requestId: 'req-1',
+      client: { surface: 'cli', version: '2.1.16', source: 'header' },
+    })
+
+    recordAudit({
+      workspaceId: 'ws-1',
+      actorId: 'user-1',
+      actorName: 'Test',
+      actorEmail: 'test@test.com',
+      action: AuditAction.WORKFLOW_CREATED,
+      resourceType: AuditResourceType.WORKFLOW,
+    })
+
+    await flush()
+
+    expect(dbChainMockFns.values).toHaveBeenCalledWith(expect.objectContaining({ surface: 'cli' }))
+  })
+
+  it('records no surface outside a request', async () => {
+    mockGetRequestContext.mockReturnValueOnce(undefined)
+
+    recordAudit({
+      workspaceId: 'ws-1',
+      actorId: 'user-1',
+      actorName: 'Test',
+      actorEmail: 'test@test.com',
+      action: AuditAction.WORKFLOW_CREATED,
+      resourceType: AuditResourceType.WORKFLOW,
+    })
+
+    await flush()
+
+    expect(dbChainMockFns.values.mock.calls.at(-1)?.[0].surface).toBeUndefined()
+  })
+
+  it('records null when x-forwarded-for is absent', async () => {
     const request = new Request('https://example.com', {
       headers: { 'x-real-ip': '10.0.0.1' },
     })
@@ -186,7 +242,7 @@ describe('recordAudit', () => {
 
     expect(dbChainMockFns.values).toHaveBeenCalledWith(
       expect.objectContaining({
-        ipAddress: '10.0.0.1',
+        ipAddress: null,
         userAgent: undefined,
       })
     )
@@ -382,6 +438,68 @@ describe('recordAudit', () => {
         })
       )
     })
+  })
+})
+
+describe('recordAuditBatch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+  })
+
+  it('writes all entries in a single insert', async () => {
+    recordAuditBatch([
+      {
+        workspaceId: 'ws-1',
+        actorId: null,
+        actorName: 'Billing System',
+        action: AuditAction.WORKSPACE_UPDATED,
+        resourceType: AuditResourceType.WORKSPACE,
+        resourceId: 'ws-1',
+      },
+      {
+        workspaceId: 'ws-2',
+        actorId: null,
+        actorName: 'Billing System',
+        action: AuditAction.WORKSPACE_UPDATED,
+        resourceType: AuditResourceType.WORKSPACE,
+        resourceId: 'ws-2',
+      },
+    ])
+
+    await flush()
+
+    expect(dbChainMockFns.insert).toHaveBeenCalledTimes(1)
+    expect(dbChainMockFns.values).toHaveBeenCalledWith([
+      expect.objectContaining({ workspaceId: 'ws-1', actorId: null, actorName: 'Billing System' }),
+      expect.objectContaining({ workspaceId: 'ws-2', actorId: null, actorName: 'Billing System' }),
+    ])
+  })
+
+  it('does nothing for an empty batch', async () => {
+    recordAuditBatch([])
+
+    await flush()
+
+    expect(dbChainMockFns.insert).not.toHaveBeenCalled()
+  })
+
+  it('does not throw when the batch insert fails', async () => {
+    dbChainMockFns.values.mockImplementation(() => Promise.reject(new Error('DB connection lost')))
+
+    expect(() => {
+      recordAuditBatch([
+        {
+          workspaceId: 'ws-1',
+          actorId: null,
+          actorName: 'Billing System',
+          action: AuditAction.WORKSPACE_UPDATED,
+          resourceType: AuditResourceType.WORKSPACE,
+        },
+      ])
+    }).not.toThrow()
+
+    await flush()
   })
 })
 

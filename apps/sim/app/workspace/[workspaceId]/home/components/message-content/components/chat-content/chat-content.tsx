@@ -1,6 +1,15 @@
 'use client'
 
-import { type ComponentPropsWithoutRef, memo, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ComponentPropsWithoutRef,
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Streamdown } from 'streamdown'
 import 'streamdown/styles.css'
 // prismjs core must load before its language components — they register on the
@@ -11,19 +20,28 @@ import 'prismjs/components/prism-bash'
 import 'prismjs/components/prism-css'
 import 'prismjs/components/prism-markup'
 import '@sim/emcn/components/code/code.css'
-import { Checkbox, CopyCodeButton, cn, highlight, languages } from '@sim/emcn'
+import { Checkbox, CopyCodeButton, cn, languages, highlight as prismHighlight } from '@sim/emcn'
 import { decodeVfsSegmentSafe } from '@/lib/copilot/vfs/path-utils'
 import { extractTextContent } from '@/lib/core/utils/react-node-text'
 import { ContextMentionIcon } from '@/app/workspace/[workspaceId]/home/components/context-mention-icon'
 import {
+  SourceChip,
+  sourceLabel,
+} from '@/app/workspace/[workspaceId]/home/components/message-content/components/source-chip'
+import {
   type ContentSegment,
-  PendingTagIndicator,
+  type CredentialSubmissionPayload,
   parseSpecialTags,
+  type SourceTagData,
   SpecialTags,
 } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags'
-import type { ChatContextKind, MothershipResource } from '@/app/workspace/[workspaceId]/home/types'
+import type {
+  ChatContextKind,
+  WorkspaceResourceRef,
+} from '@/app/workspace/[workspaceId]/home/types'
 import { useSmoothText } from '@/hooks/use-smooth-text'
 import { sanitizeChatDisplayContent } from './chat-sanitize'
+import { ExternalLink, externalLinkHostname } from './external-link'
 
 const LANG_ALIASES: Record<string, string> = {
   js: 'javascript',
@@ -40,16 +58,16 @@ const LANG_ALIASES: Record<string, string> = {
 
 const PROSE_CLASSES = cn(
   'prose prose-base dark:prose-invert max-w-none',
-  'font-[family-name:var(--font-inter)] antialiased break-words font-[430] tracking-[0]',
-  'prose-headings:font-[600] prose-headings:tracking-[0] prose-headings:text-[var(--text-primary)]',
+  'font-[family-name:var(--font-inter)] antialiased break-words tracking-[0]',
+  'prose-headings:font-semibold prose-headings:tracking-[0] prose-headings:text-[var(--text-primary)]',
   'prose-headings:mb-3 prose-headings:mt-6 first:prose-headings:mt-0',
   'prose-p:text-base prose-p:leading-[25px] prose-p:text-[var(--text-primary)]',
   'prose-li:text-base prose-li:leading-[25px] prose-li:text-[var(--text-primary)]',
   'prose-li:my-1',
   'prose-ul:my-4 prose-ol:my-4',
-  'prose-strong:font-[600] prose-strong:text-[var(--text-primary)]',
+  'prose-strong:font-semibold prose-strong:text-[var(--text-primary)]',
   'prose-a:text-[var(--text-primary)] prose-a:underline prose-a:decoration-dashed prose-a:underline-offset-4',
-  'prose-hr:border-[var(--divider)] prose-hr:my-6',
+  'prose-hr:border-[var(--border)] prose-hr:my-6',
   'prose-table:my-0'
 )
 
@@ -101,9 +119,48 @@ function endsInlineWord(value: string): boolean {
 
 function nextInlineSegmentLabel(segment?: ContentSegment): string {
   if (!segment) return ''
-  if (segment.type === 'text' || segment.type === 'thinking') return segment.content
+  // Thinking segments are never rendered, so they contribute no following text.
+  if (segment.type === 'text') return segment.content
   if (segment.type === 'workspace_resource') return segment.data.title || segment.data.id || ''
+  if (segment.type === 'source') return sourceLabel(segment.data)
   return ''
+}
+
+/**
+ * The `<source>` payloads of the segment being rendered, in emission order. An
+ * inline citation is written into the markdown as a link to a sentinel
+ * fragment carrying the payload's index, so it flows with its paragraph, and
+ * the link renderer resolves the index back through this context — the
+ * component map is static, so it is the one channel from segment data into it.
+ */
+const SourceRefsContext = createContext<readonly SourceTagData[]>([])
+
+/**
+ * Fragment prefix of a generated citation link. Internal — never navigated —
+ * and deliberately not a name the model would write on its own; an index that
+ * resolves to no parsed source falls back to the link text.
+ */
+const SOURCE_LINK_PREFIX = '#sim-source-ref-'
+
+interface SourceReferenceProps {
+  index: number
+  children?: React.ReactNode
+}
+
+/** The inline citation chip; a dangling index falls back to the link text. */
+function SourceReference({ index, children }: SourceReferenceProps) {
+  const source = useContext(SourceRefsContext)[index]
+  if (!source) return <>{children}</>
+  return <SourceChip source={source} />
+}
+
+/**
+ * A source's name as a Markdown link label. A site name or knowledge-base
+ * name is free text: an unescaped `]` would end the label early and a `*` or
+ * `_` would style it, so the delimiters are backslash-escaped.
+ */
+function escapeLinkLabel(label: string): string {
+  return label.replace(/[\\[\]*_`<>]/g, '\\$&')
 }
 
 function appendInlineReferenceMarkdown(
@@ -159,10 +216,42 @@ function fileIconLabel(ref: string, fallback: string): string {
   return fallback
 }
 
+/**
+ * Bounded LRU cache for Prism highlight output. Chat rows are virtualized, so a
+ * message re-highlights every time it scrolls back into view; a component
+ * `useMemo` would not survive the unmount, so the cache lives at module scope.
+ * Output for an unregistered language is never cached — it renders through the
+ * JavaScript fallback, so caching it would keep serving that stale render if the
+ * real grammar registers later in the session.
+ */
+const HIGHLIGHT_CACHE_LIMIT = 512
+const highlightCache = new Map<string, string>()
+
+function highlight(code: string, language: string): string {
+  const resolved = LANG_ALIASES[language] || language || 'javascript'
+  const grammar = languages[resolved]
+  if (!grammar) return prismHighlight(code, languages.javascript, resolved)
+
+  const key = `${resolved}\n${code}`
+  const cached = highlightCache.get(key)
+  if (cached !== undefined) {
+    highlightCache.delete(key)
+    highlightCache.set(key, cached)
+    return cached
+  }
+  const html = prismHighlight(code, grammar, resolved)
+  highlightCache.set(key, html)
+  if (highlightCache.size > HIGHLIGHT_CACHE_LIMIT) {
+    const oldest = highlightCache.keys().next().value
+    if (oldest !== undefined) highlightCache.delete(oldest)
+  }
+  return html
+}
+
 const MARKDOWN_COMPONENTS = {
   table({ children }: { children?: React.ReactNode }) {
     return (
-      <div className='not-prose my-4 w-full overflow-x-auto [&_strong]:font-[600]'>
+      <div className='not-prose my-4 w-full overflow-x-auto [&_strong]:font-semibold'>
         <table className='min-w-full border-collapse [&_tbody_tr:last-child_td]:border-b-0'>
           {children}
         </table>
@@ -175,8 +264,8 @@ const MARKDOWN_COMPONENTS = {
   th({ children, style }: ThProps) {
     return (
       <th
-        style={style}
-        className='whitespace-nowrap border-[var(--divider)] border-b px-3 py-2 text-left font-[600] text-[var(--text-primary)] text-sm leading-6'
+        style={{ textAlign: style?.textAlign }}
+        className='whitespace-nowrap border-[var(--border)] border-b px-3 py-2 text-left font-semibold text-[var(--text-primary)] text-sm leading-6'
       >
         {children}
       </th>
@@ -185,8 +274,8 @@ const MARKDOWN_COMPONENTS = {
   td({ children, style }: TdProps) {
     return (
       <td
-        style={style}
-        className='whitespace-nowrap border-[var(--divider)] border-b px-3 py-2 text-[var(--text-primary)] text-sm leading-6'
+        style={{ textAlign: style?.textAlign }}
+        className='whitespace-nowrap border-[var(--border)] border-b px-3 py-2 text-[var(--text-primary)] text-sm leading-6'
       >
         {children}
       </td>
@@ -199,19 +288,17 @@ const MARKDOWN_COMPONENTS = {
 
     if (!codeString) {
       return (
-        <pre className='not-prose my-6 overflow-x-auto rounded-lg bg-[var(--surface-5)] p-4 font-[430] font-mono text-[var(--text-primary)] text-small leading-[21px] dark:bg-[var(--code-bg)]'>
+        <pre className='not-prose my-6 overflow-x-auto rounded-lg bg-[var(--surface-5)] p-4 font-mono text-[var(--text-primary)] text-small leading-[21px] dark:bg-[var(--code-bg)]'>
           <code>{children}</code>
         </pre>
       )
     }
 
-    const resolved = LANG_ALIASES[language] || language || 'javascript'
-    const grammar = languages[resolved] || languages.javascript
-    const html = highlight(codeString.trimEnd(), grammar, resolved)
+    const html = highlight(codeString.trimEnd(), language)
 
     return (
-      <div className='not-prose my-6 overflow-hidden rounded-lg border border-[var(--divider)]'>
-        <div className='flex items-center justify-between border-[var(--divider)] border-b bg-[var(--surface-4)] px-4 py-2 dark:bg-[var(--surface-4)]'>
+      <div className='not-prose my-6 overflow-hidden rounded-lg border border-[var(--border)]'>
+        <div className='flex items-center justify-between border-[var(--border)] border-b bg-[var(--surface-4)] px-4 py-2 dark:bg-[var(--surface-4)]'>
           <span className='text-[var(--text-tertiary)] text-xs'>{language || 'code'}</span>
           <CopyCodeButton
             code={codeString}
@@ -220,7 +307,7 @@ const MARKDOWN_COMPONENTS = {
         </div>
         <div className='code-editor-theme bg-[var(--surface-5)] dark:bg-[var(--code-bg)]'>
           <pre
-            className='m-0 overflow-x-auto whitespace-pre p-4 font-[430] font-mono text-[var(--text-primary)] text-small leading-[21px]'
+            className='m-0 overflow-x-auto whitespace-pre p-4 font-mono text-[var(--text-primary)] text-small leading-[21px]'
             dangerouslySetInnerHTML={{ __html: html }}
           />
         </div>
@@ -228,6 +315,13 @@ const MARKDOWN_COMPONENTS = {
     )
   },
   a({ children, href }: { children?: React.ReactNode; href?: string }) {
+    if (href?.startsWith(SOURCE_LINK_PREFIX)) {
+      return (
+        <SourceReference index={Number(href.slice(SOURCE_LINK_PREFIX.length))}>
+          {children}
+        </SourceReference>
+      )
+    }
     if (href?.startsWith('#wsres-')) {
       const match = href.match(/^#wsres-(\w+)-(.+)$/)
       const type = match?.[1]
@@ -240,13 +334,16 @@ const MARKDOWN_COMPONENTS = {
           className={cn(
             'text-[var(--text-primary)]',
             kind
-              ? 'not-prose inline-flex items-center gap-[5px] no-underline'
+              ? 'not-prose inline-flex items-baseline gap-1 rounded-[5px] bg-[var(--surface-5)] px-[5px] no-underline transition-colors hover-hover:bg-[var(--surface-6)]'
               : 'underline decoration-dashed underline-offset-4'
           )}
           onClick={(e) => {
             e.preventDefault()
             if (!type || !ref) return
             const linkText = label || ref
+            // A file link carries whichever the tag had (`path ?? id`) with no
+            // way to tell them apart here, so it is forwarded as-is and the
+            // resolver tries every interpretation against the real file list.
             window.dispatchEvent(
               new CustomEvent('wsres-click', {
                 detail:
@@ -260,9 +357,24 @@ const MARKDOWN_COMPONENTS = {
           {kind && ref && (
             <ContextMentionIcon
               context={{ kind, label: kind === 'file' ? fileIconLabel(ref, label) : label }}
-              className='size-[14px] flex-shrink-0 text-[var(--text-icon)]'
+              className='relative top-0.5 size-[12px] shrink-0 text-[var(--text-icon)]'
             />
           )}
+          {children}
+        </a>
+      )
+    }
+    const hostname = externalLinkHostname(href)
+    if (hostname && href) {
+      return (
+        <ExternalLink href={href} hostname={hostname}>
+          {children}
+        </ExternalLink>
+      )
+    }
+    if (href?.startsWith('mailto:')) {
+      return (
+        <a href={href} className='not-prose text-[var(--text-primary)] no-underline'>
           {children}
         </a>
       )
@@ -303,14 +415,14 @@ const MARKDOWN_COMPONENTS = {
   },
   inlineCode({ children }: { children?: React.ReactNode }) {
     return (
-      <code className='whitespace-normal rounded bg-[var(--surface-5)] px-1.5 py-0.5 font-[400] font-mono text-[var(--text-primary)] not-italic before:content-none after:content-none'>
+      <code className='whitespace-normal rounded bg-[var(--surface-5)] px-1.5 py-0.5 font-mono font-normal text-[var(--text-primary)] not-italic before:content-none after:content-none'>
         {children}
       </code>
     )
   },
   blockquote({ children }: { children?: React.ReactNode }) {
     return (
-      <blockquote className='my-4 break-words border-[var(--divider)] border-l-2 pl-4 text-[var(--text-primary)] italic [&>p:first-child]:mt-0 [&>p:last-child]:mb-0 [&>p]:my-2'>
+      <blockquote className='my-4 break-words border-[var(--border)] border-l-2 pl-4 text-[var(--text-primary)] italic [&>p:first-child]:mt-0 [&>p:last-child]:mb-0 [&>p]:my-2'>
         {children}
       </blockquote>
     )
@@ -334,7 +446,7 @@ const MARKDOWN_COMPONENTS = {
         src={src}
         alt={alt ?? ''}
         loading='lazy'
-        className='my-4 h-auto max-w-full rounded-lg border border-[var(--divider)]'
+        className='my-4 h-auto max-w-full rounded-lg border border-[var(--border)]'
       />
     )
   },
@@ -342,18 +454,42 @@ const MARKDOWN_COMPONENTS = {
 
 interface ChatContentProps {
   content: string
+  messageId?: string
+  requestMode?: 'agent' | 'assistant'
   isStreaming?: boolean
+  /** Transcript-derived answers for this message's question card (renders the recap). */
+  questionAnswers?: string[]
+  /** Transcript-derived status payload for this message's credential card. */
+  credentialSubmission?: CredentialSubmissionPayload
+  /** The user moved on without submitting this message's credential card. */
+  credentialAbandoned?: boolean
   onOptionSelect?: (id: string) => void
-  onWorkspaceResourceSelect?: (resource: MothershipResource) => void
+  onQuestionDismiss?: () => void
+  onWorkspaceResourceSelect?: (resource: WorkspaceResourceRef) => void
   onRevealStateChange?: (isRevealing: boolean) => void
+  /** Reports whether this segment is actively painting text. */
+  onStreamActivityChange?: (active: boolean) => void
+  /**
+   * Reports whether a special tag is mid-stream — bytes arriving but rendering
+   * nothing (tags are suppressed until complete). A wait from the user's POV.
+   */
+  onPendingTagChange?: (pending: boolean) => void
 }
 
 function ChatContentInner({
   content,
+  messageId,
+  requestMode,
   isStreaming = false,
+  questionAnswers,
+  credentialSubmission,
+  credentialAbandoned,
   onOptionSelect,
+  onQuestionDismiss,
   onWorkspaceResourceSelect,
   onRevealStateChange,
+  onStreamActivityChange,
+  onPendingTagChange,
 }: ChatContentProps) {
   const onWorkspaceResourceSelectRef = useRef(onWorkspaceResourceSelect)
   onWorkspaceResourceSelectRef.current = onWorkspaceResourceSelect
@@ -363,7 +499,8 @@ function ChatContentInner({
 
   const displayContent = useMemo(() => sanitizeChatDisplayContent(content), [content])
   const streamedContent = useSmoothText(displayContent, isStreaming)
-  const isRevealing = isStreaming || streamedContent.length < displayContent.length
+  const hasRevealBacklog = streamedContent.length < displayContent.length
+  const isRevealing = isStreaming || hasRevealBacklog
 
   useEffect(() => {
     onRevealStateChangeRef.current?.(isRevealing)
@@ -459,10 +596,12 @@ function ChatContentInner({
   useEffect(() => {
     const handler = (e: Event) => {
       const { type, id, path, title } = (e as CustomEvent).detail
+      // A link built from a path carries no id. Forward what the tag actually
+      // had; the select handler resolves it rather than guessing here.
       onWorkspaceResourceSelectRef.current?.({
         type,
-        id: id ?? '',
-        path,
+        ...(id ? { id } : {}),
+        ...(path ? { path } : {}),
         title: title || id || path || '',
       })
     }
@@ -475,16 +614,33 @@ function ChatContentInner({
     [streamedContent, isRevealing]
   )
 
+  useEffect(() => {
+    onStreamActivityChange?.(hasRevealBacklog)
+    return () => onStreamActivityChange?.(false)
+  }, [hasRevealBacklog, onStreamActivityChange])
+
+  const hasPendingTag = parsed.hasPendingTag && isRevealing
+  useEffect(() => {
+    onPendingTagChange?.(hasPendingTag)
+    return () => onPendingTagChange?.(false)
+  }, [hasPendingTag, onPendingTagChange])
+
   type BlockSegment = Exclude<
     ContentSegment,
-    { type: 'text' } | { type: 'thinking' } | { type: 'workspace_resource' }
+    { type: 'text' } | { type: 'thinking' } | { type: 'workspace_resource' } | { type: 'source' }
   >
   type RenderGroup =
     | { kind: 'inline'; markdown: string }
     | { kind: 'block'; segment: BlockSegment; index: number }
 
+  const sourceRefs = useMemo(
+    () => parsed.segments.flatMap((segment) => (segment.type === 'source' ? [segment.data] : [])),
+    [parsed]
+  )
+
   const groups: RenderGroup[] = []
   let pendingMarkdown = ''
+  let sourceIndex = 0
 
   const flushMarkdown = () => {
     if (pendingMarkdown.trim()) {
@@ -507,7 +663,21 @@ function ChatContentInner({
         `[${label}](<#wsres-${s.data.type}-${ref}>)`,
         nextSegment
       )
-    } else if (s.type === 'text' || s.type === 'thinking') {
+    } else if (s.type === 'source') {
+      // A citation always stands off from the sentence it supports, even when
+      // the model closes the sentence on punctuation the word-boundary rule
+      // would otherwise glue the chip to.
+      if (pendingMarkdown && !/\s$/.test(pendingMarkdown)) pendingMarkdown += ' '
+      pendingMarkdown = appendInlineReferenceMarkdown(
+        pendingMarkdown,
+        `[${escapeLinkLabel(sourceLabel(s.data))}](<${SOURCE_LINK_PREFIX}${sourceIndex++}>)`,
+        nextSegment
+      )
+    } else if (s.type === 'thinking') {
+      // Model-emitted <thinking> tag bodies are reasoning, not answer text —
+      // never rendered (matches the block-level thinking omission in
+      // message-content and the tag stripping in the inbox executor).
+    } else if (s.type === 'text') {
       pendingMarkdown += s.content
     } else {
       flushMarkdown()
@@ -528,36 +698,43 @@ function ChatContentInner({
    * the new special block mounts.
    */
   return (
-    <div className='space-y-3'>
-      {groups.map((group, i) => {
-        if (group.kind === 'inline') {
-          return (
-            <div
-              key={`inline-${i}`}
-              className={cn(PROSE_CLASSES, '[&>:first-child]:mt-0 [&>:last-child]:mb-0')}
-            >
-              <Streamdown
-                key={streamingTree ? 'stream' : 'settled'}
-                mode={parserTree ? undefined : 'static'}
-                animated={fadeActive ? STREAM_ANIMATION : false}
-                isAnimating={streamingTree}
-                components={MARKDOWN_COMPONENTS}
+    <SourceRefsContext.Provider value={sourceRefs}>
+      <div className='space-y-3'>
+        {groups.map((group, i) => {
+          if (group.kind === 'inline') {
+            return (
+              <div
+                key={`inline-${i}`}
+                className={cn(PROSE_CLASSES, '[&>:first-child]:mt-0 [&>:last-child]:mb-0')}
               >
-                {group.markdown}
-              </Streamdown>
-            </div>
+                <Streamdown
+                  key={streamingTree ? 'stream' : 'settled'}
+                  mode={parserTree ? undefined : 'static'}
+                  animated={fadeActive ? STREAM_ANIMATION : false}
+                  isAnimating={streamingTree}
+                  components={MARKDOWN_COMPONENTS}
+                >
+                  {group.markdown}
+                </Streamdown>
+              </div>
+            )
+          }
+          return (
+            <SpecialTags
+              key={`special-${group.index}`}
+              segment={group.segment}
+              interactionId={`${messageId ?? 'message'}:${group.index}`}
+              questionAnswers={questionAnswers}
+              credentialSubmission={credentialSubmission}
+              credentialAbandoned={credentialAbandoned}
+              requestMode={requestMode}
+              onOptionSelect={onOptionSelect}
+              onQuestionDismiss={onQuestionDismiss}
+            />
           )
-        }
-        return (
-          <SpecialTags
-            key={`special-${group.index}`}
-            segment={group.segment}
-            onOptionSelect={onOptionSelect}
-          />
-        )
-      })}
-      {parsed.hasPendingTag && isRevealing && <PendingTagIndicator />}
-    </div>
+        })}
+      </div>
+    </SourceRefsContext.Provider>
   )
 }
 

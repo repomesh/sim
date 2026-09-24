@@ -4,9 +4,13 @@ import type React from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { Badge, Checkbox, cn, Tooltip } from '@sim/emcn'
 import { parse } from 'tldts'
-import type { RowExecutionMetadata } from '@/lib/table'
+import { faviconUrl } from '@/lib/core/utils/favicon'
+import type { RowExecutionMetadata, SelectOption } from '@/lib/table'
+import { columnTypeOf } from '@/lib/table/column-types'
 import { StatusBadge } from '@/app/workspace/[workspaceId]/logs/utils'
+import type { TimezoneState } from '@/hooks/queries/general-settings'
 import { storageToDisplay } from '../../../utils'
+import { resolveSelectOptions, SelectPill } from '../../select-field'
 import type { DisplayColumn } from '../types'
 import { SimResourceCell, type SimResourceType } from './sim-resource-cell'
 
@@ -24,8 +28,9 @@ export type CellRenderKind =
   | { kind: 'no-output' }
   // Plain typed cells
   | { kind: 'boolean'; checked: boolean }
+  | { kind: 'select'; options: SelectOption[] }
   | { kind: 'json'; text: string }
-  | { kind: 'date'; text: string }
+  | { kind: 'date'; text: string; raw?: boolean }
   | { kind: 'url'; text: string; href: string; domain: string }
   | {
       kind: 'sim-resource'
@@ -49,6 +54,8 @@ interface ResolveCellRenderInput {
   /** Current workspace id — a URL pointing to a resource in this workspace
    *  renders as a tagged-resource chip rather than a plain external link. */
   currentWorkspaceId?: string
+  /** Invalid or unavailable preferences render time-based values without conversion. */
+  timezoneStatus?: TimezoneState['status']
 }
 
 export function resolveCellRender({
@@ -58,6 +65,7 @@ export function resolveCellRender({
   waitingOnLabels,
   isEnrichmentOutput,
   currentWorkspaceId,
+  timezoneStatus,
 }: ResolveCellRenderInput): CellRenderKind {
   const isNull = value === null || value === undefined
   const isEmpty = isNull || value === ''
@@ -119,9 +127,27 @@ export function resolveCellRender({
   }
 
   if (column.type === 'boolean') return { kind: 'boolean', checked: Boolean(value) }
+  // Always render select cells as the `select` kind — an empty one shows a muted
+  // "None" so every select cell reads as a clickable dropdown.
+  if (column.type === 'select') {
+    return { kind: 'select', options: resolveSelectOptions(column, value) }
+  }
   if (isNull) return { kind: 'empty' }
+  // Formatted here rather than in a render branch because the symbol and
+  // fraction digits come from the COLUMN's currency, which the render switch
+  // (keyed on kind alone) no longer has. Renders as plain text — a currency
+  // cell is a number cell with a symbol, so it stays left-aligned like one.
+  if (column.type === 'currency') {
+    return { kind: 'text', text: columnTypeOf(column).formatForDisplay(value, column) }
+  }
   if (column.type === 'json') return { kind: 'json', text: JSON.stringify(value) }
-  if (column.type === 'date') return { kind: 'date', text: String(value) }
+  const definition = columnTypeOf(column)
+  if (definition.editor === 'date') {
+    if (timezoneStatus !== undefined && timezoneStatus !== 'ready') {
+      return { kind: 'date', text: stringifyValue(value), raw: true }
+    }
+    return { kind: 'date', text: definition.formatForInput(value, column) }
+  }
   if (column.type === 'string') {
     const text = stringifyValue(value)
     return resolveLinkKind(text, currentWorkspaceId) ?? { kind: 'text', text }
@@ -345,6 +371,20 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
         </div>
       )
 
+    case 'select':
+      // Chip-only view: just the option pills. Pills stay visible while editing —
+      // the inline editor overlays an invisible trigger and portals its menu
+      // below, so the cell keeps showing the current selection.
+      return (
+        <span className='flex min-w-0 items-center gap-1 overflow-hidden'>
+          {kind.options.length > 0 ? (
+            kind.options.map((option) => <SelectPill key={option.id} option={option} />)
+          ) : (
+            <span className='text-[var(--text-muted)] text-small'>None</span>
+          )}
+        </span>
+      )
+
     case 'json':
       return (
         <span
@@ -360,7 +400,7 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
     case 'date':
       return (
         <span className={cn('text-[var(--text-primary)]', isEditing && 'invisible')}>
-          {storageToDisplay(kind.text, { seconds: true })}
+          {kind.raw ? kind.text : storageToDisplay(kind.text, { seconds: true })}
         </span>
       )
 
@@ -368,7 +408,7 @@ export function CellRender({ kind, isEditing }: CellRenderProps): React.ReactEle
       return (
         <span className={cn('flex min-w-0 items-center gap-1.5', isEditing && 'invisible')}>
           <img
-            src={`https://www.google.com/s2/favicons?domain=${encodeURIComponent(kind.domain)}&sz=16`}
+            src={faviconUrl(kind.domain, 16)}
             alt=''
             width={12}
             height={12}

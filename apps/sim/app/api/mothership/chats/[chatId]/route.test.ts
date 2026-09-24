@@ -1,14 +1,11 @@
 /**
  * @vitest-environment node
  */
-import { copilotHttpMock, copilotHttpMockFns } from '@sim/testing'
+import { copilotHttpMock, copilotHttpMockFns, dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { NextRequest } from 'next/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockDbDelete,
-  mockDbReturning,
-  mockDbWhere,
   mockDecrementStorageUsageForBillingContext,
   mockDecrementStorageUsageForBillingContextInTx,
   mockGetAccessibleCopilotChat,
@@ -17,9 +14,6 @@ const {
   mockReadFilePreviewSessions,
   mockGetLatestRunForStream,
 } = vi.hoisted(() => ({
-  mockDbDelete: vi.fn(),
-  mockDbReturning: vi.fn(),
-  mockDbWhere: vi.fn(),
   mockDecrementStorageUsageForBillingContext: vi.fn(),
   mockDecrementStorageUsageForBillingContextInTx: vi.fn(),
   mockGetAccessibleCopilotChat: vi.fn(),
@@ -27,36 +21,6 @@ const {
   mockReadEvents: vi.fn(),
   mockReadFilePreviewSessions: vi.fn(),
   mockGetLatestRunForStream: vi.fn(),
-}))
-
-vi.mock('@sim/db', () => ({
-  db: {
-    delete: mockDbDelete,
-  },
-}))
-
-vi.mock('@sim/db/schema', () => ({
-  copilotChats: {
-    id: 'copilotChats.id',
-    userId: 'copilotChats.userId',
-    type: 'copilotChats.type',
-    updatedAt: 'copilotChats.updatedAt',
-    lastSeenAt: 'copilotChats.lastSeenAt',
-    workspaceId: 'copilotChats.workspaceId',
-  },
-}))
-
-vi.mock('drizzle-orm', () => ({
-  and: vi.fn((...conditions: unknown[]) => ({ type: 'and', conditions })),
-  eq: vi.fn((field: unknown, value: unknown) => ({ type: 'eq', field, value })),
-  sql: Object.assign(
-    vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
-      type: 'sql',
-      strings,
-      values,
-    })),
-    { raw: vi.fn() }
-  ),
 }))
 
 vi.mock('@/lib/copilot/request/http', () => copilotHttpMock)
@@ -95,7 +59,7 @@ vi.mock('@/lib/copilot/chat/persisted-message', () => ({
 }))
 
 vi.mock('@/lib/copilot/chat-status', () => ({
-  chatPubSub: { publishStatusChanged: vi.fn() },
+  publishChatStatusChanged: vi.fn(),
 }))
 
 vi.mock('@/lib/billing/storage', () => ({
@@ -107,7 +71,8 @@ vi.mock('@/lib/posthog/server', () => ({
   captureServerEvent: vi.fn(),
 }))
 
-import { DELETE, GET } from '@/app/api/mothership/chats/[chatId]/route'
+import { publishChatStatusChanged } from '@/lib/copilot/chat-status'
+import { DELETE, GET, PATCH } from '@/app/api/mothership/chats/[chatId]/route'
 
 function makeContext(chatId: string) {
   return { params: Promise.resolve({ chatId }) }
@@ -119,9 +84,14 @@ function createRequest(chatId: string) {
   })
 }
 
+afterAll(() => {
+  resetDbChainMock()
+})
+
 describe('GET /api/mothership/chats/[chatId]', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     copilotHttpMockFns.mockAuthenticateCopilotRequestSessionOnly.mockResolvedValue({
       userId: 'user-1',
       isAuthenticated: true,
@@ -173,7 +143,7 @@ describe('GET /api/mothership/chats/[chatId]', () => {
     expect(mockReadEvents).not.toHaveBeenCalled()
   })
 
-  it('returns the live activeStreamId when redis confirms the lock', async () => {
+  it('returns the live activeStreamId with a status-only snapshot (no events)', async () => {
     mockGetAccessibleCopilotChat.mockResolvedValueOnce({
       id: 'chat-live',
       type: 'mothership',
@@ -185,15 +155,57 @@ describe('GET /api/mothership/chats/[chatId]', () => {
       updatedAt: new Date('2026-05-11T12:00:00Z'),
     })
     mockGetLatestRunForStream.mockResolvedValueOnce({ status: 'active' })
+    const previewSession = {
+      id: 'preview-1',
+      previewVersion: 1,
+      status: 'active',
+      updatedAt: '2026-05-11T12:00:00Z',
+    }
+    mockReadFilePreviewSessions.mockResolvedValueOnce([previewSession])
 
     const response = await GET(createRequest('chat-live'), makeContext('chat-live'))
     expect(response.status).toBe(200)
     const body = await response.json()
 
     expect(body.chat.activeStreamId).toBe('stream-live')
+    // Events are read only to synthesize the in-flight assistant turn for the
+    // initial paint; the client reconnects to the replay buffer for the rest.
+    // Status and preview sessions ARE shipped so hydration can gate the
+    // reconnect and seed the preview panel before the resume request lands.
     expect(mockReadEvents).toHaveBeenCalledWith('stream-live', '0')
-    expect(body.chat.streamSnapshot).toBeDefined()
-    expect(body.chat.streamSnapshot.status).toBe('active')
+    expect(mockReadFilePreviewSessions).toHaveBeenCalledWith('stream-live')
+    expect(body.chat.streamSnapshot).toEqual({
+      events: [],
+      previewSessions: [previewSession],
+      status: 'active',
+    })
+  })
+
+  it('reports a terminal run status when the stream lock is still visible', async () => {
+    mockGetAccessibleCopilotChat.mockResolvedValueOnce({
+      id: 'chat-finished',
+      type: 'mothership',
+      title: 'Finished',
+      messages: [],
+      resources: [],
+      conversationId: 'stream-finished',
+      createdAt: new Date('2026-05-11T12:00:00Z'),
+      updatedAt: new Date('2026-05-11T12:00:00Z'),
+    })
+    mockGetLatestRunForStream.mockResolvedValueOnce({ status: 'complete' })
+
+    const response = await GET(createRequest('chat-finished'), makeContext('chat-finished'))
+    expect(response.status).toBe(200)
+    const body = await response.json()
+
+    // The run finished but the Redis lock hasn't cleared yet: the client
+    // must see the terminal status so it skips the reconnect entirely.
+    expect(body.chat.activeStreamId).toBe('stream-finished')
+    expect(body.chat.streamSnapshot).toEqual({
+      events: [],
+      previewSessions: [],
+      status: 'complete',
+    })
   })
 
   it('uses the Redis lock owner when it differs from a stale persisted streamId', async () => {
@@ -268,6 +280,7 @@ describe('GET /api/mothership/chats/[chatId]', () => {
 describe('DELETE /api/mothership/chats/[chatId]', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     copilotHttpMockFns.mockAuthenticateCopilotRequestSessionOnly.mockResolvedValue({
       userId: 'user-1',
       isAuthenticated: true,
@@ -277,12 +290,10 @@ describe('DELETE /api/mothership/chats/[chatId]', () => {
       type: 'mothership',
       workspaceId: 'workspace-1',
     })
-    mockDbDelete.mockReturnValue({ where: mockDbWhere })
-    mockDbWhere.mockReturnValue({ returning: mockDbReturning })
-    mockDbReturning.mockResolvedValue([{ workspaceId: 'workspace-1' }])
+    dbChainMockFns.returning.mockResolvedValue([{ workspaceId: 'workspace-1' }])
   })
 
-  it('deletes an unbilled chat without decrementing workspace or payer storage', async () => {
+  it('soft-deletes an unbilled chat without decrementing workspace or payer storage', async () => {
     const response = await DELETE(
       new NextRequest('http://localhost:3000/api/mothership/chats/chat-delete', {
         method: 'DELETE',
@@ -291,8 +302,73 @@ describe('DELETE /api/mothership/chats/[chatId]', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(dbChainMockFns.update).toHaveBeenCalled()
+    expect(dbChainMockFns.set).toHaveBeenCalledWith({ deletedAt: expect.any(Date) })
     expect(mockDecrementStorageUsageForBillingContext).not.toHaveBeenCalled()
     expect(mockDecrementStorageUsageForBillingContextInTx).not.toHaveBeenCalled()
+  })
+})
+
+describe('organization chat mutations publish private owner updates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetDbChainMock()
+    copilotHttpMockFns.mockAuthenticateCopilotRequestSessionOnly.mockResolvedValue({
+      userId: 'user-1',
+      isAuthenticated: true,
+      principal: { kind: 'session', userId: 'user-1', sessionId: 'session-1' },
+    })
+    mockGetAccessibleCopilotChat.mockResolvedValue({
+      id: 'chat-1',
+      type: 'mothership',
+      organizationId: 'org-1',
+      userId: 'user-1',
+    })
+    dbChainMockFns.returning.mockResolvedValue([
+      { id: 'chat-1', workspaceId: null, organizationId: 'org-1' },
+    ])
+  })
+
+  it.each([{ title: 'New title' }, { pinned: true }, { isUnread: true }, { isUnread: false }])(
+    'publishes after updating %j',
+    async (body) => {
+      const response = await PATCH(
+        new NextRequest('http://localhost/api/mothership/chats/chat-1', {
+          method: 'PATCH',
+          body: JSON.stringify(body),
+        }),
+        makeContext('chat-1')
+      )
+      expect(response.status).toBe(200)
+      expect(publishChatStatusChanged).toHaveBeenCalledWith(
+        expect.objectContaining({ organizationId: 'org-1', userId: 'user-1' }),
+        { chatId: 'chat-1', type: 'title' in body ? 'renamed' : 'updated' }
+      )
+    }
+  )
+
+  it('publishes deletion under the same owner', async () => {
+    const response = await DELETE(
+      new NextRequest('http://localhost/api/mothership/chats/chat-1', { method: 'DELETE' }),
+      makeContext('chat-1')
+    )
+    expect(response.status).toBe(200)
+    expect(publishChatStatusChanged).toHaveBeenCalledWith(
+      expect.objectContaining({ organizationId: 'org-1', userId: 'user-1' }),
+      { chatId: 'chat-1', type: 'deleted' }
+    )
+  })
+
+  it('does not publish if a concurrent deletion leaves no updated row', async () => {
+    dbChainMockFns.returning.mockResolvedValueOnce([])
+    const response = await PATCH(
+      new NextRequest('http://localhost/api/mothership/chats/chat-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ pinned: true }),
+      }),
+      makeContext('chat-1')
+    )
+    expect(response.status).toBe(404)
+    expect(publishChatStatusChanged).not.toHaveBeenCalled()
   })
 })

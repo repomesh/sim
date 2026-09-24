@@ -6,7 +6,10 @@ import {
   forkLineageChildSchema,
   forkLineageNodeSchema,
   forkMappableResourceTypeSchema,
+  getForkDiffContract,
   getWorkspaceBackgroundWorkQuerySchema,
+  promoteForkBodySchema,
+  updateForkExcludedWorkflowsBodySchema,
   updateForkMappingBodySchema,
 } from '@/lib/api/contracts/workspace-fork'
 
@@ -29,6 +32,7 @@ describe('forkMappableResourceTypeSchema', () => {
       'file',
       'mcp_server',
       'custom_tool',
+      'custom_block',
       'skill',
     ]) {
       expect(forkMappableResourceTypeSchema.safeParse(type).success).toBe(true)
@@ -127,5 +131,121 @@ describe('updateForkMappingBodySchema', () => {
       })
       expect(result.success).toBe(false)
     }
+  })
+})
+
+describe('updateForkExcludedWorkflowsBodySchema', () => {
+  it('accepts a batch of workflow ids with the exclusion flag', () => {
+    const parsed = updateForkExcludedWorkflowsBodySchema.parse({
+      workflowIds: ['wf-1', 'wf-2'],
+      forkSyncExcluded: true,
+    })
+    expect(parsed).toEqual({ workflowIds: ['wf-1', 'wf-2'], forkSyncExcluded: true })
+  })
+
+  it('rejects an empty id list, empty ids, and oversized batches', () => {
+    expect(
+      updateForkExcludedWorkflowsBodySchema.safeParse({ workflowIds: [], forkSyncExcluded: true })
+        .success
+    ).toBe(false)
+    expect(
+      updateForkExcludedWorkflowsBodySchema.safeParse({ workflowIds: [''], forkSyncExcluded: true })
+        .success
+    ).toBe(false)
+    expect(
+      updateForkExcludedWorkflowsBodySchema.safeParse({
+        workflowIds: Array.from({ length: 1001 }, (_, index) => `wf-${index}`),
+        forkSyncExcluded: false,
+      }).success
+    ).toBe(false)
+  })
+
+  it('requires the forkSyncExcluded flag', () => {
+    expect(updateForkExcludedWorkflowsBodySchema.safeParse({ workflowIds: ['wf-1'] }).success).toBe(
+      false
+    )
+  })
+})
+
+describe('getForkDiffContract response excluded-workflow lists', () => {
+  const baseDiffResponse = {
+    sourceWorkspaceId: 'ws-src',
+    targetWorkspaceId: 'ws-tgt',
+    willUpdate: 0,
+    willCreate: 0,
+    willArchive: 0,
+    workflows: [],
+    unmappedRequired: [],
+    unmappedOptional: [],
+    mcpReauthServerIds: [],
+    inlineSecretSources: [],
+    dependentReconfigs: [],
+    resourceUsages: [],
+    copyableUnmapped: [],
+    clearedRefs: [],
+  }
+
+  it('defaults absent lists to empty (old-server tolerance)', () => {
+    const parsed = getForkDiffContract.response.schema.parse(baseDiffResponse)
+    expect(parsed.excludedSourceWorkflows).toEqual([])
+    expect(parsed.excludedTargetWorkflows).toEqual([])
+    expect(parsed.retiringTriggerUrls).toEqual([])
+    expect(parsed.triggerMappings).toEqual([])
+  })
+
+  it('carries every trigger, whether or not its URL is up for decision', () => {
+    const parsed = getForkDiffContract.response.schema.parse({
+      ...baseDiffResponse,
+      triggerMappings: [
+        // Already serving a URL: informational, no choice offered.
+        {
+          sourceBlockId: 'blk-stable',
+          blockName: 'Prod intake',
+          workflowName: 'ITSM intake',
+          ownPath: 'prod-live-path',
+          adoptablePaths: [],
+          defaultAdoptPath: null,
+        },
+        // Arriving without one, with a retiring URL it can take over.
+        {
+          sourceBlockId: 'blk-new',
+          blockName: 'Slack messages',
+          workflowName: 'ITSM intake',
+          ownPath: null,
+          adoptablePaths: ['live-slack-path'],
+          defaultAdoptPath: 'live-slack-path',
+        },
+      ],
+      retiringTriggerUrls: [{ workflowName: 'ITSM intake', path: 'dead-path' }],
+    })
+    expect(parsed.triggerMappings[0].ownPath).toBe('prod-live-path')
+    expect(parsed.triggerMappings[0].adoptablePaths).toEqual([])
+    expect(parsed.triggerMappings[1].defaultAdoptPath).toBe('live-slack-path')
+    expect(parsed.retiringTriggerUrls[0].path).toBe('dead-path')
+  })
+
+  it('accepts a trigger mapping choice on the promote body, including "new URL"', () => {
+    const parsed = promoteForkBodySchema.parse({
+      otherWorkspaceId: 'ws-other',
+      direction: 'push',
+      triggerMappings: [
+        { sourceBlockId: 'blk-a', adoptPath: 'keep-this-path' },
+        { sourceBlockId: 'blk-b', adoptPath: null },
+      ],
+    })
+    expect(parsed.triggerMappings).toEqual([
+      { sourceBlockId: 'blk-a', adoptPath: 'keep-this-path' },
+      { sourceBlockId: 'blk-b', adoptPath: null },
+    ])
+  })
+
+  it('carries the lists when present', () => {
+    const parsed = getForkDiffContract.response.schema.parse({
+      ...baseDiffResponse,
+      excludedSourceWorkflows: ['Scratch agent'],
+      excludedTargetWorkflows: ['Prod hotfix'],
+    })
+    expect(parsed.excludedSourceWorkflows).toEqual(['Scratch agent'])
+    expect(parsed.excludedTargetWorkflows).toEqual(['Prod hotfix'])
   })
 })

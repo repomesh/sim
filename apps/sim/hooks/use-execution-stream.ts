@@ -1,6 +1,8 @@
 import { useCallback } from 'react'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
+import type { WorkflowStateContractInput } from '@/lib/api/contracts/workflows'
 import { readSSEEvents } from '@/lib/core/utils/sse'
 import type {
   BlockChildWorkflowStartedData,
@@ -14,7 +16,10 @@ import type {
   ExecutionPausedData,
   ExecutionStartedData,
   StreamChunkData,
+  StreamChunkResetData,
   StreamDoneData,
+  StreamThinkingData,
+  StreamToolData,
 } from '@/lib/workflows/executor/execution-events'
 import type { SerializableExecutionState } from '@/executor/execution/types'
 
@@ -23,7 +28,8 @@ const logger = createLogger('useExecutionStream')
 export class ExecutionStreamHttpError extends Error {
   constructor(
     message: string,
-    public readonly httpStatus: number
+    public readonly httpStatus: number,
+    public readonly code?: string
   ) {
     super(message)
     this.name = 'ExecutionStreamHttpError'
@@ -62,16 +68,56 @@ export class SSEStreamInterruptedError extends Error {
  * Detects errors caused by the browser killing a fetch (page refresh, navigation, tab close).
  * These should be treated as clean disconnects, not execution errors.
  */
-function isClientDisconnectError(error: any): boolean {
-  return error.name === 'AbortError'
+function isClientDisconnectError(error: unknown): boolean {
+  return isRecordLike(error) && error.name === 'AbortError'
 }
 
-function isRecoverableStreamError(error: any): boolean {
-  if (isClientDisconnectError(error)) return false
-  const msg = (error.message ?? '').toLowerCase()
+/**
+ * Messages browsers put on the TypeError a fetch or body read rejects with when
+ * the connection drops: Chrome's "network error" and "Failed to fetch",
+ * Firefox's "NetworkError when attempting to fetch resource.", and Safari's
+ * "Load failed".
+ */
+const TRANSPORT_FAILURE_MESSAGE_PATTERNS = [
+  /network\s?error/,
+  /failed to fetch/,
+  /load failed/,
+] as const
+
+/**
+ * Errors the stream layer raises itself carry their own meaning (an HTTP
+ * rejection, a handler failure, an already classified drop), so their message
+ * text must never be mistaken for a transport failure.
+ */
+function isStreamLayerError(error: unknown): boolean {
   return (
-    msg.includes('network error') || msg.includes('failed to fetch') || msg.includes('load failed')
+    error instanceof ExecutionStreamHttpError ||
+    error instanceof SSEEventHandlerError ||
+    error instanceof SSEStreamInterruptedError
   )
+}
+
+function isRecoverableStreamError(error: unknown): boolean {
+  if (!isRecordLike(error) || isClientDisconnectError(error) || isStreamLayerError(error)) {
+    return false
+  }
+  const msg = typeof error.message === 'string' ? error.message.toLowerCase() : ''
+  return TRANSPORT_FAILURE_MESSAGE_PATTERNS.some((pattern) => pattern.test(msg))
+}
+
+/**
+ * Wraps a transport failure that cut a live execution stream before its
+ * terminal event, so every consumer of a live stream classifies interruptions
+ * the same way and recovery code can rely on one error type. Returns null for
+ * client aborts and for anything that is not a transport failure.
+ */
+export function toStreamInterruptedError(
+  error: unknown,
+  executionId: string | undefined,
+  message: string
+): SSEStreamInterruptedError | null {
+  if (!isRecoverableStreamError(error)) return null
+  return new SSEStreamInterruptedError(message, executionId, error)
 }
 
 /**
@@ -121,8 +167,17 @@ export async function processSSEStream(
             case 'stream:chunk':
               await callbacks.onStreamChunk?.(event.data)
               break
+            case 'stream:chunk_reset':
+              await callbacks.onStreamChunkReset?.(event.data)
+              break
             case 'stream:done':
               await callbacks.onStreamDone?.(event.data)
+              break
+            case 'stream:thinking':
+              await callbacks.onStreamThinking?.(event.data)
+              break
+            case 'stream:tool':
+              await callbacks.onStreamTool?.(event.data)
               break
             default:
               logger.warn('Unknown event type:', (event as any).type)
@@ -164,7 +219,10 @@ export interface ExecutionStreamCallbacks {
   onBlockError?: (data: BlockErrorData) => void | Promise<void>
   onBlockChildWorkflowStarted?: (data: BlockChildWorkflowStartedData) => void | Promise<void>
   onStreamChunk?: (data: StreamChunkData) => void | Promise<void>
+  onStreamChunkReset?: (data: StreamChunkResetData) => void | Promise<void>
   onStreamDone?: (data: StreamDoneData) => void | Promise<void>
+  onStreamThinking?: (data: StreamThinkingData) => void | Promise<void>
+  onStreamTool?: (data: StreamToolData) => void | Promise<void>
   onEventId?: (eventId: number) => void | Promise<void>
 }
 
@@ -181,12 +239,7 @@ export interface ExecuteStreamOptions {
   triggerType?: string
   useDraftState?: boolean
   isClientSession?: boolean
-  workflowStateOverride?: {
-    blocks: Record<string, any>
-    edges: any[]
-    loops?: Record<string, any>
-    parallels?: Record<string, any>
-  }
+  workflowStateOverride?: WorkflowStateContractInput
   stopAfterBlockId?: string
   onExecutionId?: (executionId: string) => void
   callbacks?: ExecutionStreamCallbacks
@@ -195,8 +248,12 @@ export interface ExecuteStreamOptions {
 export interface ExecuteFromBlockOptions {
   workflowId: string
   startBlockId: string
-  sourceSnapshot: SerializableExecutionState
+  sourceSnapshot?: SerializableExecutionState
+  sourceExecutionId?: string
   input?: any
+  useDraftState?: boolean
+  isClientSession?: boolean
+  workflowStateOverride?: WorkflowStateContractInput
   onExecutionId?: (executionId: string) => void
   callbacks?: ExecutionStreamCallbacks
 }
@@ -302,16 +359,17 @@ export function useExecutionStream() {
         logger.info('Execution stream disconnected (page unload or abort)')
         return
       }
-      if (isRecoverableStreamError(error)) {
+      const interrupted = toStreamInterruptedError(
+        error,
+        serverExecutionId,
+        'Execution stream interrupted before a terminal event was received'
+      )
+      if (interrupted) {
         logger.warn('Execution stream interrupted; preserving execution for reconnect', {
           executionId: serverExecutionId,
           error: error.message,
         })
-        throw new SSEStreamInterruptedError(
-          'Execution stream interrupted before a terminal event was received',
-          serverExecutionId,
-          error
-        )
+        throw interrupted
       }
       logger.error('Execution stream error:', error)
       if (!(error instanceof SSEEventHandlerError)) {
@@ -333,7 +391,11 @@ export function useExecutionStream() {
       workflowId,
       startBlockId,
       sourceSnapshot,
+      sourceExecutionId,
       input,
+      useDraftState,
+      isClientSession,
+      workflowStateOverride,
       onExecutionId,
       callbacks = {},
     } = options
@@ -355,7 +417,14 @@ export function useExecutionStream() {
         body: JSON.stringify({
           stream: true,
           input,
-          runFromBlock: { startBlockId, sourceSnapshot },
+          useDraftState,
+          isClientSession,
+          workflowStateOverride,
+          runFromBlock: {
+            startBlockId,
+            ...(sourceExecutionId ? { executionId: sourceExecutionId } : {}),
+            ...(sourceSnapshot ? { sourceSnapshot } : {}),
+          },
         }),
         signal: abortController.signal,
       })
@@ -396,16 +465,17 @@ export function useExecutionStream() {
         logger.info('Run-from-block stream disconnected (page unload or abort)')
         return
       }
-      if (isRecoverableStreamError(error)) {
+      const interrupted = toStreamInterruptedError(
+        error,
+        serverExecutionId,
+        'Run-from-block stream interrupted before a terminal event was received'
+      )
+      if (interrupted) {
         logger.warn('Run-from-block stream interrupted; preserving execution for reconnect', {
           executionId: serverExecutionId,
           error: error.message,
         })
-        throw new SSEStreamInterruptedError(
-          'Run-from-block stream interrupted before a terminal event was received',
-          serverExecutionId,
-          error
-        )
+        throw interrupted
       }
       logger.error('Run-from-block execution error:', error)
       if (!(error instanceof SSEEventHandlerError)) {

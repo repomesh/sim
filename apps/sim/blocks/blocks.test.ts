@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 vi.unmock('@/blocks/registry')
 
+import { evaluateSubBlockCondition } from '@/lib/workflows/subblocks/visibility'
 import { generateRouterPrompt } from '@/blocks/blocks/router'
 import {
   getAllBlocks,
@@ -167,18 +168,36 @@ describe.concurrent('Blocks Module', () => {
       expect(block).toBeDefined()
       expect(block?.hideFromToolbar).toBe(false)
       expect(block?.subBlocks[0].options?.map((option) => option.id)).toEqual([
+        'file_list',
         'file_read',
         'file_get_content',
+        'file_search',
         'file_fetch',
         'file_write',
         'file_append',
+        'file_edit',
         'file_compress',
         'file_decompress',
         'file_manage_sharing',
+        'file_create_folder',
+        'file_update_folder',
+        'file_delete_folder',
+        'file_restore_folder',
+        'file_move',
       ])
+      expect(block?.tools.config?.tool({ operation: 'file_list' })).toBe('file_list')
+      expect(block?.tools.config?.tool({ operation: 'file_delete_folder' })).toBe(
+        'file_delete_folder'
+      )
       expect(block?.tools.config?.tool({ operation: 'file_compress' })).toBe('file_compress')
       expect(block?.tools.config?.tool({ operation: 'file_decompress' })).toBe('file_decompress')
-      expect(block?.subBlocks.find((subBlock) => subBlock.id === 'readFile')?.multiple).toBe(true)
+      expect(block?.subBlocks.find((subBlock) => subBlock.id === 'readFile')?.folderScope).toEqual({
+        fieldId: 'folderSelection',
+        recursiveFieldId: 'folderIncludeSubfolders',
+      })
+      expect(block?.subBlocks.find((subBlock) => subBlock.id === 'folderSelection')?.mode).toBe(
+        'basic'
+      )
       expect(block?.tools.config?.tool({ operation: 'file_read' })).toBe('file_read')
       expect(block?.tools.config?.tool({ operation: 'file_get_content' })).toBe('file_get_content')
       expect(block?.tools.config?.tool({ operation: 'file_fetch' })).toBe('file_fetch')
@@ -338,6 +357,9 @@ describe.concurrent('Blocks Module', () => {
         expect(block?.subBlocks.length).toBeGreaterThanOrEqual(1)
         const languageSubBlock = block?.subBlocks.find((sb) => sb.id === 'language')
         const codeSubBlock = block?.subBlocks.find((sb) => sb.id === 'code')
+        const sandboxSubBlock = block?.subBlocks.find((sb) => sb.id === 'sandboxId')
+        expect(languageSubBlock?.showWhenEnvSet).toBeUndefined()
+        expect(sandboxSubBlock?.showWhenEnvSet).toBe('NEXT_PUBLIC_SANDBOXES_ENABLED')
         expect(codeSubBlock).toBeDefined()
         expect(codeSubBlock?.type).toBe('code')
       })
@@ -577,10 +599,12 @@ describe.concurrent('Blocks Module', () => {
         'variables-input',
         'messages-input',
         'workflow-selector',
+        'workflow-output-selector',
         'workflow-input-mapper',
         'text',
         'router-input',
         'table-selector',
+        'model-fallback-list',
         'column-selector',
         'filter-builder',
         'sort-builder',
@@ -833,6 +857,124 @@ describe.concurrent('Blocks Module', () => {
       expect(getBlock('video_generator_v2')?.hideFromToolbar).toBe(true)
     })
 
+    it('should keep the legacy openai block registered but out of discovery', () => {
+      const legacy = getBlock('openai')
+      const replacement = getBlock('embeddings')
+
+      // Placed instances must keep resolving and executing.
+      expect(legacy).toBeDefined()
+      expect(legacy?.tools.access).toContain('openai_embeddings')
+      // ...while the block itself is gone from the toolbar, search, and mentions.
+      expect(legacy?.hideFromToolbar).toBe(true)
+      expect(legacy?.sunset).toEqual({ status: 'legacy', replacedBy: 'embeddings' })
+      // The badge only renders when replacedBy resolves to a registered block.
+      expect(replacement).toBeDefined()
+      expect(replacement?.hideFromToolbar).not.toBe(true)
+    })
+
+    it('should keep the legacy table block registered but out of discovery', () => {
+      const legacy = getBlock('table')
+      const replacement = getBlock('table_v2')
+
+      // Placed instances must keep resolving and executing.
+      expect(legacy).toBeDefined()
+      expect(legacy?.tools.access).toContain('table_query_rows')
+      // ...while the block itself is gone from the toolbar, search, and mentions.
+      expect(legacy?.hideFromToolbar).toBe(true)
+      expect(legacy?.sunset).toEqual({ status: 'legacy', replacedBy: 'table_v2' })
+      expect(replacement).toBeDefined()
+      expect(replacement?.hideFromToolbar).not.toBe(true)
+      // GA: the reveal gate is gone, so it no longer depends on block-visibility.
+      expect(replacement?.preview).toBeUndefined()
+      expect(replacement?.tools.access).toContain('table_query_rows_v2')
+    })
+
+    /**
+     * Webhook execution gates on `triggers.enabled` at runtime, not on
+     * discovery, so hiding v1 must not disable the trigger it hosts — every
+     * deployed v1 table-trigger workflow depends on it staying live. Both
+     * versions host the same trigger id.
+     */
+    it("should keep the legacy table block's trigger enabled", () => {
+      expect(getBlock('table')?.triggers).toEqual({
+        enabled: true,
+        available: ['table_new_row'],
+      })
+      expect(getBlock('table_v2')?.triggers?.available).toContain('table_new_row')
+    })
+
+    /**
+     * `openai_embeddings` is an alias of `embeddings_openai`, so the legacy
+     * block's runtime payload gained `provider` and `dimensions`. Undeclared,
+     * they were absent from the tag picker and unreferenceable downstream even
+     * though every run returned them.
+     */
+    it('should declare every output the legacy openai block returns at runtime', () => {
+      const legacy = getBlock('openai')
+      const replacement = getBlock('embeddings')
+
+      expect(Object.keys(legacy?.outputs ?? {}).sort()).toEqual([
+        'dimensions',
+        'embeddings',
+        'model',
+        'provider',
+        'usage',
+      ])
+      expect(legacy?.outputs?.provider).toEqual({
+        type: 'string',
+        description: 'Provider used',
+      })
+      expect(legacy?.outputs?.dimensions).toEqual({
+        type: 'number',
+        description: 'Dimensionality of each vector',
+      })
+      // Both blocks run the same tool, so neither may expose fields the other lacks.
+      expect(Object.keys(legacy?.outputs ?? {}).sort()).toEqual(
+        Object.keys(replacement?.outputs ?? {}).sort()
+      )
+    })
+
+    it('should offer every embeddings provider with a matching tool and model list', () => {
+      const block = getBlock('embeddings')
+      const providerSubBlock = block?.subBlocks.find((sb) => sb.id === 'provider')
+      const providerOptions = providerSubBlock?.options
+      const providerIds = Array.isArray(providerOptions)
+        ? providerOptions.map((option) => option.id)
+        : []
+
+      expect(providerSubBlock?.commandSearchable).toBe(true)
+      expect(providerSubBlock?.value?.()).toBe('openai')
+      expect(providerIds).toEqual(['openai', 'gemini', 'cohere', 'mistral', 'openrouter', 'ollama'])
+
+      for (const provider of providerIds) {
+        // Each provider routes to its own registered tool...
+        const toolId = block?.tools.config?.tool?.({ provider })
+        expect(block?.tools.access).toContain(toolId)
+        // ...and has either a static model list or a dynamic model loader.
+        const modelSubBlock = block?.subBlocks.find(
+          (sb) => sb.id === 'model' && sb.condition?.value === provider
+        )
+        // OpenRouter's catalog is remote and Ollama's is the deployment's own,
+        // so neither can be enumerated here.
+        if (provider === 'openrouter' || provider === 'ollama') {
+          expect(modelSubBlock?.selectorKey).toBeTypeOf('string')
+        } else {
+          expect(
+            Array.isArray(modelSubBlock?.options) ? modelSubBlock.options.length : 0
+          ).toBeGreaterThan(0)
+        }
+      }
+    })
+
+    it('should default an embeddings block saved before the provider field existed to openai', () => {
+      const block = getBlock('embeddings')
+
+      // Serialization runs before variable resolution, so an absent provider
+      // must still resolve to the original OpenAI tool.
+      expect(block?.tools.config?.tool?.({})).toBe('embeddings_openai')
+      expect(block?.tools.config?.tool?.({ provider: 'gemini' })).toBe('embeddings_gemini')
+    })
+
     it('should mark the agent model combobox as command-searchable', () => {
       const agentBlock = getBlock('agent')
       const modelSubBlock = agentBlock?.subBlocks.find((sb) => sb.id === 'model')
@@ -840,6 +982,41 @@ describe.concurrent('Blocks Module', () => {
       expect(agentBlock?.hideFromToolbar).not.toBe(true)
       expect(modelSubBlock?.type).toBe('combobox')
       expect(modelSubBlock?.commandSearchable).toBe(true)
+    })
+
+    /** Each model-tuning field with a model that accepts it and one that does not. */
+    const AGENT_MODEL_LEVEL_FIELDS = [
+      { id: 'reasoningEffort', capable: 'gpt-5.1', incapable: 'claude-sonnet-5' },
+      { id: 'verbosity', capable: 'gpt-5.1', incapable: 'claude-sonnet-5' },
+      { id: 'thinkingLevel', capable: 'claude-sonnet-5', incapable: 'gpt-5.1' },
+    ] as const
+
+    it('should let the agent model-tuning fields take a typed reference', () => {
+      const agentBlock = getBlock('agent')
+
+      for (const { id } of AGENT_MODEL_LEVEL_FIELDS) {
+        const subBlock = agentBlock?.subBlocks.find((sb) => sb.id === id)
+        // A combobox is editable, so a `<block.output>` / `{{ENV_VAR}}` reference can be
+        // typed into it; the option list still offers every level the model accepts.
+        expect(subBlock?.type).toBe('combobox')
+        expect(typeof subBlock?.condition).toBe('function')
+      }
+    })
+
+    it('should keep the agent model-tuning fields visible when the model is a reference', () => {
+      const agentBlock = getBlock('agent')
+
+      for (const { id, capable, incapable } of AGENT_MODEL_LEVEL_FIELDS) {
+        const subBlock = agentBlock?.subBlocks.find((sb) => sb.id === id)
+        const condition = subBlock?.condition
+        if (typeof condition !== 'function') throw new Error(`${id} condition is not a function`)
+
+        expect(evaluateSubBlockCondition(condition, { model: '<start.model>' })).toBe(true)
+        expect(evaluateSubBlockCondition(condition, { model: '{{MODEL_ID}}' })).toBe(true)
+        // Gating on the capability list is unchanged for a literal model.
+        expect(evaluateSubBlockCondition(condition, { model: capable })).toBe(true)
+        expect(evaluateSubBlockCondition(condition, { model: incapable })).toBe(false)
+      }
     })
 
     it('should hide generator API keys on hosted only for Fal.ai providers', () => {

@@ -1,6 +1,9 @@
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { CompletionUsage } from 'openai/resources/completions'
-import { checkForForcedToolUsageOpenAI, createOpenAICompatibleStream } from '@/providers/utils'
+import { createOpenAICompatibleAgentEventStream } from '@/providers/openai-compat/stream-events'
+import type { AgentStreamEvent } from '@/providers/stream-events'
+import type { ProviderRequest } from '@/providers/types'
+import { checkForForcedToolUsageOpenAI } from '@/providers/utils'
 
 /**
  * Together gates native `json_schema` per-model, so we use the broadly supported
@@ -11,14 +14,21 @@ export async function supportsNativeStructuredOutputs(_modelId: string): Promise
 }
 
 /**
- * Creates a ReadableStream from a Together AI streaming response.
- * Uses the shared OpenAI-compatible streaming utility.
+ * Creates an agent-events stream from a Together AI streaming response.
+ * Uses the shared OpenAI-compatible agent event streaming utility.
  */
 export function createReadableStreamFromOpenAIStream(
   openaiStream: AsyncIterable<ChatCompletionChunk>,
-  onComplete?: (content: string, usage: CompletionUsage) => void
-): ReadableStream<Uint8Array> {
-  return createOpenAICompatibleStream(openaiStream, 'Together', onComplete)
+  onComplete?: (content: string, usage: CompletionUsage, thinking?: string) => void,
+  request?: ProviderRequest
+): ReadableStream<AgentStreamEvent> {
+  return createOpenAICompatibleAgentEventStream(openaiStream, {
+    request,
+    providerName: 'Together',
+    onComplete: onComplete
+      ? (result) => onComplete(result.content, result.usage, result.thinking)
+      : undefined,
+  })
 }
 
 /**

@@ -5,6 +5,7 @@ import type { ToolConfig } from '@/tools/types'
 export const gitlabListCommitsTool: ToolConfig<GitLabListCommitsParams, GitLabListCommitsResponse> =
   {
     id: 'gitlab_list_commits',
+    personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
     name: 'GitLab List Commits',
     description: 'List commits in a GitLab project repository',
     version: '1.0.0',
@@ -26,7 +27,7 @@ export const gitlabListCommitsTool: ToolConfig<GitLabListCommitsParams, GitLabLi
         type: 'string',
         required: true,
         visibility: 'user-or-llm',
-        description: 'Project ID or URL-encoded path',
+        description: 'Project ID or path (e.g. mygroup/myproject)',
       },
       refName: {
         type: 'string',
@@ -123,7 +124,8 @@ export const gitlabListCommitsTool: ToolConfig<GitLabListCommitsParams, GitLabLi
       },
       total: {
         type: 'number',
-        description: 'Total number of commits',
+        description:
+          'Number of commits returned on this page (GitLab does not report a grand total for commits)',
       },
     },
   }

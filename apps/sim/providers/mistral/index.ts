@@ -1,15 +1,29 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import OpenAI from 'openai'
 import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
+import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
 import { createReadableStreamFromMistralStream } from '@/providers/mistral/utils'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { getChatCompletionConversationUsage } from '@/providers/openai-compat/conversation-usage'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
+import { openAICompatTransport } from '@/providers/transport'
 import type {
   ProviderConfig,
   ProviderRequest,
@@ -19,12 +33,12 @@ import type {
 import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
   trackForcedToolUsage,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('MistralProvider')
 
@@ -57,6 +71,7 @@ export const mistralProvider: ProviderConfig = {
     }
 
     const mistral = new OpenAI({
+      ...openAICompatTransport(),
       apiKey: request.apiKey,
       baseURL: 'https://api.mistral.ai/v1',
     })
@@ -139,12 +154,17 @@ export const mistralProvider: ProviderConfig = {
       if (request.stream && (!tools || tools.length === 0)) {
         logger.info('Using streaming response for Mistral request')
 
+        /**
+         * Mistral reports stream usage on the terminal chunk on its own and
+         * rejects `stream_options` with HTTP 422 (`extra_forbidden`), so the
+         * opt-in every other OpenAI-compatible provider sends is omitted here.
+         */
         const streamingParams: ChatCompletionCreateParamsStreaming = {
           ...payload,
           stream: true,
         }
         const streamResponse = await mistral.chat.completions.create(
-          streamingParams,
+          await prepareConversationGeneration(request, 'chat-completions', streamingParams),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
 
@@ -155,28 +175,33 @@ export const mistralProvider: ProviderConfig = {
           timing: { kind: 'simple', segmentName: request.model },
           initialTokens: { input: 0, output: 0, total: 0 },
           initialCost: { input: 0, output: 0, total: 0 },
+          streamFormat: 'agent-events-v1',
           createStream: ({ output, finalizeTiming }) =>
-            createReadableStreamFromMistralStream(streamResponse, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: usage.total_tokens,
-              }
+            createReadableStreamFromMistralStream(
+              streamResponse,
+              (content, usage) => {
+                output.content = content
+                output.tokens = {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  total: usage.total_tokens,
+                }
 
-              const costResult = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              output.cost = {
-                input: costResult.input,
-                output: costResult.output,
-                total: costResult.total,
-              }
+                const costResult = calculateCost(
+                  request.model,
+                  usage.prompt_tokens,
+                  usage.completion_tokens
+                )
+                output.cost = {
+                  input: costResult.input,
+                  output: costResult.output,
+                  total: costResult.total,
+                }
 
-              finalizeTiming()
-            }),
+                finalizeTiming()
+              },
+              request
+            ),
         })
 
         return streamingResult
@@ -193,8 +218,11 @@ export const mistralProvider: ProviderConfig = {
         response: any,
         toolChoice: string | { type: string; function?: { name: string }; name?: string; any?: any }
       ) => {
-        if (typeof toolChoice === 'object' && response.choices[0]?.message?.tool_calls) {
-          const toolCallsResponse = response.choices[0].message.tool_calls
+        const toolCallsResponse =
+          typeof toolChoice === 'object'
+            ? response.choices?.[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+            : undefined
+        if (toolCallsResponse?.length) {
           const result = trackForcedToolUsage(
             toolCallsResponse,
             toolChoice,
@@ -209,9 +237,17 @@ export const mistralProvider: ProviderConfig = {
       }
 
       let currentResponse = await mistral.chat.completions.create(
-        payload,
+        await prepareConversationGeneration(request, 'chat-completions', payload),
         request.abortSignal ? { signal: request.abortSignal } : undefined
       )
+      if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
+      }
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = currentResponse.choices[0]?.message?.content || ''
@@ -247,7 +283,8 @@ export const mistralProvider: ProviderConfig = {
           content = currentResponse.choices[0].message.content
         }
 
-        const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+        const toolCallsInResponse =
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
 
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
@@ -265,32 +302,78 @@ export const mistralProvider: ProviderConfig = {
         )
 
         const toolsStartTime = Date.now()
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
         const toolExecutionPromises = toolCallsInResponse.map(async (toolCall) => {
           const toolCallStartTime = Date.now()
           const toolName = toolCall.function.name
 
           try {
-            const toolArgs = JSON.parse(toolCall.function.arguments)
+            const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
             const tool = request.tools?.find((t) => t.id === toolName)
 
-            if (!tool) return null
+            if (!tool) {
+              await recordProviderConversationToolError(
+                request,
+                toolCall.id,
+                toolName,
+                `Tool "${toolName}" is not available`
+              )
+              const toolCallEndTime = Date.now()
+              return {
+                toolCall,
+                toolName,
+                toolParams: {},
+                result: {
+                  success: false,
+                  output: undefined,
+                  error: `Tool "${toolName}" is not available`,
+                },
+                startTime: toolCallStartTime,
+                endTime: toolCallEndTime,
+                duration: toolCallEndTime - toolCallStartTime,
+              }
+            }
 
-            const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-            const result = await executeTool(toolName, executionParams, {
-              signal: request.abortSignal,
-            })
+            const { toolParams, executionParams } = prepareToolExecution(
+              tool,
+              toolArgs,
+              request,
+              toolCall.id
+            )
+            const { rawResponse, modelResponse } = await executeProviderTool(
+              toolName,
+              executionParams,
+              {
+                signal: request.abortSignal,
+              }
+            )
             const toolCallEndTime = Date.now()
 
             return {
               toolCall,
               toolName,
               toolParams,
-              result,
+              result: rawResponse,
+              modelResult: modelResponse,
               startTime: toolCallStartTime,
               endTime: toolCallEndTime,
               duration: toolCallEndTime - toolCallStartTime,
             }
           } catch (error) {
+            if (isAbortError(error) || request.abortSignal?.aborted) {
+              throw error
+            }
+            await recordProviderConversationToolError(
+              request,
+              toolCall.id,
+              toolName,
+              getErrorMessage(error, 'Tool execution failed')
+            )
             const toolCallEndTime = Date.now()
             logger.error('Error processing tool call:', { error, toolName })
 
@@ -310,7 +393,7 @@ export const mistralProvider: ProviderConfig = {
           }
         })
 
-        const executionResults = await Promise.allSettled(toolExecutionPromises)
+        const executionResults = await Promise.all(toolExecutionPromises)
         currentMessages.push({
           role: 'assistant',
           content: null,
@@ -324,11 +407,11 @@ export const mistralProvider: ProviderConfig = {
           })),
         })
 
-        for (const settledResult of executionResults) {
-          if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+        for (const executionResult of executionResults) {
           const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-            settledResult.value
+            executionResult
+          const modelResult =
+            'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
           timeSegments.push({
             type: 'tool',
@@ -339,10 +422,12 @@ export const mistralProvider: ProviderConfig = {
             toolCallId: toolCall.id,
           })
 
-          let resultContent: any
-          if (result.success && result.output) {
-            toolResults.push(result.output)
-            resultContent = result.output
+          let resultContent: unknown
+          if (result.success) {
+            if (isRecordLike(result.output)) {
+              toolResults.push(result.output)
+            }
+            resultContent = result.output ?? null
           } else {
             resultContent = {
               error: true,
@@ -350,6 +435,13 @@ export const mistralProvider: ProviderConfig = {
               tool: toolName,
             }
           }
+          const modelResultContent = modelResult.success
+            ? (modelResult.output ?? null)
+            : {
+                error: true,
+                message: modelResult.error || 'Tool execution failed',
+                tool: toolName,
+              }
 
           toolCalls.push({
             name: toolName,
@@ -364,7 +456,7 @@ export const mistralProvider: ProviderConfig = {
             role: 'tool',
             tool_call_id: toolCall.id,
             name: toolName,
-            content: JSON.stringify(resultContent),
+            content: JSON.stringify(modelResultContent),
           })
         }
 
@@ -394,9 +486,17 @@ export const mistralProvider: ProviderConfig = {
         const nextModelStartTime = Date.now()
 
         currentResponse = await mistral.chat.completions.create(
-          nextPayload,
+          await prepareConversationGeneration(request, 'chat-completions', nextPayload),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
+        if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+          await captureProviderConversationStep(
+            request,
+            'chat-completions',
+            currentResponse.choices[0]?.message,
+            getChatCompletionConversationUsage(currentResponse.usage)
+          )
+        }
 
         checkForForcedToolUsage(currentResponse, nextPayload.tool_choice)
 
@@ -430,28 +530,66 @@ export const mistralProvider: ProviderConfig = {
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
           currentResponse,
-          currentResponse.choices[0]?.message?.tool_calls,
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
           { model: request.model, provider: 'mistral' }
         )
+
+        if (currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)?.length) {
+          /**
+           * The capped turn still requests tools, so make one tool-disabled call
+           * to synthesize an answer from the tool results already gathered.
+           */
+          const { tools: _tools, tool_choice: _toolChoice, ...synthesisPayload } = payload
+          const synthesisStartTime = Date.now()
+          const synthesisResponse = await mistral.chat.completions.create(
+            await prepareConversationGeneration(request, 'chat-completions', {
+              ...synthesisPayload,
+              messages: currentMessages,
+            }),
+            request.abortSignal ? { signal: request.abortSignal } : undefined
+          )
+          if (!synthesisResponse.choices[0]?.message?.tool_calls?.length) {
+            await captureProviderConversationStep(
+              request,
+              'chat-completions',
+              synthesisResponse.choices[0]?.message,
+              getChatCompletionConversationUsage(synthesisResponse.usage)
+            )
+          }
+          const synthesisEndTime = Date.now()
+
+          timeSegments.push({
+            type: 'model',
+            name: 'Final answer after tool limit',
+            startTime: synthesisStartTime,
+            endTime: synthesisEndTime,
+            duration: synthesisEndTime - synthesisStartTime,
+          })
+          modelTime += synthesisEndTime - synthesisStartTime
+
+          content = synthesisResponse.choices[0]?.message?.content || content
+          if (synthesisResponse.usage) {
+            tokens.input += synthesisResponse.usage.prompt_tokens || 0
+            tokens.output += synthesisResponse.usage.completion_tokens || 0
+            tokens.total += synthesisResponse.usage.total_tokens || 0
+          }
+
+          enrichLastModelSegmentFromChatCompletions(
+            timeSegments,
+            synthesisResponse,
+            synthesisResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+            { model: request.model, provider: 'mistral' }
+          )
+        }
       }
 
       if (request.stream) {
-        logger.info('Using streaming for final response after tool processing')
+        logger.info('Projecting settled response after tool processing')
 
         const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+        const toolCost = sumToolCosts(toolResults)
 
-        const streamingParams: ChatCompletionCreateParamsStreaming = {
-          ...payload,
-          messages: currentMessages,
-          tool_choice: 'auto',
-          stream: true,
-        }
-        const streamResponse = await mistral.chat.completions.create(
-          streamingParams,
-          request.abortSignal ? { signal: request.abortSignal } : undefined
-        )
-
-        const streamingResult = createStreamingExecution({
+        return createStreamingExecution({
           model: request.model,
           providerStartTime,
           providerStartTimeISO,
@@ -460,7 +598,7 @@ export const mistralProvider: ProviderConfig = {
             modelTime,
             toolsTime,
             firstResponseTime,
-            iterations: iterationCount + 1,
+            iterations: timeSegments.filter((segment) => segment.type === 'model').length,
             timeSegments,
           },
           initialTokens: {
@@ -471,7 +609,8 @@ export const mistralProvider: ProviderConfig = {
           initialCost: {
             input: accumulatedCost.input,
             output: accumulatedCost.output,
-            total: accumulatedCost.total,
+            toolCost: toolCost || undefined,
+            total: accumulatedCost.total + toolCost,
           },
           toolCalls:
             toolCalls.length > 0
@@ -480,31 +619,13 @@ export const mistralProvider: ProviderConfig = {
                   count: toolCalls.length,
                 }
               : undefined,
-          createStream: ({ output }) =>
-            createReadableStreamFromMistralStream(streamResponse, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: tokens.input + usage.prompt_tokens,
-                output: tokens.output + usage.completion_tokens,
-                total: tokens.total + usage.total_tokens,
-              }
-
-              const streamCost = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-              }
-            }),
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
         })
-
-        return streamingResult
       }
 
       const providerEndTime = Date.now()
@@ -524,7 +645,7 @@ export const mistralProvider: ProviderConfig = {
           modelTime: modelTime,
           toolsTime: toolsTime,
           firstResponseTime: firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments: timeSegments,
         },
       }
@@ -537,6 +658,14 @@ export const mistralProvider: ProviderConfig = {
         error,
         duration: totalDuration,
       })
+
+      if (
+        isAbortError(error) ||
+        request.abortSignal?.aborted ||
+        isConversationContextError(error)
+      ) {
+        throw error
+      }
 
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,

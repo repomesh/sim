@@ -1,27 +1,25 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import {
   Badge,
-  Button,
   ChipConfirmModal,
+  ChipModal,
+  ChipModalBody,
+  ChipModalFooter,
+  ChipModalHeader,
+  ChipModalTabs,
+  chipContentIconClass,
+  cn,
   Loader,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalDescription,
-  ModalFooter,
-  ModalHeader,
-  ModalTabs,
-  ModalTabsContent,
-  ModalTabsList,
-  ModalTabsTrigger,
   Tooltip,
+  toast,
 } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import { useQueryClient } from '@tanstack/react-query'
 import { useParams } from 'next/navigation'
+import type { DeploymentOperationSummary } from '@/lib/api/contracts/deployments'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import { getInputFormatExample as getInputFormatExampleUtil } from '@/lib/workflows/operations/deployment-utils'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
@@ -30,8 +28,8 @@ import {
   releaseDeployAction,
   tryAcquireDeployAction,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/hooks/deploy-action-lock'
-import { syncLocalDraftFromServer } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/hooks/sync-local-draft'
 import type { DeployReadiness } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/hooks/use-deploy-readiness'
+import type { DeploymentViewState } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/hooks/use-deployment-view-state'
 import { runPreDeployChecks } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/hooks/use-predeploy-checks'
 import { normalizeName, startsWithUuid } from '@/executor/constants'
 import { useApiKeys } from '@/hooks/queries/api-keys'
@@ -50,6 +48,7 @@ import { useWorkspaceSettings } from '@/hooks/queries/workspace'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
+import { syncLocalDraftFromServer } from '@/stores/workflows/sync-local-draft'
 import { mergeSubblockState } from '@/stores/workflows/utils'
 import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 import type { WorkflowState } from '@/stores/workflows/workflow/types'
@@ -62,12 +61,10 @@ interface DeployModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   workflowId: string | null
-  isDeployed: boolean
-  needsRedeployment: boolean
+  /** The one derived deployment verdict, shared with the deploy chip. */
+  deployment: DeploymentViewState
   deployedState?: WorkflowState | null
-  isLoadingDeployedState: boolean
   deployReadiness: DeployReadiness
-  isDeploymentSettling: boolean
 }
 
 interface WorkflowDeploymentInfoUI {
@@ -92,13 +89,20 @@ export function DeployModal({
   open,
   onOpenChange,
   workflowId,
-  isDeployed: isDeployedProp,
-  needsRedeployment,
-  deployedState,
-  isLoadingDeployedState,
+  deployment,
   deployReadiness,
-  isDeploymentSettling,
 }: DeployModalProps) {
+  const descriptionId = useId()
+  const {
+    status: deploymentStatus,
+    isDeployed: isDeployedProp,
+    deployedState,
+    isAwaitingSnapshot,
+    isSettling: isDeploymentSettling,
+  } = deployment
+  const needsRedeployment = deploymentStatus === 'changed'
+  /* A snapshot that is expected but absent reads as loading everywhere. */
+  const isLoadingDeployedState = isAwaitingSnapshot
   const queryClient = useQueryClient()
   const params = useParams()
   const workspaceId = params?.workspaceId as string
@@ -110,7 +114,6 @@ export function DeployModal({
   const [activeTab, setActiveTab] = useState<TabView>('general')
   const [chatSubmitting, setChatSubmitting] = useState(false)
   const [deployError, setDeployError] = useState<string | null>(null)
-  const [deployWarnings, setDeployWarnings] = useState<string[]>([])
   const [isFinalizingDeploy, setIsFinalizingDeploy] = useState(false)
   const [isActivatingVersion, setIsActivatingVersion] = useState(false)
   const [isChatFormValid, setIsChatFormValid] = useState(false)
@@ -132,9 +135,20 @@ export function DeployModal({
   const userPermissions = useUserPermissionsContext()
   const canManageWorkspaceKeys = userPermissions.canAdmin
   const { config: permissionConfig, isPublicApiDisabled } = usePermissionConfig()
-  const { data: apiKeysData, isLoading: isLoadingKeys } = useApiKeys(workflowWorkspaceId || '')
+  const visibleTabs = [
+    { value: 'general', label: 'General' },
+    ...(!permissionConfig.hideDeployApi ? [{ value: 'api', label: 'API' }] : []),
+    ...(!permissionConfig.hideDeployMcp ? [{ value: 'mcp', label: 'MCP' }] : []),
+    ...(!permissionConfig.hideDeployChatbot ? [{ value: 'chat', label: 'Chat' }] : []),
+  ]
+  const { data: apiKeysData, isLoading: isLoadingKeys } = useApiKeys(
+    workflowWorkspaceId || '',
+    'combined',
+    { enabled: open }
+  )
   const { data: workspaceSettingsData, isLoading: isLoadingSettings } = useWorkspaceSettings(
-    workflowWorkspaceId || ''
+    workflowWorkspaceId || '',
+    { enabled: open }
   )
   const apiKeyWorkspaceKeys = apiKeysData?.workspaceKeys || []
   const apiKeyPersonalKeys = apiKeysData?.personalKeys || []
@@ -149,7 +163,7 @@ export function DeployModal({
     data: deploymentInfoData,
     isLoading: isLoadingDeploymentInfo,
     refetch: refetchDeploymentInfo,
-  } = useDeploymentInfo(workflowId, { enabled: open && isDeployed })
+  } = useDeploymentInfo(workflowId, { enabled: open })
 
   const { data: versionsData, isLoading: versionsLoading } = useDeploymentVersions(workflowId, {
     enabled: open,
@@ -162,7 +176,9 @@ export function DeployModal({
     refetch: refetchChatInfo,
   } = useChatDeploymentInfo(workflowId, { enabled: open })
 
-  const { data: mcpServers = [] } = useWorkflowMcpServers(workflowWorkspaceId || '')
+  const { data: mcpServers = [] } = useWorkflowMcpServers(workflowWorkspaceId || '', {
+    enabled: open,
+  })
   const hasMcpServers = mcpServers.length > 0
 
   const deployMutation = useDeployWorkflow()
@@ -170,34 +186,49 @@ export function DeployModal({
   const activateVersionMutation = useActivateDeploymentVersion()
 
   const versions = versionsData?.versions ?? []
+  const deploymentAttemptStatus = deploymentInfoData?.latestDeploymentAttempt?.status
+  const attemptErrorMessage =
+    deploymentInfoData?.latestDeploymentAttempt?.error?.message ??
+    (deploymentAttemptStatus === 'failed' ? 'Deployment preparation failed' : null)
 
   const isWorkflowStillActive = (targetWorkflowId: string) => {
     return useWorkflowRegistry.getState().activeWorkflowId === targetWorkflowId
   }
 
-  const syncDraftAfterDeploy = async (): Promise<string | null> => {
-    if (!workflowId) return null
+  const syncDraftAfterDeploy = async (): Promise<void> => {
+    if (!workflowId) return
 
     try {
-      const syncedActiveWorkflow = await syncLocalDraftFromServer(workflowId)
-      if (!syncedActiveWorkflow && isWorkflowStillActive(workflowId)) {
-        return 'Deployment succeeded, but local sync is still catching up. Refresh if the status looks stale.'
-      }
-      return null
+      await syncLocalDraftFromServer(workflowId)
     } catch (error) {
-      if (!isWorkflowStillActive(workflowId)) return null
+      if (!isWorkflowStillActive(workflowId)) return
       logger.warn('Workflow deployed, but local draft sync failed', {
         workflowId,
         error: toError(error).message,
       })
-      return 'Deployment succeeded, but local sync failed. Refresh if the status looks stale.'
     }
   }
 
+  /**
+   * Post-activation warnings (dead-lettered or still-queued side effects)
+   * arrive with an `active` attempt, so the Live badge gives no signal —
+   * surface them as a toast. Pending/failed attempts are excluded: the
+   * status badge already covers those.
+   */
+  const toastPostActivationWarnings = (
+    title: string,
+    result: { latestDeploymentAttempt?: { status: string } | null; warnings?: string[] }
+  ) => {
+    if (result.latestDeploymentAttempt?.status !== 'active') return
+    if (!result.warnings?.length) return
+    toast.warning(title, { description: result.warnings.join(' ') })
+  }
+
   useEffect(() => {
-    deployActionIdRef.current += 1
-    setIsFinalizingDeploy(false)
-    setUndeployTargetWorkflowId(null)
+    return () => {
+      deployActionIdRef.current += 1
+      if (workflowId) releaseDeployAction(workflowId)
+    }
   }, [workflowId])
 
   const getApiKeyLabel = (value?: string | null) => {
@@ -211,7 +242,21 @@ export function DeployModal({
     workflowWorkspaceId ? 'YOUR_WORKSPACE_API_KEY' : 'YOUR_PERSONAL_API_KEY'
 
   const getInputFormatExample = (includeStreaming = false) => {
-    return getInputFormatExampleUtil(includeStreaming, selectedStreamingOutputs)
+    const inputFormatExample = getInputFormatExampleUtil(includeStreaming, selectedStreamingOutputs)
+    if (!inputFormatExample) return ''
+
+    const match = inputFormatExample.match(/-d\s*'([\s\S]*)'/)
+    if (!match) {
+      throw new Error(`Invalid workflow input example: ${inputFormatExample}`)
+    }
+
+    const legacyBody = JSON.parse(match[1]) as Record<string, unknown>
+    const { stream, selectedOutputs, ...input } = legacyBody
+    return ` -d '${JSON.stringify({
+      input,
+      ...(stream === true ? { stream: true } : {}),
+      ...(Array.isArray(selectedOutputs) ? { selectedOutputs } : {}),
+    })}'`
   }
 
   const deploymentInfo: WorkflowDeploymentInfoUI | null = (() => {
@@ -219,7 +264,7 @@ export function DeployModal({
       return null
     }
 
-    const endpoint = `${getBaseUrl()}/api/workflows/${workflowId}/execute`
+    const endpoint = `${getBaseUrl()}/api/v2/workflows/${workflowId}/execute`
     const inputFormatExample = getInputFormatExample(selectedStreamingOutputs.length > 0)
     const placeholderKey = getApiHeaderPlaceholder()
 
@@ -238,34 +283,33 @@ export function DeployModal({
   selectedStreamingOutputsRef.current = selectedStreamingOutputs
 
   useEffect(() => {
-    if (open && workflowId) {
-      setActiveTab('general')
-      setDeployError(null)
-      setDeployWarnings([])
-      setChatSuccess(false)
+    if (!open || !workflowId) return
 
-      const currentOutputs = selectedStreamingOutputsRef.current
-      if (currentOutputs.length > 0) {
-        const blocks = Object.values(useWorkflowStore.getState().blocks)
-        const validOutputs = currentOutputs.filter((outputId) => {
-          if (startsWithUuid(outputId)) {
-            const underscoreIndex = outputId.indexOf('_')
-            if (underscoreIndex === -1) return false
-            const blockId = outputId.substring(0, underscoreIndex)
-            return blocks.some((b) => b.id === blockId)
-          }
-          const parts = outputId.split('.')
-          if (parts.length >= 2) {
-            const blockName = parts[0]
-            return blocks.some((b) => b.name && normalizeName(b.name) === blockName.toLowerCase())
-          }
-          return true
-        })
-        if (validOutputs.length !== currentOutputs.length) {
-          setSelectedStreamingOutputs(validOutputs)
+    setDeployError(null)
+    setChatSuccess(false)
+
+    const currentOutputs = selectedStreamingOutputsRef.current
+    if (currentOutputs.length > 0) {
+      const blocks = Object.values(useWorkflowStore.getState().blocks)
+      const validOutputs = currentOutputs.filter((outputId) => {
+        if (startsWithUuid(outputId)) {
+          const underscoreIndex = outputId.indexOf('_')
+          if (underscoreIndex === -1) return false
+          const blockId = outputId.substring(0, underscoreIndex)
+          return blocks.some((b) => b.id === blockId)
         }
+        const parts = outputId.split('.')
+        if (parts.length >= 2) {
+          const blockName = parts[0]
+          return blocks.some((b) => b.name && normalizeName(b.name) === blockName.toLowerCase())
+        }
+        return true
+      })
+      if (validOutputs.length !== currentOutputs.length) {
+        setSelectedStreamingOutputs(validOutputs)
       }
     }
+
     return () => {
       if (chatSuccessTimeoutRef.current) {
         clearTimeout(chatSuccessTimeoutRef.current)
@@ -297,7 +341,6 @@ export function DeployModal({
     deployActionIdRef.current = actionId
     setIsFinalizingDeploy(true)
     setDeployError(null)
-    setDeployWarnings([])
 
     try {
       if (!(await deployReadiness.waitUntilReady())) {
@@ -309,9 +352,12 @@ export function DeployModal({
 
       try {
         const result = await deployMutation.mutateAsync({ workflowId })
-        const syncWarning = await syncDraftAfterDeploy()
-        if (!isWorkflowStillActive(workflowId) || deployActionIdRef.current !== actionId) return
-        setDeployWarnings([...(result.warnings || []), ...(syncWarning ? [syncWarning] : [])])
+        if (result.latestDeploymentAttempt?.status === 'active') {
+          await syncDraftAfterDeploy()
+        }
+        if (isWorkflowStillActive(workflowId)) {
+          toastPostActivationWarnings('Workflow deployed', result)
+        }
       } finally {
         if (deployActionIdRef.current === actionId) {
           setIsFinalizingDeploy(false)
@@ -337,18 +383,17 @@ export function DeployModal({
 
     activateVersionInFlightRef.current = true
     setIsActivatingVersion(true)
-    setDeployWarnings([])
+    setDeployError(null)
 
     try {
       const result = await activateVersionMutation.mutateAsync({ workflowId, version })
-      if (!isWorkflowStillActive(workflowId)) return
-      if (result.warnings && result.warnings.length > 0) {
-        setDeployWarnings(result.warnings)
+      if (isWorkflowStillActive(workflowId)) {
+        toastPostActivationWarnings(`Promoted v${version} to live`, result)
       }
     } catch (error) {
       if (!isWorkflowStillActive(workflowId)) return
       logger.error('Error promoting version:', { error })
-      throw error
+      setDeployError(toError(error).message || `Failed to promote v${version} to live`)
     } finally {
       activateVersionInFlightRef.current = false
       setIsActivatingVersion(false)
@@ -363,20 +408,23 @@ export function DeployModal({
       return
     }
 
-    setDeployWarnings([])
-
     try {
       const result = await undeployMutation.mutateAsync({ workflowId: targetWorkflowId })
       if (!isWorkflowStillActive(targetWorkflowId)) return
       setUndeployTargetWorkflowId(null)
-      if (result.warnings && result.warnings.length > 0) {
-        setDeployWarnings(result.warnings)
-        return
-      }
       onOpenChange(false)
+      /**
+       * Partial cleanup warnings (e.g. external subscription teardown left to
+       * background retries) surface as a toast so closing the modal does not
+       * silently swallow them.
+       */
+      if (result.warnings?.length) {
+        toast.warning('Workflow undeployed', { description: result.warnings.join(' ') })
+      }
     } catch (error: unknown) {
       if (!isWorkflowStillActive(targetWorkflowId)) return
       logger.error('Error undeploying workflow:', { error })
+      toast.error('Failed to undeploy workflow', { description: toError(error).message })
     }
   }
 
@@ -388,7 +436,6 @@ export function DeployModal({
     deployActionIdRef.current = actionId
     setIsFinalizingDeploy(true)
     setDeployError(null)
-    setDeployWarnings([])
 
     try {
       if (!(await deployReadiness.waitUntilReady())) {
@@ -414,9 +461,12 @@ export function DeployModal({
 
       try {
         const result = await deployMutation.mutateAsync({ workflowId })
-        const syncWarning = await syncDraftAfterDeploy()
-        if (!isWorkflowStillActive(workflowId) || deployActionIdRef.current !== actionId) return
-        setDeployWarnings([...(result.warnings || []), ...(syncWarning ? [syncWarning] : [])])
+        if (result.latestDeploymentAttempt?.status === 'active') {
+          await syncDraftAfterDeploy()
+        }
+        if (isWorkflowStillActive(workflowId)) {
+          toastPostActivationWarnings('Workflow redeployed', result)
+        }
       } finally {
         if (deployActionIdRef.current === actionId) {
           setIsFinalizingDeploy(false)
@@ -440,9 +490,15 @@ export function DeployModal({
     deployActionIdRef.current += 1
     setIsFinalizingDeploy(false)
     if (workflowId) releaseDeployAction(workflowId)
+    setActiveTab('general')
     setChatSubmitting(false)
+    setIsChatFormValid(false)
+    setChatSuccess(false)
+    setMcpToolSubmitting(false)
+    setMcpToolCanSave(false)
+    setMcpToolSaveDisabledReason(null)
+    setMcpActiveServerId(null)
     setDeployError(null)
-    setDeployWarnings([])
     onOpenChange(false)
   }
 
@@ -462,11 +518,6 @@ export function DeployModal({
     await refetchChatInfo()
   }
 
-  const handleChatFormSubmit = () => {
-    const form = document.getElementById('chat-deploy-form') as HTMLFormElement
-    form?.requestSubmit()
-  }
-
   const handleChatDelete = () => {
     const form = document.getElementById('chat-deploy-form') as HTMLFormElement
     if (form) {
@@ -477,230 +528,187 @@ export function DeployModal({
     }
   }
 
-  const handleMcpToolFormSubmit = () => {
-    const form = document.getElementById('mcp-deploy-form') as HTMLFormElement
-    form?.requestSubmit()
-  }
-
   const isSubmitting = deployMutation.isPending || isFinalizingDeploy
   const isUndeploying = undeployMutation.isPending
+  const chatActionLabel = chatSuccess
+    ? chatExists
+      ? 'Updated'
+      : 'Launched'
+    : chatSubmitting
+      ? chatExists
+        ? 'Updating...'
+        : 'Launching...'
+      : chatExists
+        ? 'Update'
+        : 'Launch Chat'
 
   return (
     <>
-      <Modal open={open} onOpenChange={handleCloseModal}>
-        <ModalContent size='lg' className='h-[76vh]'>
-          <ModalHeader>Workflow Deployment</ModalHeader>
+      <ChipModal
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) handleCloseModal()
+        }}
+        srTitle='Workflow Deployment'
+        aria-describedby={descriptionId}
+        size='lg'
+        className='h-[76vh] [&>div]:h-full'
+      >
+        <ChipModalHeader onClose={handleCloseModal}>Workflow Deployment</ChipModalHeader>
 
-          <ModalTabs
+        <ChipModalBody>
+          <p id={descriptionId} className='sr-only'>
+            Configure and manage workflow deployment settings including API, MCP, and chat options.
+          </p>
+          <ChipModalTabs
+            tabs={visibleTabs}
             value={activeTab}
-            onValueChange={(value) => setActiveTab(value as TabView)}
-            className='flex min-h-0 flex-1 flex-col'
-          >
-            <ModalTabsList activeValue={activeTab}>
-              <ModalTabsTrigger value='general'>General</ModalTabsTrigger>
-              {!permissionConfig.hideDeployApi && (
-                <ModalTabsTrigger value='api'>API</ModalTabsTrigger>
-              )}
-              {!permissionConfig.hideDeployMcp && (
-                <ModalTabsTrigger value='mcp'>MCP</ModalTabsTrigger>
-              )}
-              {!permissionConfig.hideDeployChatbot && (
-                <ModalTabsTrigger value='chat'>Chat</ModalTabsTrigger>
-              )}
-            </ModalTabsList>
-
-            <ModalBody className='min-h-0 flex-1'>
-              <ModalDescription className='sr-only'>
-                Configure and manage workflow deployment settings including API, MCP, and chat
-                options.
-              </ModalDescription>
-              {(deployError || deployWarnings.length > 0) && (
-                <div className='mb-3 flex flex-col gap-2'>
-                  {deployError && (
-                    <Badge variant='red' size='lg' dot className='max-w-full truncate'>
-                      {deployError}
-                    </Badge>
-                  )}
-                  {deployWarnings.map((warning) => (
-                    <Badge
-                      key={warning}
-                      variant='amber'
-                      size='lg'
-                      dot
-                      className='max-w-full truncate'
-                    >
-                      {warning}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-              <ModalTabsContent value='general'>
-                <GeneralDeploy
-                  workflowId={workflowId}
-                  deployedState={deployedState}
-                  isLoadingDeployedState={isLoadingDeployedState}
-                  versions={versions}
-                  versionsLoading={versionsLoading}
-                  isPromotingVersion={isActivatingVersion || activateVersionMutation.isPending}
-                  deployReadiness={deployReadiness}
-                  onPromoteToLive={handlePromoteToLive}
-                  onLoadDeploymentComplete={handleCloseModal}
-                  onLoadDeploymentBlocked={setDeployError}
-                />
-              </ModalTabsContent>
-
-              <ModalTabsContent value='api' className='h-full'>
-                <ApiDeploy
-                  workflowId={workflowId}
-                  deploymentInfo={deploymentInfo}
-                  isLoading={isLoadingDeploymentInfo}
-                  needsRedeployment={needsRedeployment}
-                  getInputFormatExample={getInputFormatExample}
-                  selectedStreamingOutputs={selectedStreamingOutputs}
-                  onSelectedStreamingOutputsChange={setSelectedStreamingOutputs}
-                />
-              </ModalTabsContent>
-
-              <ModalTabsContent value='chat'>
-                <ChatDeploy
-                  workflowId={workflowId || ''}
-                  deploymentInfo={deploymentInfo}
-                  existingChat={existingChat as ExistingChat | null}
-                  isLoadingChat={isLoadingChat}
-                  onRefetchChat={handleRefetchChat}
-                  chatSubmitting={chatSubmitting}
-                  setChatSubmitting={setChatSubmitting}
-                  onValidationChange={setIsChatFormValid}
-                  onDeploymentComplete={handleCloseModal}
-                  onDeployed={handleChatDeployed}
-                  onVersionActivated={() => {}}
-                />
-              </ModalTabsContent>
-
-              <ModalTabsContent value='mcp' className='h-full'>
-                {workflowId && (
-                  <McpDeploy
-                    workflowId={workflowId}
-                    workflowName={workflowMetadata?.name || 'Workflow'}
-                    workflowDescription={workflowMetadata?.description}
-                    isDeployed={isDeployed}
-                    deployedState={deployedState}
-                    isLoadingDeployedState={isLoadingDeployedState}
-                    onSubmittingChange={setMcpToolSubmitting}
-                    onCanSaveChange={setMcpToolCanSave}
-                    onSaveDisabledReasonChange={setMcpToolSaveDisabledReason}
-                    onActiveServerChange={setMcpActiveServerId}
-                  />
-                )}
-              </ModalTabsContent>
-            </ModalBody>
-          </ModalTabs>
-
+            onChange={(value) => {
+              if (isDeployModalTab(value)) setActiveTab(value)
+            }}
+            aria-label='Deployment settings'
+          />
+          {deployError && (
+            <div role='alert'>
+              <Badge variant='red' size='lg' dot className='max-w-full truncate'>
+                {deployError}
+              </Badge>
+            </div>
+          )}
           {activeTab === 'general' && (
-            <GeneralFooter
-              isDeployed={isDeployed}
-              needsRedeployment={needsRedeployment}
-              isSubmitting={isSubmitting}
-              isUndeploying={isUndeploying}
+            <GeneralDeploy
+              workflowId={workflowId}
+              deployedState={deployedState}
+              isLoadingDeployedState={isLoadingDeployedState}
+              isAwaitingSnapshot={isAwaitingSnapshot}
+              versions={versions}
+              versionsLoading={versionsLoading}
+              isPromotingVersion={isActivatingVersion || activateVersionMutation.isPending}
               deployReadiness={deployReadiness}
-              isDeploymentSettling={isDeploymentSettling}
-              onDeploy={onDeploy}
-              onRedeploy={handleRedeploy}
-              onUndeploy={() => {
-                if (workflowId) setUndeployTargetWorkflowId(workflowId)
-              }}
+              onPromoteToLive={handlePromoteToLive}
+              onLoadDeploymentComplete={handleCloseModal}
+              onLoadDeploymentBlocked={setDeployError}
             />
           )}
           {activeTab === 'api' && (
-            <ModalFooter className='items-center justify-between'>
-              <div />
-              <div className='flex items-center gap-2'>
-                <Button variant='default' onClick={() => setIsApiInfoModalOpen(true)}>
-                  Edit API Info
-                </Button>
-                <Button
-                  variant='tertiary'
-                  onClick={() => setIsCreateKeyModalOpen(true)}
-                  disabled={createButtonDisabled}
-                >
-                  Generate API Key
-                </Button>
-              </div>
-            </ModalFooter>
+            <ApiDeploy
+              workflowId={workflowId}
+              deploymentInfo={deploymentInfo}
+              isLoading={isLoadingDeploymentInfo}
+              needsRedeployment={needsRedeployment}
+              getInputFormatExample={getInputFormatExample}
+              selectedStreamingOutputs={selectedStreamingOutputs}
+              onSelectedStreamingOutputsChange={setSelectedStreamingOutputs}
+            />
           )}
           {activeTab === 'chat' && (
-            <ModalFooter className='items-center justify-between'>
-              <div />
-              <div className='flex items-center gap-2'>
-                {chatExists && (
-                  <Button
-                    type='button'
-                    variant='default'
-                    onClick={handleChatDelete}
-                    disabled={chatSubmitting}
-                  >
-                    Delete
-                  </Button>
-                )}
-                <Button
-                  type='button'
-                  variant='tertiary'
-                  onClick={handleChatFormSubmit}
-                  disabled={chatSubmitting || !isChatFormValid}
-                >
-                  {chatSuccess
-                    ? chatExists
-                      ? 'Updated'
-                      : 'Launched'
-                    : chatSubmitting
-                      ? chatExists
-                        ? 'Updating...'
-                        : 'Launching...'
-                      : chatExists
-                        ? 'Update'
-                        : 'Launch Chat'}
-                </Button>
-              </div>
-            </ModalFooter>
+            <ChatDeploy
+              workflowId={workflowId || ''}
+              deploymentInfo={deploymentInfo}
+              existingChat={existingChat as ExistingChat | null}
+              isLoadingChat={isLoadingChat}
+              onRefetchChat={handleRefetchChat}
+              chatSubmitting={chatSubmitting}
+              setChatSubmitting={setChatSubmitting}
+              canRevealPassword={userPermissions.canAdmin}
+              onValidationChange={setIsChatFormValid}
+              onDeploymentComplete={handleCloseModal}
+              onDeployed={handleChatDeployed}
+              onVersionActivated={() => {}}
+            />
           )}
-          {activeTab === 'mcp' && isDeployed && hasMcpServers && (
-            <ModalFooter className='items-center justify-between'>
-              <div />
-              <div className='flex items-center gap-2'>
-                <Button
-                  type='button'
-                  variant='default'
-                  onClick={() =>
-                    navigateToSettings({
-                      section: 'workflow-mcp-servers',
-                      mcpServerId: mcpActiveServerId ?? undefined,
-                    })
+          {activeTab === 'mcp' && workflowId && (
+            <McpDeploy
+              workflowId={workflowId}
+              workflowName={workflowMetadata?.name || 'Workflow'}
+              workflowDescription={workflowMetadata?.description}
+              isDeployed={isDeployed}
+              deployedState={deployedState}
+              isLoadingDeployedState={isLoadingDeployedState}
+              onSubmittingChange={setMcpToolSubmitting}
+              onCanSaveChange={setMcpToolCanSave}
+              onSaveDisabledReasonChange={setMcpToolSaveDisabledReason}
+              onActiveServerChange={setMcpActiveServerId}
+            />
+          )}
+        </ChipModalBody>
+
+        {activeTab === 'general' && (
+          <GeneralFooter
+            isDeployed={isDeployed}
+            needsRedeployment={needsRedeployment}
+            isSubmitting={isSubmitting}
+            isUndeploying={isUndeploying}
+            deployReadiness={deployReadiness}
+            isDeploymentSettling={isDeploymentSettling}
+            attemptStatus={deploymentAttemptStatus}
+            attemptErrorMessage={attemptErrorMessage}
+            onDeploy={onDeploy}
+            onRedeploy={handleRedeploy}
+            onUndeploy={() => {
+              if (workflowId) setUndeployTargetWorkflowId(workflowId)
+            }}
+          />
+        )}
+        {activeTab === 'api' && (
+          <ChipModalFooter
+            onCancel={handleCloseModal}
+            hideCancel
+            defaultAction='none'
+            primaryAdjacentAction={{
+              label: 'Edit API Info',
+              onClick: () => setIsApiInfoModalOpen(true),
+            }}
+            primaryAction={{
+              label: 'Generate API Key',
+              onClick: () => setIsCreateKeyModalOpen(true),
+              disabled: createButtonDisabled,
+            }}
+          />
+        )}
+        {activeTab === 'chat' && (
+          <ChipModalFooter
+            onCancel={handleCloseModal}
+            hideCancel
+            primaryAdjacentAction={
+              chatExists
+                ? {
+                    label: 'Delete',
+                    onClick: handleChatDelete,
+                    disabled: chatSubmitting,
                   }
-                >
-                  Manage
-                </Button>
-                <Tooltip.Root>
-                  <Tooltip.Trigger asChild>
-                    <span>
-                      <Button
-                        type='button'
-                        variant='tertiary'
-                        onClick={handleMcpToolFormSubmit}
-                        disabled={mcpToolSubmitting || !mcpToolCanSave}
-                      >
-                        {mcpToolSubmitting ? 'Saving...' : 'Save Tool'}
-                      </Button>
-                    </span>
-                  </Tooltip.Trigger>
-                  {mcpToolSaveDisabledReason && (
-                    <Tooltip.Content>{mcpToolSaveDisabledReason}</Tooltip.Content>
-                  )}
-                </Tooltip.Root>
-              </div>
-            </ModalFooter>
-          )}
-        </ModalContent>
-      </Modal>
+                : undefined
+            }
+            primaryAction={{
+              label: chatActionLabel,
+              type: 'submit',
+              form: 'chat-deploy-form',
+              disabled: chatSubmitting || !isChatFormValid,
+            }}
+          />
+        )}
+        {activeTab === 'mcp' && isDeployed && hasMcpServers && (
+          <ChipModalFooter
+            onCancel={handleCloseModal}
+            hideCancel
+            primaryAdjacentAction={{
+              label: 'Manage',
+              onClick: () =>
+                navigateToSettings({
+                  section: 'workflow-mcp-servers',
+                  mcpServerId: mcpActiveServerId ?? undefined,
+                }),
+            }}
+            primaryAction={{
+              label: mcpToolSubmitting ? 'Saving...' : 'Save Tool',
+              type: 'submit',
+              form: 'mcp-deploy-form',
+              disabled: mcpToolSubmitting || !mcpToolCanSave,
+              disabledTooltip: mcpToolSaveDisabledReason ?? undefined,
+            }}
+          />
+        )}
+      </ChipModal>
 
       <ChipConfirmModal
         open={Boolean(undeployTargetWorkflowId)}
@@ -746,15 +754,77 @@ export function DeployModal({
   )
 }
 
+type DeploymentAttemptStatus = DeploymentOperationSummary['status']
+
 interface StatusBadgeProps {
-  isWarning: boolean
+  isDeployed: boolean
+  needsRedeployment: boolean
+  attemptStatus?: DeploymentAttemptStatus
+  attemptErrorMessage?: string | null
 }
 
-function StatusBadge({ isWarning }: StatusBadgeProps) {
-  const label = isWarning ? 'Update deployment' : 'Live'
+/**
+ * Lifecycle-aware deployment status badge. Pending attempts render amber
+ * (labelled Retrying once an attempt has recorded a transient error), failed
+ * attempts render red with the failure reason in a tooltip, and a settled
+ * live deployment falls back to the Live/Update states.
+ */
+function StatusBadge({
+  isDeployed,
+  needsRedeployment,
+  attemptStatus,
+  attemptErrorMessage,
+}: StatusBadgeProps) {
+  if (attemptStatus === 'preparing' || attemptStatus === 'activating') {
+    const isRetrying = Boolean(attemptErrorMessage)
+    return (
+      <Tooltip.Root>
+        <Tooltip.Trigger asChild>
+          <Badge variant='amber' size='lg' dot className='cursor-default'>
+            {isRetrying ? 'Retrying' : 'Pending'}
+          </Badge>
+        </Tooltip.Trigger>
+        <Tooltip.Content side='top' className='max-w-[320px]'>
+          {isRetrying && <p className='text-caption'>{attemptErrorMessage}</p>}
+          <p className='text-caption'>
+            {isRetrying
+              ? isDeployed
+                ? 'Retrying automatically. The current version stays live until cutover completes.'
+                : 'Retrying automatically. The workflow goes live once activation completes.'
+              : isDeployed
+                ? 'A new version is being prepared. The current version stays live until cutover completes.'
+                : 'Triggers and schedules are being registered. The workflow goes live once activation completes.'}
+          </p>
+        </Tooltip.Content>
+      </Tooltip.Root>
+    )
+  }
+
+  if (attemptStatus === 'failed') {
+    return (
+      <Tooltip.Root>
+        <Tooltip.Trigger asChild>
+          <Badge variant='red' size='lg' dot className='cursor-default'>
+            Failed
+          </Badge>
+        </Tooltip.Trigger>
+        <Tooltip.Content side='top' className='max-w-[320px]'>
+          <p className='text-caption'>{attemptErrorMessage || 'Deployment preparation failed.'}</p>
+          <p className='text-caption'>
+            {isDeployed
+              ? 'The previously deployed version is still live.'
+              : 'The workflow remains undeployed.'}
+          </p>
+        </Tooltip.Content>
+      </Tooltip.Root>
+    )
+  }
+
+  if (!isDeployed) return null
+
   return (
-    <Badge variant={isWarning ? 'amber' : 'green'} size='lg' dot>
-      {label}
+    <Badge variant={needsRedeployment ? 'amber' : 'green'} size='lg' dot>
+      {needsRedeployment ? 'Update deployment' : 'Live'}
     </Badge>
   )
 }
@@ -766,6 +836,8 @@ interface GeneralFooterProps {
   isUndeploying: boolean
   deployReadiness: DeployReadiness
   isDeploymentSettling: boolean
+  attemptStatus?: DeploymentAttemptStatus
+  attemptErrorMessage?: string | null
   onDeploy: () => Promise<void>
   onRedeploy: () => Promise<void>
   onUndeploy: () => void
@@ -778,6 +850,8 @@ function GeneralFooter({
   isUndeploying,
   deployReadiness,
   isDeploymentSettling,
+  attemptStatus,
+  attemptErrorMessage,
   onDeploy,
   onRedeploy,
   onUndeploy,
@@ -788,41 +862,70 @@ function GeneralFooter({
     deployReadiness.isBlocked && !deployReadiness.isSyncing && !isSubmitting && !isUndeploying
       ? deployReadiness.tooltip
       : null
+  const status = (
+    <div className='flex min-w-0 flex-col gap-1'>
+      <StatusBadge
+        isDeployed={Boolean(isDeployed)}
+        needsRedeployment={needsRedeployment}
+        attemptStatus={attemptStatus}
+        attemptErrorMessage={attemptErrorMessage}
+      />
+      {blockedMessage && (
+        <div
+          className='max-w-[300px] truncate text-[var(--text-muted)] text-xs'
+          title={blockedMessage}
+        >
+          {blockedMessage}
+        </div>
+      )}
+    </div>
+  )
   const deployActionLoading = isSubmitting || isDeploymentSettling
+  const deployLoader = deployActionLoading ? (
+    <Loader className={cn(chipContentIconClass, 'text-current')} animate />
+  ) : null
 
   if (!isDeployed) {
     return (
-      <ModalFooter className='items-center justify-between'>
-        <div className='max-w-[260px] text-[var(--text-muted)] text-xs'>{blockedMessage}</div>
-        <div className='flex items-center gap-2'>
-          <Button variant='tertiary' onClick={onDeploy} disabled={isDeployBlocked}>
-            {deployActionLoading && <Loader className='mr-1.5 size-3.5' animate />}
-            Deploy
-          </Button>
-        </div>
-      </ModalFooter>
+      <ChipModalFooter
+        hideCancel
+        leadingContent={status}
+        primaryAction={{
+          label: 'Deploy',
+          onClick: onDeploy,
+          disabled: isDeployBlocked,
+          leftAdornment: deployLoader,
+        }}
+      />
     )
   }
 
-  return (
-    <ModalFooter className='items-center justify-between'>
-      <div className='flex min-w-0 flex-col gap-1'>
-        <StatusBadge isWarning={needsRedeployment} />
-        {blockedMessage && (
-          <div className='max-w-[300px] text-[var(--text-muted)] text-xs'>{blockedMessage}</div>
-        )}
-      </div>
-      <div className='flex items-center gap-2'>
-        <Button variant='default' onClick={onUndeploy} disabled={isUndeploying || isSubmitting}>
-          {isUndeploying ? 'Undeploying...' : 'Undeploy'}
-        </Button>
-        {(needsRedeployment || isDeploymentSettling) && (
-          <Button variant='tertiary' onClick={onRedeploy} disabled={isDeployBlocked}>
-            {deployActionLoading && <Loader className='mr-1.5 size-3.5' animate />}
-            Update
-          </Button>
-        )}
-      </div>
-    </ModalFooter>
+  const hasUpdateAction = needsRedeployment || isDeploymentSettling
+
+  const undeployAction = {
+    label: isUndeploying ? 'Undeploying...' : 'Undeploy',
+    onClick: onUndeploy,
+    disabled: isUndeploying || isSubmitting,
+  }
+
+  return hasUpdateAction ? (
+    <ChipModalFooter
+      hideCancel
+      leadingContent={status}
+      primaryAdjacentAction={undeployAction}
+      primaryAction={{
+        label: 'Update',
+        onClick: onRedeploy,
+        disabled: isDeployBlocked,
+        leftAdornment: deployLoader,
+      }}
+    />
+  ) : (
+    <ChipModalFooter
+      hideCancel
+      defaultAction='none'
+      leadingContent={status}
+      primaryAdjacentAction={undeployAction}
+    />
   )
 }

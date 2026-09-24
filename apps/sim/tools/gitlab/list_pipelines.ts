@@ -7,6 +7,7 @@ export const gitlabListPipelinesTool: ToolConfig<
   GitLabListPipelinesResponse
 > = {
   id: 'gitlab_list_pipelines',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab List Pipelines',
   description: 'List pipelines in a GitLab project',
   version: '1.0.0',
@@ -28,7 +29,7 @@ export const gitlabListPipelinesTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     ref: {
       type: 'string',
@@ -41,7 +42,7 @@ export const gitlabListPipelinesTool: ToolConfig<
       required: false,
       visibility: 'user-or-llm',
       description:
-        'Filter by status (created, waiting_for_resource, preparing, pending, running, success, failed, canceled, skipped, manual, scheduled)',
+        'Filter by status (created, waiting_for_resource, preparing, pending, running, success, failed, canceling, canceled, skipped, manual, scheduled, waiting_for_callback)',
     },
     orderBy: {
       type: 'string',

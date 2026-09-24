@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { createFileResponse, extractFilename, findLocalFile } from '@/app/api/files/utils'
+import {
+  createConditionalFileResponse,
+  createFileResponse,
+  encodeFilenameForHeader,
+  extractFilename,
+  findLocalFile,
+} from '@/app/api/files/utils'
 
 describe('extractFilename', () => {
   describe('legitimate file paths', () => {
@@ -173,6 +179,35 @@ describe('extractFilename', () => {
         expect(response.headers.get('Content-Security-Policy')).toBeNull()
       })
 
+      it('appends the content-type extension to an extensionless download name', () => {
+        const response = createFileResponse({
+          buffer: Buffer.from('fake-image-data'),
+          contentType: 'image/png',
+          filename: 'navbar_2',
+        })
+        expect(response.headers.get('Content-Disposition')).toBe('inline; filename="navbar_2.png"')
+      })
+
+      it('defaults to a PRIVATE cache so access-verified content is never shared-cached', () => {
+        const response = createFileResponse({
+          buffer: Buffer.from('fake-image-data'),
+          contentType: 'image/png',
+          filename: 'safe-image.png',
+        })
+        // No explicit cacheControl → must NOT be `public` (a shared cache/CDN could re-serve authed bytes).
+        expect(response.headers.get('Cache-Control')).toBe('private, no-cache')
+      })
+
+      it('honors an explicit cacheControl (e.g. public assets opt in)', () => {
+        const response = createFileResponse({
+          buffer: Buffer.from('fake-image-data'),
+          contentType: 'image/png',
+          filename: 'avatar.png',
+          cacheControl: 'public, max-age=31536000',
+        })
+        expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000')
+      })
+
       it('should serve PDFs inline safely', () => {
         const response = createFileResponse({
           buffer: Buffer.from('fake-pdf-data'),
@@ -297,6 +332,62 @@ describe('extractFilename', () => {
       })
     })
 
+    /**
+     * `originalName` is attacker-controlled — it only rejects path separators — so a
+     * quote can reach the header and close the quoted parameter early. RFC 6266 tells
+     * clients to prefer `filename*`, so an injected one decides the name the file
+     * lands under on disk regardless of what the product UI displayed.
+     */
+    describe('encodeFilenameForHeader parameter injection', () => {
+      it('neutralizes a quote that would close the quoted filename parameter', () => {
+        expect(encodeFilenameForHeader(`report.pdf"; filename*=UTF-8''invoice.html`)).toBe(
+          `filename="report.pdf__ filename*=UTF-8''invoice.html"; filename*=UTF-8''report.pdf%22%3B%20filename%2A%3DUTF-8%27%27invoice.html`
+        )
+      })
+
+      it('neutralizes the same injection on the non-ascii branch', () => {
+        expect(encodeFilenameForHeader(`repört.pdf"; filename*=UTF-8''invoice.html`)).toBe(
+          `filename="rep_rt.pdf__ filename*=UTF-8''invoice.html"; filename*=UTF-8''rep%C3%B6rt.pdf%22%3B%20filename%2A%3DUTF-8%27%27invoice.html`
+        )
+      })
+
+      it('emits exactly one filename* parameter, holding the real name', () => {
+        const name = `report.pdf"; filename*=UTF-8''invoice.html`
+        const header = encodeFilenameForHeader(name)
+        // Strip the quoted value: text inside it is inert, so only what follows counts.
+        const parameters = `${header.slice(0, header.indexOf('filename="'))}${header.slice(header.lastIndexOf('"') + 1)}`
+        expect(parameters.match(/filename\*=/g)).toHaveLength(1)
+        // The one surviving filename* is the real name, not the injected one.
+        expect(decodeURIComponent(parameters.split(`filename*=UTF-8''`)[1])).toBe(name)
+      })
+
+      it('percent-encodes an apostrophe so it cannot desync the ext-value delimiter', () => {
+        const header = encodeFilenameForHeader("it's a café.pdf")
+        expect(header.split(`filename*=UTF-8''`)[1]).toBe('it%27s%20a%20caf%C3%A9.pdf')
+      })
+
+      it('encodes control characters that would otherwise be an invalid header value', () => {
+        const header = encodeFilenameForHeader('report\r\nX-Injected: 1.pdf')
+        expect(header).toBe(
+          `filename="report__X-Injected: 1.pdf"; filename*=UTF-8''report%0D%0AX-Injected%3A%201.pdf`
+        )
+        expect(
+          () =>
+            new Response('data', { headers: { 'Content-Disposition': `attachment; ${header}` } })
+        ).not.toThrow()
+      })
+
+      it('leaves an ordinary ascii filename byte-identical', () => {
+        expect(encodeFilenameForHeader('quarterly-report (final).pdf')).toBe(
+          'filename="quarterly-report (final).pdf"'
+        )
+      })
+
+      it('strips the directory prefix before encoding', () => {
+        expect(encodeFilenameForHeader('workspace/abc/report.pdf')).toBe('filename="report.pdf"')
+      })
+    })
+
     describe('Content Security Policy', () => {
       it('should include CSP header only for SVG responses', () => {
         const svgResponse = createFileResponse({
@@ -416,5 +507,63 @@ describe('findLocalFile - Path Traversal Security Tests', () => {
         }
       }
     )
+  })
+})
+
+describe('createConditionalFileResponse', () => {
+  const file = {
+    buffer: Buffer.from('compiled-document-bytes'),
+    contentType: 'application/pdf',
+    filename: 'report.pdf',
+    cacheControl: 'private, no-cache, must-revalidate',
+  }
+
+  function etagOf(ifNoneMatch: string | null = null): string {
+    return createConditionalFileResponse(file, ifNoneMatch).headers.get('ETag') as string
+  }
+
+  it('sends the body with a strong validator when the client holds nothing', () => {
+    const response = createConditionalFileResponse(file, null)
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('ETag')).toMatch(/^"[A-Za-z0-9_-]+"$/)
+    expect(response.headers.get('Cache-Control')).toBe('private, no-cache, must-revalidate')
+  })
+
+  it('answers 304 without a body when the client already holds these bytes', async () => {
+    const response = createConditionalFileResponse(file, etagOf())
+
+    expect(response.status).toBe(304)
+    expect(await response.text()).toBe('')
+    // Repeated so the stored response is refreshed with this request's lifetime.
+    expect(response.headers.get('Cache-Control')).toBe('private, no-cache, must-revalidate')
+  })
+
+  it('sends the body when the client holds a validator for different bytes', () => {
+    const stale = createConditionalFileResponse(
+      { ...file, buffer: Buffer.from('an-earlier-render') },
+      null
+    ).headers.get('ETag') as string
+
+    expect(createConditionalFileResponse(file, stale).status).toBe(200)
+  })
+
+  it('matches weakly, so a cache that stored a weak validator still revalidates', () => {
+    expect(createConditionalFileResponse(file, `W/${etagOf()}`).status).toBe(304)
+  })
+
+  it('matches one entry out of a list, and the wildcard', () => {
+    expect(createConditionalFileResponse(file, `"other", ${etagOf()}`).status).toBe(304)
+    expect(createConditionalFileResponse(file, '*').status).toBe(304)
+  })
+
+  it('gives bytes that differ only in one byte different validators', () => {
+    const a = etagOf()
+    const b = createConditionalFileResponse(
+      { ...file, buffer: Buffer.from('compiled-document-byteS') },
+      null
+    ).headers.get('ETag')
+
+    expect(a).not.toBe(b)
   })
 })

@@ -1,12 +1,12 @@
 import { ConnectIcon } from '@/components/icons'
+import { getModelFallbackSubBlock, MODEL_FALLBACK_INPUTS } from '@/blocks/model-fallbacks'
 import { AuthMode, type BlockConfig } from '@/blocks/types'
 import {
   getModelOptions,
   getProviderCredentialSubBlocks,
+  getSerializedModelProviderId,
   PROVIDER_CREDENTIAL_INPUTS,
 } from '@/blocks/utils'
-import { getBaseModelProviders } from '@/providers/models'
-import type { ProviderId } from '@/providers/types'
 import type { ToolResponse } from '@/tools/types'
 
 interface RouterResponse extends ToolResponse {
@@ -157,6 +157,18 @@ export const RouterBlock: BlockConfig<RouterResponse> = {
   bgColor: '#28C43F',
   icon: ConnectIcon,
   hideFromToolbar: true, // Hide legacy version from toolbar
+  sunset: { status: 'legacy', replacedBy: 'router_v2' },
+  /* The legacy router paints an ordinary card — only `router_v2` renders the
+     branch rows that replace a sentence. */
+  canvasPresentation: {
+    defaultTitle: 'Router',
+    sentences: {
+      default: [
+        { text: 'Route based on', field: 'prompt', core: true },
+        { text: ', using', field: 'model' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'prompt',
@@ -175,6 +187,7 @@ export const RouterBlock: BlockConfig<RouterResponse> = {
       options: getModelOptions,
     },
     ...getProviderCredentialSubBlocks(),
+    getModelFallbackSubBlock(),
     {
       id: 'temperature',
       title: 'Temperature',
@@ -203,23 +216,14 @@ export const RouterBlock: BlockConfig<RouterResponse> = {
       'deepseek_reasoner',
     ],
     config: {
-      tool: (params: Record<string, any>) => {
-        const model = params.model || 'gpt-4o'
-        if (!model) {
-          throw new Error('No model selected')
-        }
-        const tool = getBaseModelProviders()[model as ProviderId]
-        if (!tool) {
-          throw new Error(`Invalid model selected: ${model}`)
-        }
-        return tool
-      },
+      tool: (params: Record<string, any>) => getSerializedModelProviderId(params.model),
     },
   },
   inputs: {
     prompt: { type: 'string', description: 'Routing prompt content' },
     model: { type: 'string', description: 'AI model to use' },
     ...PROVIDER_CREDENTIAL_INPUTS,
+    ...MODEL_FALLBACK_INPUTS,
     temperature: {
       type: 'number',
       description: 'Response randomness level (low for consistent routing)',
@@ -302,6 +306,7 @@ export const RouterV2Block: BlockConfig<RouterV2Response> = {
       options: getModelOptions,
     },
     ...getProviderCredentialSubBlocks(),
+    getModelFallbackSubBlock(),
   ],
   tools: {
     access: [
@@ -313,17 +318,7 @@ export const RouterV2Block: BlockConfig<RouterV2Response> = {
       'deepseek_reasoner',
     ],
     config: {
-      tool: (params: Record<string, any>) => {
-        const model = params.model || 'gpt-4o'
-        if (!model) {
-          throw new Error('No model selected')
-        }
-        const tool = getBaseModelProviders()[model as ProviderId]
-        if (!tool) {
-          throw new Error(`Invalid model selected: ${model}`)
-        }
-        return tool
-      },
+      tool: (params: Record<string, any>) => getSerializedModelProviderId(params.model),
     },
   },
   inputs: {
@@ -331,6 +326,7 @@ export const RouterV2Block: BlockConfig<RouterV2Response> = {
     routes: { type: 'json', description: 'Route definitions with descriptions' },
     model: { type: 'string', description: 'AI model to use' },
     ...PROVIDER_CREDENTIAL_INPUTS,
+    ...MODEL_FALLBACK_INPUTS,
   },
   outputs: {
     context: { type: 'string', description: 'Context used for routing' },

@@ -3,6 +3,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import type { PersistedStreamEventEnvelope } from '@/lib/copilot/request/session/contract'
+import { resolveStreamingToolDisplayTitle } from '@/app/workspace/[workspaceId]/home/hooks/stream/stream-helpers'
 import {
   type AgentNode,
   applyTurnTerminal,
@@ -43,8 +44,31 @@ function build(events: PersistedStreamEventEnvelope[]): TurnModel {
   return m
 }
 
+describe('streaming resource titles', () => {
+  it('includes resource names as soon as they appear in streamed arguments', () => {
+    expect(resolveStreamingToolDisplayTitle('create_workflow', '{"name":"Lead Router"}')).toBe(
+      'Creating Lead Router'
+    )
+    expect(
+      resolveStreamingToolDisplayTitle(
+        'manage_custom_tool',
+        '{"operation":"add","schema":{"function":{"name":"lookupWeather"}}}'
+      )
+    ).toBe('Creating lookupWeather')
+    expect(
+      resolveStreamingToolDisplayTitle(
+        'mv',
+        '{"sources":["workflows/Old%20Name"],"destination":"workflows/New%20Name","toolTitle":"Old Name to New Name"}'
+      )
+    ).toBe('Renaming Old Name to New Name')
+    expect(resolveStreamingToolDisplayTitle('rm', '{"toolTitle":"Old Report.pdf"}')).toBe(
+      'Deleting Old Report.pdf'
+    )
+  })
+})
+
 // A main-agent file delegation: trigger tool (main lane), subagent span, inner
-// workspace_file, span end, delegation result.
+// prepare_file_edit, span end, delegation result.
 function fileDelegationEvents(): PersistedStreamEventEnvelope[] {
   const sub: Scope = {
     lane: 'subagent',
@@ -65,13 +89,13 @@ function fileDelegationEvents(): PersistedStreamEventEnvelope[] {
     env(
       4,
       'tool',
-      { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+      { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
       { lane: 'subagent', spanId: 'S1' }
     ),
     env(
       5,
       'tool',
-      { phase: 'result', toolCallId: 'wf-1', toolName: 'workspace_file', success: true },
+      { phase: 'result', toolCallId: 'wf-1', toolName: 'prepare_file_edit', success: true },
       { lane: 'subagent', spanId: 'S1' }
     ),
     env(
@@ -88,6 +112,107 @@ function blocksByType(blocks: ReturnType<typeof modelToContentBlocks>, type: str
   return blocks.filter((b) => b.type === type)
 }
 
+describe('model-authored tool activities', () => {
+  it.each(['main', 'subagent'] as const)(
+    'keeps %s descriptions stable through completion and snapshot replay',
+    (lane) => {
+      const scope: Scope | undefined =
+        lane === 'subagent'
+          ? { lane, spanId: 'browser-span', parentSpanId: 'main', agentId: 'browser' }
+          : undefined
+      const m = build([
+        env(
+          1,
+          'tool',
+          {
+            phase: 'call',
+            toolCallId: 'activity-call',
+            toolName: 'browser_click',
+            partial: true,
+          },
+          scope
+        ),
+      ])
+      expect(
+        modelToContentBlocks(m).find((b) => b.toolCall)?.toolCall?.activityDescription
+      ).toBeUndefined()
+      reduceEvent(
+        m,
+        env(
+          2,
+          'tool',
+          {
+            phase: 'call',
+            toolCallId: 'activity-call',
+            toolName: 'browser_click',
+            arguments: { ref: 'button-1' },
+            activityDescription: '  Opening  the export menu ',
+          },
+          scope
+        )
+      )
+      reduceEvent(
+        m,
+        env(
+          3,
+          'tool',
+          {
+            phase: 'result',
+            toolCallId: 'activity-call',
+            toolName: 'browser_click',
+            success: true,
+          },
+          scope
+        )
+      )
+      reduceEvent(
+        m,
+        env(
+          4,
+          'tool',
+          {
+            phase: 'call',
+            toolCallId: 'activity-call',
+            toolName: 'browser_click',
+            arguments: { ref: 'button-1' },
+            activityDescription: 'Opening another menu',
+          },
+          scope
+        )
+      )
+      const blocks = modelToContentBlocks(m)
+      const expected = {
+        status: 'success',
+        activityDescription: 'Opening the export menu',
+        displayTitle: 'Opening the export menu',
+        params: { ref: 'button-1' },
+      }
+      expect(blocks.find((b) => b.toolCall)?.toolCall).toMatchObject(expected)
+      const replayed = modelToContentBlocks(contentBlocksToModel(blocks))
+      expect(replayed.find((b) => b.toolCall)?.toolCall).toMatchObject(expected)
+    }
+  )
+
+  it.each([undefined, '', '   ', 12, 'x'.repeat(161)])(
+    'falls back to deterministic wording for invalid metadata %s',
+    (activityDescription) => {
+      const blocks = modelToContentBlocks(
+        build([
+          env(1, 'tool', {
+            phase: 'call',
+            toolCallId: 'fallback-call',
+            toolName: 'run_function',
+            arguments: { title: 'Checking the project setup' },
+            activityDescription,
+          }),
+        ])
+      )
+      expect(blocks[0].toolCall).toMatchObject({ displayTitle: 'Checking the project setup' })
+      expect(blocks[0].toolCall?.activityDescription).toBeUndefined()
+    }
+  )
+})
+
 describe('modelToContentBlocks', () => {
   it('emits main-lane blocks without spanId and subagent-lane blocks with spanId', () => {
     const blocks = modelToContentBlocks(build(fileDelegationEvents()))
@@ -100,7 +225,7 @@ describe('modelToContentBlocks', () => {
     expect(trigger?.toolCall?.status).toBe('success')
 
     const innerTool = blocksByType(blocks, 'tool_call').find(
-      (b) => b.toolCall?.name === 'workspace_file'
+      (b) => b.toolCall?.name === 'prepare_file_edit'
     )
     expect(innerTool?.spanId).toBe('S1')
     expect(innerTool?.toolCall?.calledBy).toBe('file')
@@ -196,7 +321,7 @@ describe('modelToContentBlocks', () => {
         env(
           4,
           'tool',
-          { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+          { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
           { lane: 'subagent', spanId: 'S1' }
         ),
         env(
@@ -209,7 +334,7 @@ describe('modelToContentBlocks', () => {
       ])
     )
     const types = blocks.map((b) => b.type)
-    const innerIdx = blocks.findIndex((b) => b.toolCall?.name === 'workspace_file')
+    const innerIdx = blocks.findIndex((b) => b.toolCall?.name === 'prepare_file_edit')
     const endIdx = types.indexOf('subagent_end')
     const afterIdx = blocks.findIndex((b) => b.type === 'text' && b.content === 'after')
     // subagent_end sits after the inner work and before the trailing main text — no sibling jumps.
@@ -251,7 +376,7 @@ describe('modelToContentBlocks', () => {
       env(
         3,
         'tool',
-        { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+        { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
         { lane: 'subagent', spanId: 'S1' }
       ),
     ])
@@ -285,7 +410,7 @@ describe('modelToContentBlocks', () => {
         env(1, 'tool', {
           phase: 'call',
           toolCallId: 'wf',
-          toolName: 'workspace_file',
+          toolName: 'prepare_file_edit',
           arguments: { operation: 'create', title: 'My Doc' },
         }),
       ])
@@ -298,7 +423,7 @@ describe('modelToContentBlocks', () => {
     const blocks = modelToContentBlocks(build(fileDelegationEvents()))
     const startIdx = blocks.findIndex((b) => b.type === 'subagent')
     const innerIdx = blocks.findIndex(
-      (b) => b.type === 'tool_call' && b.toolCall?.name === 'workspace_file'
+      (b) => b.type === 'tool_call' && b.toolCall?.name === 'prepare_file_edit'
     )
     const endIdx = blocks.findIndex((b) => b.type === 'subagent_end')
     expect(startIdx).toBeGreaterThanOrEqual(0)
@@ -322,6 +447,48 @@ describe('modelToContentBlocks', () => {
     )
     expect(blocksByType(blocks, 'subagent_end')).toHaveLength(0)
     expect(blocksByType(blocks, 'subagent')).toHaveLength(1)
+  })
+
+  it('persists a completed compaction inside its subagent span', () => {
+    const sub: Scope = {
+      lane: 'subagent',
+      spanId: 'S1',
+      parentSpanId: 'main',
+      parentToolCallId: 'tc-workflow',
+      agentId: 'workflow',
+    }
+    const blocks = modelToContentBlocks(
+      build([
+        env(
+          1,
+          'span',
+          {
+            kind: 'subagent',
+            event: 'start',
+            agent: 'workflow',
+            data: { tool_call_id: 'tc-workflow' },
+          },
+          sub
+        ),
+        env(2, 'run', { kind: 'compaction_start' }, sub),
+        env(3, 'run', { kind: 'compaction_done' }, sub),
+      ])
+    )
+
+    const compaction = blocks.find(
+      (block) => block.type === 'tool_call' && block.toolCall?.name === 'context_compaction'
+    )
+    expect(compaction).toEqual(
+      expect.objectContaining({
+        spanId: 'S1',
+        parentSpanId: 'main',
+        toolCall: expect.objectContaining({
+          calledBy: 'workflow',
+          displayTitle: 'Summarizing context',
+          status: 'success',
+        }),
+      })
+    )
   })
 })
 
@@ -359,7 +526,7 @@ describe('contentBlocksToModel round-trip', () => {
       env(
         3,
         'tool',
-        { phase: 'call', toolCallId: 'wf-1', toolName: 'workspace_file' },
+        { phase: 'call', toolCallId: 'wf-1', toolName: 'prepare_file_edit' },
         { lane: 'subagent', spanId: 'S1' }
       ),
     ])

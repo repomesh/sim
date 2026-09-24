@@ -13,8 +13,8 @@ const FEATURE_FLAGS_PROFILE = 'feature-flags'
 
 /**
  * A single flag's gating rule. A flag is ON for a context when ANY clause matches:
- * the global `enabled` default, the org/user allowlists, or `adminEnabled` for
- * platform admins. An absent clause never matches. Shape shared with the other
+ * the global `enabled` default, the workspace/org/user allowlists, or
+ * `adminEnabled` for platform admins. An absent clause never matches. Shape shared with the other
  * AppConfig gating documents via {@link AppConfigGateRule}.
  */
 export type FeatureFlagRule = AppConfigGateRule
@@ -29,22 +29,12 @@ export type FeatureFlagsConfig = Record<string, FeatureFlagRule>
 export type FeatureFlagContext = AppConfigGateContext
 
 /**
- * Registry of known feature flags. Each maps to the secret consulted ONLY when
- * AppConfig is not the source of truth (self-hosted/OSS, local dev, or hosted
- * without APPCONFIG_*). A truthy secret turns the flag on globally.
- *
- * Gating by org/user/admin is available ONLY through the hosted AppConfig document
- * — it deliberately cannot be expressed here, so no environment can grant (e.g.)
- * admin access from a code literal. To add a flag, register its name and the secret
- * to fall back on.
- */
-/**
  * The single definition of a feature flag. Everything about a flag lives in one
  * place: its name (the registry key), a human-readable `description`, and the
  * `fallback` secret consulted when AppConfig isn't the source of truth (truthy ⇒ on
  * globally).
  *
- * Gating by org/user/admin is deliberately NOT part of a definition — it lives only
+ * Gating by workspace/org/user/admin is deliberately NOT part of a definition — it lives only
  * in the hosted AppConfig document, so no environment can grant access from a code
  * literal.
  */
@@ -56,38 +46,17 @@ interface FeatureFlagDefinition {
 
 /** The single registry of known flags. To add a flag, add one entry here. */
 const FEATURE_FLAGS = {
-  'mothership-beta': {
+  'agent-memory-history': {
     description:
-      'Mothership beta plan/changelog artifact surfaces in the copilot VFS and doc compiler. ' +
-      'Note: userId/orgId targeting only works for WorkspaceVfs (resolved in materialize). ' +
-      'getE2BDocFormat, resolveInputFiles, and resolveWorkflowAliasForWorkspace evaluate without ' +
-      'user context — use enabled:true for global rollout rather than per-user targeting.',
-    fallback: 'MOTHERSHIP_BETA_FEATURES',
+      'Capture durable Workflow Agent tool history and continue existing retries. Supports workspace rollout targeting; version-aware memory storage remains active when capture is disabled.',
+    fallback: 'AGENT_MEMORY_HISTORY',
   },
-  'table-snapshot-cache': {
+  'slack-search-shared-app': {
     description:
-      'Mount Sim tables into code sandboxes by reference via a version-keyed CSV snapshot in ' +
-      'object storage (reused across runs until the table mutates) instead of draining the whole ' +
-      'table into web-process heap. resolveInputFiles evaluates without user context — use ' +
-      'enabled:true for global rollout rather than per-user targeting.',
-    fallback: 'TABLE_SNAPSHOT_CACHE',
-  },
-  'pii-redaction': {
-    description:
-      'Redact PII from workflow logs via configurable Data Retention rules (Presidio at the ' +
-      'logger persist choke point) and expose the Data Retention config surfaces. Global on/off ' +
-      'only — evaluated without user/org context so the persist path and config routes always ' +
-      'agree.',
-    fallback: 'PII_REDACTION',
-  },
-  'pii-granular-redaction': {
-    description:
-      'Expose the execution-altering PII redaction stages (redact the workflow input and every ' +
-      'block output in-flight) in the Data Retention config, layered on top of pii-redaction. ' +
-      'Global on/off only — gates the config surfaces (route write + UI). Because stored rules ' +
-      'are the source of truth for the executor, a granular stage can only run once it was ' +
-      'writable, so the executor is never flag-gated at runtime (avoiding a fail-open leak).',
-    fallback: 'PII_GRANULAR_REDACTION',
+      'Enable the official shared Slack app for existing Search customers. Supports orgId ' +
+      'targeting for setup, personal connections, and bot execution. Off-AppConfig falls back ' +
+      'to SLACK_SEARCH_SHARED_APP.',
+    fallback: 'SLACK_SEARCH_SHARED_APP',
   },
   'trigger-eu-region': {
     description:
@@ -96,21 +65,62 @@ const FEATURE_FLAGS = {
       'resolveTriggerRegion, so the whole deployment switches regions together.',
     fallback: 'TRIGGER_EU_REGION',
   },
-  'workspace-forking': {
+  'tables-v2-api': {
     description:
-      'Runtime rollout gate for workspace forking (fork/promote/rollback), layered on top of ' +
-      'the existing FORKING_ENABLED / Enterprise-plan gate at the shared assertForkingEnabled ' +
-      'choke point. Enforced ONLY where AppConfig is the source of truth (Sim Cloud), so ' +
-      'operators can dark-launch forking to specific orgs/users/admins without touching ' +
-      'self-hosted/local behaviour. Fallback mirrors FORKING_ENABLED for off-AppConfig reads.',
-    fallback: 'FORKING_ENABLED',
+      'Gate the internal predicate-grammar table query route (POST /api/table/[tableId]/query), ' +
+      'its only caller. When off, that route returns 403 naming the gate (post-authz, so the ' +
+      'masquerade 404 served nobody and broke the table_v2 block confusingly). Despite the ' +
+      'name it does NOT gate any /api/v2/tables route. Gated by userId/orgId/admins via ' +
+      'AppConfig; off-AppConfig falls back to TABLES_V2_API.',
+    fallback: 'TABLES_V2_API',
   },
-  'deploy-as-block': {
+  'table-row-ttl': {
     description:
-      'Publish a deployed workflow as a reusable, org-wide custom block (custom name/SVG icon/' +
-      'description; Start inputs become block inputs). Gates the Deploy-modal "Block" tab and the ' +
-      'custom-block publish/list routes. Off-AppConfig falls back to DEPLOY_AS_BLOCK.',
-    fallback: 'DEPLOY_AS_BLOCK',
+      'Enable TTL columns and the scheduled cleanup that removes expired table rows. ' +
+      'Global on/off only; existing TTL data remains readable when disabled.',
+    fallback: 'TABLE_ROW_TTL',
+  },
+  'credential-groups': {
+    description:
+      'Managed connected accounts, including organization account pools and their settings UI. ' +
+      'Uses orgId targeting only; workspace callers resolve their canonical organization. Hosted ' +
+      'owners also require an active Enterprise subscription. Organization Search additionally ' +
+      'requires knowledge-member-access. Off-AppConfig falls back to CREDENTIAL_GROUPS.',
+    fallback: 'CREDENTIAL_GROUPS',
+  },
+  'knowledge-member-access': {
+    description:
+      'Permission-aware indexing and retrieval. Organization Search UI, MCP, and search APIs ' +
+      'require this flag and credential-groups for the canonical orgId; user/admin/workspace ' +
+      'targeting cannot enable another organization. Workspace member sync uses workspaceId; ' +
+      'workspace retrieval defaults may additionally use user/admin targeting. Source ACL ' +
+      'mirroring remains independent of managed identities. Off-AppConfig falls back to ' +
+      'KNOWLEDGE_MEMBER_ACCESS.',
+    fallback: 'KNOWLEDGE_MEMBER_ACCESS',
+  },
+  'knowledge-tin-keyword': {
+    description:
+      'Rank keyword retrieval for members whose permitted set is too large to enumerate through ' +
+      'the Tin text index instead of GIN. Has no effect where the Tin keyword index is absent or ' +
+      'invalid. Off-AppConfig falls back to KNOWLEDGE_TIN_KEYWORD.',
+    fallback: 'KNOWLEDGE_TIN_KEYWORD',
+  },
+  'knowledge-async-projection': {
+    description:
+      'Knowledge writers (document processing and connector ACL writes) leave search projection ' +
+      'rows to the background knowledge projector instead of rewriting them in their own ' +
+      'transaction. Global on/off only; turn it on only once no release older than the ' +
+      'projector serves search. Off-AppConfig falls back to KNOWLEDGE_ASYNC_PROJECTION.',
+    fallback: 'KNOWLEDGE_ASYNC_PROJECTION',
+  },
+  'knowledge-projection-fill': {
+    description:
+      'The knowledge projector also fills search projection rows written before they carried ' +
+      "their document's source and ACL, marking at most 100 documents at once so fresh writes " +
+      'never wait behind much of it. Global on/off only; off pauses the fill, and search keeps ' +
+      'deciding unfilled rows on their document. Off-AppConfig falls back to ' +
+      'KNOWLEDGE_PROJECTION_FILL.',
+    fallback: 'KNOWLEDGE_PROJECTION_FILL',
   },
 } satisfies Record<string, FeatureFlagDefinition>
 
@@ -142,8 +152,8 @@ async function resolveAdmin(userId: string): Promise<boolean> {
 }
 
 /**
- * The admin clause is resolved last and lazily: a global/userId/orgId match
- * short-circuits before any DB read, a rule without `adminEnabled` never queries,
+ * The admin clause is resolved last and lazily: a global/userId/orgId/workspaceId
+ * match short-circuits before any DB read, a rule without `adminEnabled` never queries,
  * and a missing `userId` resolves to `false` without a query.
  */
 async function evaluate(

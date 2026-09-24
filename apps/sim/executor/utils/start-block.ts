@@ -1,5 +1,6 @@
 import { isRecordLike } from '@sim/utils/object'
 import {
+  extractWorkspaceIdFromStorageKey,
   inferContextFromKey,
   isInternalFileUrl,
   parseInternalFileUrl,
@@ -13,6 +14,8 @@ import type { InputFormatField } from '@/lib/workflows/types'
 import {
   EXECUTION_CONTROL_OUTPUT_FIELD_NAMES,
   type NormalizedBlockOutput,
+  START_BLOCK_METADATA_FIELD,
+  type StartBlockRunMetadata,
   type UserFile,
 } from '@/executor/types'
 import type { SerializedBlock } from '@/serializer/types'
@@ -139,6 +142,14 @@ function extractInputFormat(block: SerializedBlock): InputFormatField[] {
   return source
     .filter((field): field is InputFormatField => isRecordLike(field))
     .map((field) => field)
+}
+
+/**
+ * Reads the Start block's "Add run metadata" toggle from the serialized block.
+ */
+export function isRunMetadataEnabled(block: SerializedBlock): boolean {
+  const value = readMetadataSubBlockValue(block, 'runMetadata') ?? block.config?.params?.runMetadata
+  return value === true || value === 'true'
 }
 
 function normalizeLegacyStarterMode(modeValue: unknown): 'manual' | 'api' | 'chat' | null {
@@ -324,8 +335,61 @@ function getRawInputCandidate(workflowInput: unknown): unknown {
   return workflowInput
 }
 
-function normalizeStartFile(file: unknown): UserFile | null {
-  if (!isRecordLike(file)) {
+/**
+ * The storage key for a Start file, when the caller can prove the execution's
+ * workspace owns it.
+ *
+ * Checks the supplied key first and the key parsed out of an internal URL
+ * second; both are caller-authored, so both are held to the same ownership test
+ * and neither is preferred for being "more official".
+ */
+function resolveOwnedStartFileKey(suppliedKey: unknown, url: string, workspaceId: string): string {
+  if (typeof suppliedKey === 'string' && suppliedKey) {
+    if (extractWorkspaceIdFromStorageKey(suppliedKey) === workspaceId) {
+      return suppliedKey
+    }
+    return ''
+  }
+
+  if (!url || !isInternalFileUrl(url)) {
+    return ''
+  }
+
+  try {
+    const parsed = parseInternalFileUrl(url)
+    return extractWorkspaceIdFromStorageKey(parsed.key) === workspaceId ? parsed.key : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Normalizes one caller-supplied file object into the executor's canonical
+ * {@link UserFile}, or returns `null` when the shape is not usable.
+ *
+ * A storage key names a specific tenant's bytes, so the test is ownership, not
+ * provenance: a key is accepted when its own layout names the workspace this
+ * execution runs in — `workspace/{workspaceId}/…` or
+ * `execution/{workspaceId}/…` — and rejected otherwise. That holds whether the
+ * key arrives directly or is parsed out of the file's URL, so neither source has
+ * to be trusted: {@link isInternalFileUrl} matches the path prefix on any host,
+ * and a caller can author either field.
+ *
+ * Both sources have to be honoured. The server-side uploader for run inputs
+ * hands back a *presigned cloud* URL whenever object storage is configured
+ * (`generatePresignedDownloadUrl`), whose path is the bucket key rather than
+ * `/api/files/serve/...` — so a URL-only rule silently drops every chat
+ * attachment, API `files[]` payload and webhook file field on any deployment
+ * that is not using local storage, while passing locally and in tests.
+ *
+ * Key layouts that name no workspace (`kb/`, `chat/`, `copilot/`, the
+ * world-readable prefixes) prove no ownership and are rejected, as is every file
+ * when the execution carries no workspace at all. `context` is derived from the
+ * accepted key rather than read from the payload or the URL's `?context=`, so it
+ * cannot label owned bytes with a bucket they do not live in.
+ */
+function normalizeStartFile(file: unknown, workspaceId: string | undefined): UserFile | null {
+  if (!isRecordLike(file) || !workspaceId) {
     return null
   }
 
@@ -335,26 +399,14 @@ function normalizeStartFile(file: unknown): UserFile | null {
     typeof file.url === 'string' ? file.url : typeof file.path === 'string' ? file.path : ''
   const size = typeof file.size === 'number' ? file.size : Number.NaN
   const type = typeof file.type === 'string' ? file.type : ''
-  const explicitKey = typeof file.key === 'string' ? file.key : ''
 
-  let key = explicitKey
-  let context = typeof file.context === 'string' ? file.context : undefined
-
-  if (!key && url && isInternalFileUrl(url)) {
-    try {
-      const parsed = parseInternalFileUrl(url)
-      key = parsed.key
-      context = context || parsed.context
-    } catch {
-      return null
-    }
-  }
-
-  if (!context && key) {
+  const key = resolveOwnedStartFileKey(file.key, url, workspaceId)
+  let context: string | undefined
+  if (key) {
     try {
       context = inferContextFromKey(key)
     } catch {
-      // Older file outputs may have opaque keys; keep the file shape intact.
+      return null
     }
   }
 
@@ -374,7 +426,10 @@ function normalizeStartFile(file: unknown): UserFile | null {
   }
 }
 
-function getFilesFromWorkflowInput(workflowInput: unknown): UserFile[] | undefined {
+function getFilesFromWorkflowInput(
+  workflowInput: unknown,
+  workspaceId: string | undefined
+): UserFile[] | undefined {
   if (!isRecordLike(workflowInput)) {
     return undefined
   }
@@ -383,7 +438,7 @@ function getFilesFromWorkflowInput(workflowInput: unknown): UserFile[] | undefin
     return undefined
   }
 
-  const normalizedFiles = files.map(normalizeStartFile)
+  const normalizedFiles = files.map((file) => normalizeStartFile(file, workspaceId))
   if (normalizedFiles.every((file): file is UserFile => Boolean(file))) {
     return normalizedFiles
   }
@@ -392,9 +447,10 @@ function getFilesFromWorkflowInput(workflowInput: unknown): UserFile[] | undefin
 
 function mergeFilesIntoOutput(
   output: NormalizedBlockOutput,
-  workflowInput: unknown
+  workflowInput: unknown,
+  workspaceId: string | undefined
 ): NormalizedBlockOutput {
-  const files = getFilesFromWorkflowInput(workflowInput)
+  const files = getFilesFromWorkflowInput(workflowInput, workspaceId)
   if (files) {
     output.files = files
   } else if (isRecordLike(workflowInput) && Object.hasOwn(workflowInput, 'files')) {
@@ -458,7 +514,7 @@ function buildUnifiedStartOutput(
     output.conversationId = undefined
   }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function buildApiOrInputOutput(finalInput: unknown, workflowInput: unknown): NormalizedBlockOutput {
@@ -471,7 +527,7 @@ function buildApiOrInputOutput(finalInput: unknown, workflowInput: unknown): Nor
       }
     : { input: finalInput }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function buildChatOutput(workflowInput: unknown): NormalizedBlockOutput {
@@ -486,7 +542,7 @@ function buildChatOutput(workflowInput: unknown): NormalizedBlockOutput {
     output.conversationId = conversationId
   }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function buildLegacyStarterOutput(
@@ -513,7 +569,7 @@ function buildLegacyStarterOutput(
     output.conversationId = ensureString(conversationId)
   }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function buildManualTriggerOutput(
@@ -528,7 +584,7 @@ function buildManualTriggerOutput(
     output.input = getRawInputCandidate(workflowInput)
   }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function buildIntegrationTriggerOutput(
@@ -556,7 +612,7 @@ function buildIntegrationTriggerOutput(
     }
   }
 
-  return mergeFilesIntoOutput(output, workflowInput)
+  return output
 }
 
 function extractSubBlocks(block: SerializedBlock): Record<string, unknown> | undefined {
@@ -570,7 +626,7 @@ function extractSubBlocks(block: SerializedBlock): Record<string, unknown> | und
   }
 
   const subBlocks = maybeWithSubBlocks.subBlocks
-  if (subBlocks && typeof subBlocks === 'object' && !Array.isArray(subBlocks)) {
+  if (isRecordLike(subBlocks)) {
     return subBlocks
   }
 
@@ -580,11 +636,37 @@ function extractSubBlocks(block: SerializedBlock): Record<string, unknown> | und
 export interface StartBlockOutputOptions {
   resolution: ExecutorStartResolution
   workflowInput: unknown
+  /** Trusted, server-built run metadata. Only applied when the block's toggle is on. */
+  runMetadata?: StartBlockRunMetadata
+  /**
+   * Workspace this execution runs in. Caller-supplied Start files are admitted
+   * only when their storage key names this workspace; absent it, none are.
+   */
+  workspaceId?: string
+}
+
+function assertNoMetadataInputFormatField(
+  inputFormat: InputFormatField[],
+  block: SerializedBlock
+): void {
+  const hasMetadataField = inputFormat.some(
+    (field) => readInputFormatFieldName(field) === START_BLOCK_METADATA_FIELD
+  )
+
+  if (!hasMetadataField) {
+    return
+  }
+
+  const blockName = block.metadata?.name ?? block.id
+  throw new Error(
+    `Start block "${blockName}" has "Add run metadata" enabled, which reserves the "${START_BLOCK_METADATA_FIELD}" output. Rename the "${START_BLOCK_METADATA_FIELD}" input format field or disable the toggle.`
+  )
 }
 
 export function buildStartBlockOutput(options: StartBlockOutputOptions): NormalizedBlockOutput {
   const { resolution, workflowInput } = options
   const inputFormat = extractInputFormat(resolution.block)
+  const runMetadataEnabled = isRunMetadataEnabled(resolution.block)
   const legacyStarterMode =
     resolution.path === StartBlockPath.LEGACY_STARTER
       ? getSerializedLegacyStarterMode(resolution.block)
@@ -592,6 +674,9 @@ export function buildStartBlockOutput(options: StartBlockOutputOptions): Normali
 
   if (pathConsumesInputFormat(resolution.path, legacyStarterMode)) {
     assertNoReservedInputFormatFields(inputFormat, resolution.block)
+    if (runMetadataEnabled) {
+      assertNoMetadataInputFormatField(inputFormat, resolution.block)
+    }
   }
 
   const { finalInput, structuredInput, hasStructured } = deriveInputFromFormat(
@@ -629,6 +714,17 @@ export function buildStartBlockOutput(options: StartBlockOutputOptions): Normali
 
     default:
       output = buildManualTriggerOutput(finalInput, workflowInput)
+  }
+
+  output = mergeFilesIntoOutput(output, workflowInput, options.workspaceId)
+
+  if (runMetadataEnabled) {
+    // The metadata key is server-owned when the toggle is on: any caller-supplied
+    // value is dropped, and absent trusted metadata leaves the key absent (fail closed).
+    delete output[START_BLOCK_METADATA_FIELD]
+    if (options.runMetadata) {
+      output[START_BLOCK_METADATA_FIELD] = { ...options.runMetadata }
+    }
   }
 
   assertNoReservedStartOutputFields(output, resolution.block)

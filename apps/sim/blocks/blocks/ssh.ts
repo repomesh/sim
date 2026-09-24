@@ -1,12 +1,16 @@
 import { ClipboardList, Download, File, Search, Server, Wrench } from '@sim/emcn/icons'
+import { omit } from '@sim/utils/object'
 import { SshIcon, SshTerminalIcon } from '@/components/icons'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
 import { AuthMode, IntegrationType } from '@/blocks/types'
+import { createVersionedToolSelector } from '@/blocks/utils'
 import type { SSHResponse } from '@/tools/ssh/types'
 
-export const SSHBlock: BlockConfig<SSHResponse> = {
+export const SSHBlock = {
   type: 'ssh',
-  name: 'SSH',
+  name: 'SSH (Legacy)',
+  hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'ssh_v2' },
   description: 'Connect to remote servers via SSH',
   authMode: AuthMode.ApiKey,
   longDescription:
@@ -16,6 +20,65 @@ export const SSHBlock: BlockConfig<SSHResponse> = {
   integrationType: IntegrationType.DevOps,
   bgColor: '#000000',
   icon: SshIcon,
+  canvasPresentation: {
+    defaultTitle: 'SSH',
+    sentences: {
+      byOperation: {
+        ssh_execute_command: [
+          { text: 'Run', field: 'command', core: true },
+          { text: 'on', field: 'host' },
+          { text: ', from', field: 'workingDirectory' },
+        ],
+        ssh_execute_script: [
+          { text: 'Run a script on', field: 'host', core: true },
+          { text: ', from', field: 'scriptWorkingDirectory' },
+        ],
+        ssh_check_command_exists: [
+          { text: 'Check whether', field: 'commandName', after: 'is installed', core: true },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_upload_file: [
+          { text: 'Upload', field: 'fileName', core: true },
+          { text: 'to', field: 'remotePath', core: true },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_download_file: [
+          { text: 'Download', field: 'downloadRemotePath', core: true },
+          { text: 'from', field: 'host' },
+        ],
+        ssh_list_directory: [
+          { text: 'List files in', field: 'listPath', core: true },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_check_file_exists: [
+          { text: 'Check whether', field: 'checkPath', after: 'exists', core: true },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_create_directory: [
+          { text: 'Create directory', field: 'createPath', core: true },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_delete_file: [
+          { text: 'Delete', field: 'deletePath', core: true },
+          { text: 'from', field: 'host' },
+        ],
+        ssh_move_rename: [
+          { text: 'Move', field: 'sourcePath', core: true },
+          { text: 'to', field: 'destinationPath' },
+          { text: 'on', field: 'host' },
+        ],
+        ssh_get_system_info: [{ text: 'Read system info from', field: 'host', core: true }],
+        ssh_read_file_content: [
+          { text: 'Read', field: 'readPath', core: true },
+          { text: 'from', field: 'host' },
+        ],
+        ssh_write_file_content: [
+          { text: 'Write content to', field: 'writePath', core: true },
+          { text: 'on', field: 'host' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     // Operation selector
     {
@@ -91,6 +154,7 @@ export const SSHBlock: BlockConfig<SSHResponse> = {
       id: 'privateKey',
       title: 'Private Key',
       type: 'code',
+      password: true,
       placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----\n...',
       condition: { field: 'authMethod', value: 'privateKey' },
       dependsOn: ['authMethod'],
@@ -601,6 +665,48 @@ Examples:
     os: { type: 'string', description: 'Operating system' },
     message: { type: 'string', description: 'Operation status message' },
   },
+} satisfies BlockConfig<SSHResponse>
+
+const selectSshV2Tool = createVersionedToolSelector({
+  baseToolSelector: SSHBlock.tools.config.tool,
+  suffix: '_v2',
+  fallbackToolId: 'ssh_download_file_v2',
+})
+
+export const SSHV2Block: BlockConfig = {
+  ...SSHBlock,
+  type: 'ssh_v2',
+  name: 'SSH',
+  hideFromToolbar: false,
+  sunset: undefined,
+  tools: {
+    ...SSHBlock.tools,
+    access: SSHBlock.tools.access.map((toolId) =>
+      toolId === 'ssh_download_file' ? 'ssh_download_file_v2' : toolId
+    ),
+    config: {
+      ...SSHBlock.tools.config,
+      tool: (params) =>
+        params.operation === 'ssh_download_file'
+          ? selectSshV2Tool(params)
+          : SSHBlock.tools.config.tool(params),
+    },
+  },
+  outputs: {
+    ...omit(SSHBlock.outputs, ['fileContent']),
+    success: {
+      ...SSHBlock.outputs.success,
+      condition: { field: 'operation', value: 'ssh_download_file', not: true },
+    },
+    message: {
+      ...SSHBlock.outputs.message,
+      condition: { field: 'operation', value: 'ssh_download_file', not: true },
+    },
+    content: {
+      ...SSHBlock.outputs.content,
+      condition: { field: 'operation', value: 'ssh_read_file_content' },
+    },
+  },
 }
 
 export const SSHBlockMeta = {
@@ -609,7 +715,7 @@ export const SSHBlockMeta = {
   templates: [
     {
       icon: SshTerminalIcon,
-      title: 'Scheduled server health check to Slack',
+      title: 'SSH health check to Slack',
       prompt:
         'Every morning, SSH into the production server and run a health check command (uptime, load average, and free memory). Summarize stdout with an agent and post the result to the #ops Slack channel so the team starts the day knowing the box is healthy.',
       modules: ['scheduled', 'agent', 'workflows'],
@@ -638,7 +744,7 @@ export const SSHBlockMeta = {
     },
     {
       icon: ClipboardList,
-      title: 'Tail and summarize a remote log',
+      title: 'Summarize a remote log over SSH',
       prompt:
         'SSH into the server and read the last 200 lines of /var/log/app.log, then hand the content to an agent that summarizes recent errors and warnings into a short digest. Post the digest so on-call engineers can scan incidents at a glance.',
       modules: ['workflows', 'agent'],
@@ -648,7 +754,7 @@ export const SSHBlockMeta = {
     },
     {
       icon: Download,
-      title: 'Fetch a remote report file into the workflow',
+      title: 'Fetch a remote report over SSH',
       prompt:
         'Download a generated report file from the remote server via SSH and pass the resulting file output into the next step for processing or storage, so a nightly export on the box flows straight into the workflow.',
       modules: ['scheduled', 'files', 'workflows'],
@@ -657,7 +763,7 @@ export const SSHBlockMeta = {
     },
     {
       icon: Search,
-      title: 'Verify a command exists before running it',
+      title: 'Verify a command exists over SSH',
       prompt:
         'Before executing a maintenance step, use Check Command Exists over SSH to confirm a tool like docker or git is installed on the remote host. If the exists output is true, run the command; if not, report a clear message that the dependency is missing.',
       modules: ['workflows'],
@@ -666,7 +772,7 @@ export const SSHBlockMeta = {
     },
     {
       icon: File,
-      title: 'Push a config file and restart a service',
+      title: 'Push a config and restart over SSH',
       prompt:
         'Upload a rendered configuration file to the remote server via SSH, write it to the target path, then execute a command to restart the affected service. Confirm success from the exitCode and stderr outputs before finishing.',
       modules: ['workflows', 'agent'],

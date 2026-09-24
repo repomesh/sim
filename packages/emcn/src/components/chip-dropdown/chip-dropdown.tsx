@@ -1,10 +1,12 @@
 'use client'
 
 import {
+  type AriaAttributes,
   type ComponentType,
   forwardRef,
   type ReactNode,
   useContext,
+  useId,
   useMemo,
   useState,
 } from 'react'
@@ -12,14 +14,17 @@ import type { VariantProps } from 'class-variance-authority'
 import { Check, ChevronDown } from '../../icons'
 import { cn } from '../../lib/cn'
 import { chipVariants, TRIGGER_BORDER_CLASS } from '../chip/chip'
+import { chipIconSlotClass } from '../chip/chip-chrome'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuItemLabel,
   DropdownMenuSearchInput,
   DropdownMenuTrigger,
 } from '../dropdown-menu/dropdown-menu'
 import { InsideModalContext } from '../modal/modal'
+import { OverflowText, overflowTextClipClass } from '../overflow-text/overflow-text'
 
 type ChipIcon = ComponentType<{ className?: string }>
 
@@ -34,7 +39,7 @@ interface ChipDropdownOption {
   /**
    * Optional leading icon rendered inside the menu item. Auto-sized to
    * `size-[14px]` and tinted with `--text-icon` via the item's base classes
-   * (see `DROPDOWN_MENU_ITEM_BASE_CLASSES`).
+   * (see {@link dropdownMenuRowClass}).
    */
   icon?: ChipIcon
   /** Pre-rendered leading element (e.g. an avatar) — takes precedence over `icon`. */
@@ -71,6 +76,26 @@ interface ChipDropdownBaseProps extends VariantProps<typeof chipVariants> {
   leftIcon?: ChipIcon
   /** Forwarded class for the trigger button. */
   className?: string
+  /**
+   * Accessible name for the trigger. Use when the visible label sits outside
+   * the component (a field label above it) rather than in the selected value.
+   */
+  'aria-label'?: string
+  /**
+   * Ids of the elements naming the trigger. Because `aria-labelledby` REPLACES
+   * the name derived from the trigger's contents, include the trigger's own id
+   * alongside the external label's — `\`${labelId} ${triggerId}\`` — or the
+   * selected value is dropped from the accessible name.
+   */
+  'aria-labelledby'?: string
+  /** Required state announced through the menu button's accessible description. */
+  'aria-required'?: AriaAttributes['aria-required']
+  /** Validation state announced through the menu button's accessible description. */
+  'aria-invalid'?: AriaAttributes['aria-invalid']
+  /** Hint and error descriptions supplied by the enclosing field. */
+  'aria-describedby'?: AriaAttributes['aria-describedby']
+  /** Id for the trigger button. Needed to reference it from `aria-labelledby`. */
+  id?: string
 }
 
 /**
@@ -125,7 +150,7 @@ type ChipDropdownProps = ChipDropdownSingleProps | ChipDropdownMultiProps
  *
  * The trigger reuses `chipVariants` for visual parity with `Chip`. The label
  * is `flex-1`, so the trailing chevron is pushed flush right. The chevron is
- * owned by the component and rendered at `h-[6px] w-[10px]` (matching the
+ * owned by the component and rendered at `size-[14px]` (matching the
  * workspace-header chevron) — there is intentionally no `rightIcon` prop. The
  * trigger and menu shell are identical across modes; only the selection
  * semantics (label, item handlers, open state, search) branch on `multiple`.
@@ -150,7 +175,6 @@ type ChipDropdownProps = ChipDropdownSingleProps | ChipDropdownMultiProps
  *   searchable
  *   searchPlaceholder='Search members...'
  *   fullWidth
- *   flush
  * />
  */
 const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
@@ -165,10 +189,25 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
       leftIcon: LeftIcon,
       className,
       variant = 'filled',
+      shape,
       active,
       fullWidth,
-      flush,
+      'aria-label': ariaLabel,
+      'aria-labelledby': ariaLabelledBy,
+      'aria-required': ariaRequired,
+      'aria-invalid': ariaInvalid,
+      'aria-describedby': ariaDescribedBy,
+      id,
     } = props
+
+    const fieldStateId = useId()
+    const fieldState = [
+      (ariaRequired === true || ariaRequired === 'true') && 'Required.',
+      ariaInvalid && ariaInvalid !== 'false' && 'Invalid selection.',
+    ]
+      .filter(Boolean)
+      .join(' ')
+    const describedBy = [ariaDescribedBy, fieldState && fieldStateId].filter(Boolean).join(' ')
 
     const isMultiple = props.multiple === true
     const selectedValues = useMemo<string[]>(
@@ -218,7 +257,7 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
     }
     const isPlaceholder = !isMultiple && selectedValues.length === 0
 
-    const iconClass = cn('size-[16px] flex-shrink-0', !isInverse && 'text-[var(--text-icon)]')
+    const iconClass = cn('size-[16px] shrink-0', !isInverse && 'text-[var(--text-icon)]')
     /**
      * The chevron glyph stays at its conventional subtle size, but is rendered
      * inside a `size-[16px]` slot so its bounding box matches `leftIcon`'s. The
@@ -226,22 +265,34 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
      * label — without this, the smaller glyph's bounding box would let the
      * chevron read as glued to the text relative to the leading icon.
      */
-    const chevronSlotClass = cn(
-      'inline-flex size-[16px] flex-shrink-0 items-center justify-center',
-      !isInverse && 'text-[var(--text-icon)]'
-    )
+    const chevronSlotClass = cn(chipIconSlotClass, !isInverse && 'text-[var(--text-icon)]')
     /**
      * `flex-1` is always applied so the chevron is pushed flush against the
      * trailing edge whenever the trigger gets stretched — by `fullWidth`, by a
-     * flex parent with `flex-grow`, or by a CSS grid cell with a fixed track.
+     * flex parent with `grow`, or by a CSS grid cell with a fixed track.
      * On intrinsic-width triggers (`inline-flex` with no parent constraint) the
-     * container is sized to max-content, so `flex-grow` has no leftover space to
+     * container is sized to max-content, so `grow` has no leftover space to
      * consume and the layout collapses to the natural `gap-2` between items.
      */
-    const labelClass = cn(
-      'min-w-0 flex-1 truncate text-sm',
-      !isInverse && 'text-[var(--text-body)]'
+    const labelClass = cn('flex-1 text-sm', !isInverse && 'text-[var(--text-body)]')
+
+    const triggerLabelClass = cn(
+      labelClass,
+      isPlaceholder && !isInverse && 'text-[var(--text-muted)]'
     )
+    const renderLabel = (label: ReactNode) => {
+      const textLabel =
+        typeof label === 'string' || typeof label === 'number' ? String(label) : null
+      return textLabel == null ? (
+        <span className={cn(overflowTextClipClass, triggerLabelClass)}>{label}</span>
+      ) : (
+        <OverflowText
+          label={textLabel}
+          className={triggerLabelClass}
+          focusTarget='nearest-interactive'
+        />
+      )
+    }
 
     const renderItem = (option: ChipDropdownOption) => {
       const isSelected = selectedValues.includes(option.value)
@@ -263,8 +314,12 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
           }}
         >
           {option.iconElement ?? (OptionIcon ? <OptionIcon /> : null)}
-          <span>{option.label}</span>
-          {showSelectedCheck && isSelected ? <Check className='!ml-auto !size-[16px]' /> : null}
+          {typeof option.label === 'string' || typeof option.label === 'number' ? (
+            <DropdownMenuItemLabel label={String(option.label)} />
+          ) : (
+            <span className={cn(overflowTextClipClass, 'flex-1')}>{option.label}</span>
+          )}
+          {showSelectedCheck && isSelected ? <Check className='ml-auto! size-[16px]!' /> : null}
         </DropdownMenuItem>
       )
     }
@@ -285,30 +340,36 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
         <DropdownMenuTrigger asChild disabled={disabled}>
           <button
             ref={ref}
+            id={id}
             type='button'
             disabled={disabled}
+            aria-label={ariaLabel}
+            aria-labelledby={ariaLabelledBy}
+            aria-describedby={describedBy || undefined}
             className={cn(
-              chipVariants({ variant, active, fullWidth, flush }),
+              chipVariants({ variant, shape, active, fullWidth }),
               hasTriggerBorder && TRIGGER_BORDER_CLASS,
               className
             )}
           >
             {LeftIcon ? <LeftIcon className={iconClass} /> : null}
-            <span
-              className={cn(labelClass, isPlaceholder && !isInverse && 'text-[var(--text-muted)]')}
-            >
-              {displayLabel}
-            </span>
+            {renderLabel(displayLabel)}
             <span aria-hidden className={chevronSlotClass}>
-              <ChevronDown className='h-[6px] w-[10px]' />
+              <ChevronDown className='size-[14px]' />
             </span>
           </button>
         </DropdownMenuTrigger>
+        {fieldState && (
+          <span id={fieldStateId} className='sr-only'>
+            {fieldState}
+          </span>
+        )}
         <DropdownMenuContent
           align={align}
           onOpenAutoFocus={searchable ? (event) => event.preventDefault() : undefined}
           className={cn(
             matchTriggerWidth && 'w-[var(--radix-dropdown-menu-trigger-width)] max-w-none',
+            insideModal && 'max-h-[min(240px,var(--radix-popper-available-height,240px))]',
             contentClassName
           )}
         >
@@ -329,8 +390,8 @@ const ChipDropdown = forwardRef<HTMLButtonElement, ChipDropdownProps>(
                 if (isMultiple) props.onChange?.([])
               }}
             >
-              <span>{allLabel}</span>
-              {selectedValues.length === 0 ? <Check className='!ml-auto !size-[16px]' /> : null}
+              <DropdownMenuItemLabel label={allLabel} />
+              {selectedValues.length === 0 ? <Check className='ml-auto! size-[16px]!' /> : null}
             </DropdownMenuItem>
           )}
           {filteredOptions.map(renderItem)}

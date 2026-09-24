@@ -1,4 +1,4 @@
-import { redisConfigMock, redisConfigMockFns } from '@sim/testing'
+import { redisConfigMockFns } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { mockGetStorageMethod, reconnectCallbacks } = vi.hoisted(() => {
@@ -11,8 +11,6 @@ const { mockGetStorageMethod, reconnectCallbacks } = vi.hoisted(() => {
 
 const mockGetRedisClient = redisConfigMockFns.mockGetRedisClient
 const mockOnRedisReconnect = redisConfigMockFns.mockOnRedisReconnect
-
-vi.mock('@/lib/core/config/redis', () => redisConfigMock)
 
 vi.mock('@/lib/core/storage', () => ({
   getStorageMethod: mockGetStorageMethod,
@@ -60,6 +58,21 @@ describe('rate limit storage factory', () => {
 
     const adapter = createStorageAdapter()
     expect(adapter).toEqual({ type: 'redis' })
+  })
+
+  it('provider admission refuses a configured Redis outage instead of opening a second budget', () => {
+    mockGetStorageMethod.mockReturnValue('redis')
+    expect(createStorageAdapter()).toEqual({ type: 'db' })
+    expect(() => createStorageAdapter({ requireConfiguredBackend: true })).toThrow(
+      'Configured Redis rate limit storage is unavailable'
+    )
+  })
+
+  it('strict admission uses recovered Redis even when the ordinary fallback adapter is cached', () => {
+    mockGetStorageMethod.mockReturnValue('redis')
+    createStorageAdapter()
+    mockGetRedisClient.mockReturnValue({ ping: vi.fn() } as never)
+    expect(createStorageAdapter({ requireConfiguredBackend: true })).toEqual({ type: 'redis' })
   })
 
   it('should use DbTokenBucket when storage method is db', () => {

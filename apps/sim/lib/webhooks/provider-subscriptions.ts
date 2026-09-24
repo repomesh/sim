@@ -1,7 +1,13 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
+import { omit } from '@sim/utils/object'
 import type { NextRequest } from 'next/server'
-import { resolveWebhookProviderConfig } from '@/lib/webhooks/env-resolver'
+import { withResourceOutboundScope } from '@/lib/core/network/resource-scope.server'
+import {
+  resolveBackgroundWebhookEnv,
+  resolveWebhookProviderConfig,
+  resolveWebhookRecordProviderConfig,
+} from '@/lib/webhooks/env-resolver'
 import { getProviderHandler } from '@/lib/webhooks/providers'
 
 const logger = createLogger('WebhookProviderSubscriptions')
@@ -29,9 +35,26 @@ const SYSTEM_MANAGED_FIELDS = new Set([
   'secretToken',
   'historyId',
   'lastCheckedTimestamp',
+  'lastSeenGuids',
   'setupCompleted',
+  'subscriptionExpiration',
   'userId',
+  // Zoho Desk provider-managed: the persisted data-center Desk base, set by
+  // createSubscription (not a user trigger field), so it must not count as a
+  // config change that forces delete/recreate.
+  'apiDomain',
 ])
+
+/**
+ * Returns the user-controlled projection used for stable registration identity.
+ *
+ * Provider-managed subscription metadata and mutable polling cursors are intentionally omitted.
+ */
+export function projectDesiredWebhookProviderConfig(
+  providerConfig: Readonly<Record<string, unknown>>
+): Record<string, unknown> {
+  return omit(providerConfig, [...SYSTEM_MANAGED_FIELDS])
+}
 
 /** Returns true when user-controlled persisted webhook configuration changed. */
 export function hasWebhookConfigChanged(
@@ -105,7 +128,8 @@ export async function createExternalWebhookSubscription(
   webhookData: Record<string, unknown>,
   workflow: Record<string, unknown>,
   userId: string,
-  requestId: string
+  requestId: string,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ExternalSubscriptionResult> {
   const provider = webhookData.provider as string
   const providerConfig = (webhookData.providerConfig as Record<string, unknown>) || {}
@@ -123,12 +147,20 @@ export async function createExternalWebhookSubscription(
     workspaceId
   )
 
-  const result = await handler.createSubscription({
-    webhook: { ...webhookData, providerConfig: resolvedProviderConfig },
-    workflow,
-    userId,
-    requestId,
-    request,
+  /**
+   * Last abort check before the irreversible external call: a lease-expired
+   * outbox handler must not mint a provider resource it can no longer
+   * durably record.
+   */
+  const result = await withResourceOutboundScope({ workspaceId }, () => {
+    options.signal?.throwIfAborted()
+    return handler.createSubscription!({
+      webhook: { ...webhookData, providerConfig: resolvedProviderConfig },
+      workflow,
+      userId,
+      requestId,
+      request,
+    })
   })
 
   if (!result) {
@@ -143,6 +175,16 @@ export async function createExternalWebhookSubscription(
 
 /**
  * Clean up external webhook subscriptions for a webhook.
+ *
+ * Resolves persisted `{{ENV_VAR}}` references the same way the delivery that
+ * created the subscription resolved them — owner for personal variables, the
+ * workspace billing account for workspace ones. Reading both slices as the owner
+ * meant cleanup could see a narrower selection than execution did: a non-admin
+ * owner without a credential grant for the referenced key left `{{VAR}}`
+ * unresolved (`onMissing` defaults to `keep`), and the provider was then handed
+ * the literal reference as its credential. Since the failure below is non-fatal
+ * by default, that silently orphaned the subscription at the provider.
+ *
  * By default, cleanup failure is logged but non-fatal for legacy best-effort callers.
  * Deployment outbox cleanup passes `throwOnError` so provider failures stay retryable.
  */
@@ -160,7 +202,31 @@ export async function cleanupExternalWebhook(
   }
 
   try {
-    await handler.deleteSubscription({ webhook, workflow, requestId, strict: options.throwOnError })
+    if (typeof workflow.userId !== 'string') {
+      throw new Error('Cannot resolve webhook credentials without a workflow owner')
+    }
+
+    const workspaceId = typeof workflow.workspaceId === 'string' ? workflow.workspaceId : undefined
+    const envVars = await resolveBackgroundWebhookEnv(workflow.userId, workspaceId)
+    const resolvedWebhook = await resolveWebhookRecordProviderConfig(
+      webhook,
+      workflow.userId,
+      workspaceId,
+      { envVars }
+    )
+
+    /** Workspace archival precedes provider cleanup; routing still uses its canonical owner. */
+    await withResourceOutboundScope(
+      { workspaceId },
+      () =>
+        handler.deleteSubscription!({
+          webhook: resolvedWebhook,
+          workflow,
+          requestId,
+          strict: options.throwOnError,
+        }),
+      { includeArchived: true }
+    )
   } catch (error) {
     logger.warn(`[${requestId}] Error cleaning up external webhook (non-fatal)`, {
       provider,

@@ -1,10 +1,12 @@
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
+import { generateShortId } from '@sim/utils/id'
 import { NextResponse } from 'next/server'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/core/execution-limits'
 import {
   type McpApiResponse,
   McpConnectionError,
   McpOauthAuthorizationRequiredError,
+  McpServerCooldownError,
 } from '@/lib/mcp/types'
 import { isMcpTool, MCP } from '@/executor/constants'
 
@@ -22,6 +24,22 @@ export const MCP_CONSTANTS = {
  * These should be preserved when cleaning up params during schema updates.
  */
 export const MCP_TOOL_CORE_PARAMS = new Set(['serverId', 'serverUrl', 'toolName', 'serverName'])
+
+export const MANAGED_MCP_CONNECTION_PREFIX = 'mcp-cg-'
+const MANAGED_MCP_RANDOM_ID_LENGTH = 21
+const MANAGED_MCP_CONNECTION_ID_LENGTH =
+  MANAGED_MCP_CONNECTION_PREFIX.length + MANAGED_MCP_RANDOM_ID_LENGTH
+
+export function generateManagedMcpConnectionId(): string {
+  return `${MANAGED_MCP_CONNECTION_PREFIX}${generateShortId(MANAGED_MCP_RANDOM_ID_LENGTH)}`
+}
+
+export function isManagedMcpConnectionId(value: string): boolean {
+  return (
+    value.startsWith(MANAGED_MCP_CONNECTION_PREFIX) &&
+    value.length === MANAGED_MCP_CONNECTION_ID_LENGTH
+  )
+}
 
 /**
  * Sanitizes a string by removing invisible Unicode characters that cause HTTP header errors.
@@ -51,7 +69,28 @@ export function sanitizeHeaders(
 export const MCP_CLIENT_CONSTANTS = {
   CLIENT_TIMEOUT: DEFAULT_EXECUTION_TIMEOUT_MS,
   AUTO_REFRESH_INTERVAL: 5 * 60 * 1000,
-  LIST_TOOLS_TIMEOUT_MS: 10_000,
+  /**
+   * Hard ceiling for the connect handshake, regardless of the server row's
+   * configured `timeout`.
+   *
+   * The clamp used to be `getMaxExecutionTimeout()`, the *workflow* ceiling of
+   * seven days, so the real bound became the row's own `timeout` — which the
+   * registration contract permits up to 300s — multiplied by the connect
+   * retries. A hostile-but-slow server could therefore hold a Node request for
+   * roughly twenty minutes. Connecting is not a workflow run, and `tools/list`
+   * already bounds itself at a minute; the handshake gets the same budget.
+   */
+  CONNECT_MAX_TIMEOUT_MS: 60_000,
+  /** Idle timeout for tools/list (gap between progress events); raised from 10s toward the SDK's 60s default. */
+  LIST_TOOLS_TIMEOUT_MS: 30_000,
+  /** Hard ceiling for tools/list regardless of progress (SDK maxTotalTimeout safeguard). */
+  LIST_TOOLS_MAX_TOTAL_TIMEOUT_MS: 60_000,
+  /** Max `tools/list` pages followed via `nextCursor` before truncating (see fetch loop). */
+  LIST_TOOLS_MAX_PAGES: 50,
+  /** Max tools aggregated across all pages before truncating. */
+  LIST_TOOLS_MAX_TOOLS: 1000,
+  /** Max total tool-payload bytes aggregated across all pages before truncating. */
+  LIST_TOOLS_MAX_BYTES: 5 * 1024 * 1024,
   FAILURE_CACHE_TTL_MS: 120_000,
 } as const
 
@@ -146,10 +185,10 @@ export function categorizeError(error: unknown): { message: string; status: numb
   if (error instanceof McpOauthAuthorizationRequiredError || error instanceof UnauthorizedError) {
     return { message: 'Authentication required', status: 401 }
   }
+  if (error instanceof McpServerCooldownError) {
+    return { message: 'Server temporarily unavailable', status: 503 }
+  }
   if (error instanceof McpConnectionError) {
-    if (error.message.toLowerCase().includes('cooldown')) {
-      return { message: 'Server temporarily unavailable', status: 503 }
-    }
     return { message: 'Connection failed', status: 502 }
   }
 
@@ -196,6 +235,29 @@ export function parseMcpToolId(toolId: string): { serverId: string; toolName: st
   const toolName = parts.slice(2).join('-')
 
   return { serverId, toolName }
+}
+
+export type ParsedMcpToolTarget =
+  | { kind: 'shared_server'; serverId: string; toolName: string }
+  | { kind: 'managed_connection'; credentialId: string; toolName: string }
+
+export function parseMcpToolTarget(toolId: string): ParsedMcpToolTarget {
+  if (toolId.startsWith(MANAGED_MCP_CONNECTION_PREFIX)) {
+    if (
+      toolId.length <= MANAGED_MCP_CONNECTION_ID_LENGTH ||
+      toolId[MANAGED_MCP_CONNECTION_ID_LENGTH] !== '-'
+    ) {
+      throw new Error(
+        `Invalid managed MCP tool ID format: ${toolId}. Expected: mcp-cg-connectionId-toolName`
+      )
+    }
+    const credentialId = toolId.slice(0, MANAGED_MCP_CONNECTION_ID_LENGTH)
+    const toolName = toolId.slice(MANAGED_MCP_CONNECTION_ID_LENGTH + 1)
+    if (!toolName) throw new Error(`Invalid managed MCP tool ID format: ${toolId}`)
+    return { kind: 'managed_connection', credentialId, toolName }
+  }
+  const { serverId, toolName } = parseMcpToolId(toolId)
+  return { kind: 'shared_server', serverId, toolName }
 }
 
 /**

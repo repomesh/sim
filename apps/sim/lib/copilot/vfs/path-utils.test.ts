@@ -31,6 +31,15 @@ describe('VFS path utilities', () => {
       })
     ).toBe('files/Reports/Q4%20Report%20(Final)/sales%2Feast.csv')
   })
+
+  it('keeps an escaped slash inside one workspace folder segment', () => {
+    expect(
+      canonicalWorkspaceFilePath({
+        folderPath: 'Finance\\/Legal/Quarterly',
+        name: 'report.pdf',
+      })
+    ).toBe('files/Finance%2FLegal/Quarterly/report.pdf')
+  })
 })
 
 describe('canonical resource VFS paths', () => {
@@ -48,6 +57,16 @@ describe('canonical resource VFS paths', () => {
     expect(
       canonicalWorkflowVfsDir({ name: 'My Flow', folderPath: 'My%20Folder/Sub%20Folder' })
     ).toBe('workflows/My%20Folder/Sub%20Folder/My%20Flow')
+  })
+
+  it('preserves encoded nested folders in table and knowledge-base pointers', () => {
+    const folderPath = 'Finance%2FLegal/Q4%20100%25'
+    expect(canonicalTableVfsPath('Same name', folderPath)).toBe(
+      'tables/Finance%2FLegal/Q4%20100%25/Same%20name/meta.json'
+    )
+    expect(canonicalKnowledgeBaseVfsDir('Same name', folderPath)).toBe(
+      'knowledgebases/Finance%2FLegal/Q4%20100%25/Same%20name'
+    )
   })
 
   it('builds table, knowledge base, and block pointers', () => {

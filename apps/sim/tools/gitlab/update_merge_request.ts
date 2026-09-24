@@ -10,6 +10,7 @@ export const gitlabUpdateMergeRequestTool: ToolConfig<
   GitLabUpdateMergeRequestResponse
 > = {
   id: 'gitlab_update_merge_request',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Update Merge Request',
   description: 'Update an existing merge request in a GitLab project',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabUpdateMergeRequestTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     mergeRequestIid: {
       type: 'number',
@@ -97,7 +98,8 @@ export const gitlabUpdateMergeRequestTool: ToolConfig<
       type: 'boolean',
       required: false,
       visibility: 'user-or-llm',
-      description: 'Mark as draft (work in progress)',
+      description:
+        'Mark as draft or remove draft status (applied via the "Draft:" title prefix; requires title to be set)',
     },
   },
 
@@ -114,7 +116,14 @@ export const gitlabUpdateMergeRequestTool: ToolConfig<
     body: (params) => {
       const body: Record<string, any> = {}
 
-      if (params.title) body.title = params.title
+      // GitLab has no `draft` body param — draft status is conveyed via the
+      // "Draft:" title prefix, so it can only be changed when a title is sent.
+      if (params.title) {
+        let title = params.title
+        if (params.draft === true && !/^\s*draft:/i.test(title)) title = `Draft: ${title}`
+        if (params.draft === false) title = title.replace(/^\s*draft:\s*/i, '')
+        body.title = title
+      }
       if (params.description !== undefined) body.description = params.description
       if (params.stateEvent) body.state_event = params.stateEvent
       if (params.labels !== undefined) body.labels = params.labels
@@ -124,7 +133,6 @@ export const gitlabUpdateMergeRequestTool: ToolConfig<
       if (params.removeSourceBranch !== undefined)
         body.remove_source_branch = params.removeSourceBranch
       if (params.squash !== undefined) body.squash = params.squash
-      if (params.draft !== undefined) body.draft = params.draft
 
       return body
     },

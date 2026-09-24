@@ -4,6 +4,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
+  mockConversationContext,
+  mockCapabilities,
+  mockRecordUsage,
+  mockCapture,
   mockCreate,
   mockExecuteTool,
   mockSupportsNative,
@@ -11,6 +15,10 @@ const {
   mockCheckForced,
   mockCreateStream,
 } = vi.hoisted(() => ({
+  mockConversationContext: vi.fn(),
+  mockCapabilities: vi.fn(),
+  mockRecordUsage: vi.fn(),
+  mockCapture: vi.fn(),
   mockCreate: vi.fn(),
   mockExecuteTool: vi.fn(),
   mockSupportsNative: vi.fn(),
@@ -32,11 +40,20 @@ vi.mock('openai', () => ({
   ),
 }))
 
+vi.mock('@/providers/conversation-history', () => ({
+  getConversationRequestContext: mockConversationContext,
+  captureProviderConversationStep: mockCapture,
+  recordProviderConversationUsage: mockRecordUsage,
+  recordProviderConversationToolError: vi.fn(),
+}))
+
 vi.mock('@/providers', () => ({ MAX_TOOL_ITERATIONS: 10 }))
 
 vi.mock('@/tools', () => ({ executeTool: mockExecuteTool }))
 
 vi.mock('@/providers/models', () => ({
+  PROVIDER_DEFINITIONS: {},
+  getMaxOutputTokensForModel: () => 100,
   getProviderFileAttachment: vi
     .fn()
     .mockReturnValue({ maxBytes: 10 * 1024 * 1024, strategy: 'inline' }),
@@ -51,6 +68,7 @@ vi.mock('@/providers/attachments', () => ({
 
 vi.mock('@/providers/openrouter/utils', () => ({
   supportsNativeStructuredOutputs: mockSupportsNative,
+  getOpenRouterModelCapabilities: mockCapabilities,
   createReadableStreamFromOpenAIStream: mockCreateStream,
   checkForForcedToolUsage: mockCheckForced,
 }))
@@ -60,6 +78,11 @@ vi.mock('@/providers/trace-enrichment', () => ({
 }))
 
 vi.mock('@/providers/utils', () => ({
+  isFunctionToolCall: (toolCall: unknown) =>
+    typeof toolCall === 'object' &&
+    toolCall !== null &&
+    'function' in toolCall &&
+    (toolCall as { function?: unknown }).function != null,
   calculateCost: vi.fn(() => ({ input: 0, output: 0, total: 0 })),
   prepareToolsWithUsageControl: mockPrepareTools,
   prepareToolExecution: vi.fn((_tool: unknown, toolArgs: Record<string, unknown>) => ({
@@ -70,7 +93,9 @@ vi.mock('@/providers/utils', () => ({
   generateSchemaInstructions: vi.fn(() => 'SCHEMA_INSTRUCTIONS'),
 }))
 
+import type { StreamingExecution } from '@/executor/types'
 import { openRouterProvider } from '@/providers/openrouter/index'
+import type { OpenRouterReasoningDetail } from '@/providers/openrouter/reasoning'
 import type { ProviderRequest, ProviderResponse, ProviderToolConfig } from '@/providers/types'
 
 interface Usage {
@@ -89,12 +114,25 @@ function textResponse(
   }
 }
 
-function toolCallResponse(name: string, args: Record<string, unknown>, id = 'call_1') {
+function toolCallResponse(
+  name: string,
+  args: Record<string, unknown>,
+  id = 'call_1',
+  assistant: {
+    content?: string | null
+    reasoning?: string
+    reasoning_details?: OpenRouterReasoningDetail[]
+  } = {}
+) {
   return {
     choices: [
       {
         message: {
-          content: null,
+          content: assistant.content ?? null,
+          ...(assistant.reasoning !== undefined ? { reasoning: assistant.reasoning } : {}),
+          ...(assistant.reasoning_details !== undefined
+            ? { reasoning_details: assistant.reasoning_details }
+            : {}),
           tool_calls: [
             { id, type: 'function', function: { name, arguments: JSON.stringify(args) } },
           ],
@@ -109,7 +147,6 @@ function toolCallResponse(name: string, args: Record<string, unknown>, id = 'cal
 function tool(id: string): ProviderToolConfig {
   return {
     id,
-    name: id,
     description: 'test tool',
     params: {},
     parameters: { type: 'object', properties: {}, required: [] },
@@ -126,10 +163,97 @@ const baseRequest: ProviderRequest = {
 describe('openRouterProvider.executeRequest', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockConversationContext.mockReturnValue(undefined)
+    mockCapabilities.mockResolvedValue(null)
     mockCreate.mockReset()
     mockExecuteTool.mockReset()
     mockSupportsNative.mockResolvedValue(false)
+    mockCreateStream.mockReturnValue(
+      new ReadableStream({ start: (controller) => controller.close() })
+    )
   })
+
+  it.each([
+    { contextWindow: 512, historySize: 2000, retained: false },
+    { contextWindow: 128_000, historySize: 35_000, retained: true },
+  ])(
+    'budgets dynamic context $contextWindow from the existing capability cache',
+    async ({ contextWindow, historySize, retained }) => {
+      mockConversationContext.mockReturnValue({
+        agentConversation: {},
+        agentMemoryContext: { historyTokens: 64_000 },
+      })
+      mockCapabilities.mockResolvedValue({ contextWindow })
+      mockCreate.mockResolvedValueOnce(textResponse('done'))
+      const prior = { role: 'user' as const, content: 'x'.repeat(historySize) }
+      const prompt = { role: 'user' as const, content: 'Current task' }
+      const controller = new AbortController()
+      await openRouterProvider.executeRequest({
+        ...baseRequest,
+        model: 'openrouter/custom-model',
+        messages: [prior, prompt],
+        maxTokens: 32,
+        abortSignal: controller.signal,
+      })
+      expect(mockCapabilities).toHaveBeenCalledExactlyOnceWith(
+        'openrouter/custom-model',
+        controller.signal
+      )
+      const payload = mockCreate.mock.calls[0][0]
+      expect(payload.messages.includes(prior)).toBe(retained)
+      expect(payload.messages).toContain(prompt)
+      expect(payload).not.toHaveProperty('contextWindow')
+    }
+  )
+
+  it.each([false, true])(
+    'keeps capped decisions unexecuted and accounts usage when synthesis failure is %s',
+    async (failsSynthesis) => {
+      let generated = 0
+      mockCreate.mockImplementation((payload) => {
+        const final = payload.tool_choice === 'none'
+        if (final && failsSynthesis) return Promise.reject(new Error('synthesis failed'))
+        return Promise.resolve({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: final ? 'Tool limit reached' : null,
+                tool_calls: final
+                  ? []
+                  : [
+                      {
+                        id: `call-${++generated}`,
+                        type: 'function',
+                        function: { name: 'lookup', arguments: '{}' },
+                      },
+                    ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        })
+      })
+      const result = openRouterProvider.executeRequest({ ...baseRequest, tools: [tool('lookup')] })
+      if (failsSynthesis) await expect(result).rejects.toThrow('synthesis failed')
+      else
+        await expect(result).resolves.toMatchObject({
+          tokens: { input: 60, output: 36, total: 96 },
+        })
+      expect(mockExecuteTool).toHaveBeenCalledTimes(10)
+      expect(generated).toBe(11)
+      expect(mockRecordUsage).toHaveBeenCalledExactlyOnceWith(expect.anything(), {
+        input: 5,
+        output: 3,
+        cacheRead: 0,
+      })
+      const capturedCalls = mockCapture.mock.calls.flatMap(
+        ([, , message]) => message.tool_calls?.map((call: { id: string }) => call.id) ?? []
+      )
+      expect(capturedCalls).toEqual(Array.from({ length: 10 }, (_, index) => `call-${index + 1}`))
+      expect(capturedCalls).not.toContain('call-11')
+    }
+  )
 
   it('requires an API key', async () => {
     await expect(
@@ -150,6 +274,12 @@ describe('openRouterProvider.executeRequest', () => {
     expect(payload.model).toBe('anthropic/claude-3.5-sonnet')
     expect(payload.messages[0]).toEqual({ role: 'system', content: 'You are helpful.' })
     expect(payload.messages.at(-1)).toEqual({ role: 'user', content: 'Hello' })
+  })
+
+  it('preserves custom provider paths when stripping an uppercase namespace', async () => {
+    mockCreate.mockResolvedValueOnce(textResponse('ok'))
+    await openRouterProvider.executeRequest({ ...baseRequest, model: 'OPENROUTER/Org/CustomModel' })
+    expect(mockCreate.mock.calls[0][0].model).toBe('Org/CustomModel')
   })
 
   it('inserts context as a user message between system and history', async () => {
@@ -231,6 +361,85 @@ describe('openRouterProvider.executeRequest', () => {
       message: 'boom',
       tool: 'get_weather',
     })
+  })
+
+  it('replays OpenRouter reasoning_details unchanged with assistant content', async () => {
+    const reasoningDetails: OpenRouterReasoningDetail[] = [
+      {
+        type: 'reasoning.summary',
+        summary: 'Need current weather.',
+        id: 'reasoning-1',
+        format: 'anthropic-claude-v1',
+        index: 0,
+      },
+      {
+        type: 'reasoning.encrypted',
+        data: 'opaque-data',
+        id: 'reasoning-2',
+        format: 'anthropic-claude-v1',
+        index: 1,
+      },
+      {
+        type: 'reasoning.text',
+        text: 'Call the weather tool.',
+        signature: null,
+        id: 'reasoning-3',
+        format: 'anthropic-claude-v1',
+        index: 2,
+      },
+    ]
+    mockCreate
+      .mockResolvedValueOnce(
+        toolCallResponse('get_weather', { city: 'SF' }, 'call_1', {
+          content: 'I will check.',
+          reasoning_details: reasoningDetails,
+        })
+      )
+      .mockResolvedValueOnce(textResponse('done'))
+    mockExecuteTool.mockResolvedValueOnce({ success: true, output: { temp: 70 } })
+
+    await openRouterProvider.executeRequest({
+      ...baseRequest,
+      tools: [tool('get_weather')],
+    })
+
+    const assistant = mockCreate.mock.calls[1][0].messages.find(
+      (message: { role: string }) => message.role === 'assistant'
+    )
+    expect(assistant).toEqual({
+      role: 'assistant',
+      content: 'I will check.',
+      tool_calls: [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'get_weather', arguments: '{"city":"SF"}' },
+        },
+      ],
+      reasoning_details: reasoningDetails,
+    })
+  })
+
+  it('does not add OpenRouter reasoning fields when the provider omitted them', async () => {
+    mockCreate
+      .mockResolvedValueOnce(
+        toolCallResponse('get_weather', { city: 'SF' }, 'call_1', {
+          content: 'I will check.',
+        })
+      )
+      .mockResolvedValueOnce(textResponse('done'))
+    mockExecuteTool.mockResolvedValueOnce({ success: true, output: { temp: 70 } })
+
+    await openRouterProvider.executeRequest({
+      ...baseRequest,
+      tools: [tool('get_weather')],
+    })
+
+    const assistant = mockCreate.mock.calls[1][0].messages.find(
+      (message: { role: string }) => message.role === 'assistant'
+    )
+    expect(assistant).not.toHaveProperty('reasoning')
+    expect(assistant).not.toHaveProperty('reasoning_details')
   })
 
   it('applies native structured outputs (json_schema + require_parameters) when no tools are active', async () => {
@@ -329,8 +538,40 @@ describe('openRouterProvider.executeRequest', () => {
     expect(res).toHaveProperty('execution.output.model', 'anthropic/claude-3.5-sonnet')
   })
 
+  it('streams the settled tool-loop answer without a duplicate provider request', async () => {
+    mockCreate
+      .mockResolvedValueOnce(toolCallResponse('get_weather', { city: 'SF' }))
+      .mockResolvedValueOnce(
+        textResponse('It is sunny', { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26 })
+      )
+    mockExecuteTool.mockResolvedValueOnce({ success: true, output: { temp: 70 } })
+
+    const res = (await openRouterProvider.executeRequest({
+      ...baseRequest,
+      stream: true,
+      tools: [tool('get_weather')],
+    })) as StreamingExecution
+
+    expect(mockCreate).toHaveBeenCalledTimes(2)
+    expect(res.execution.output).toMatchObject({
+      content: 'It is sunny',
+      tokens: { input: 28, output: 10, total: 38 },
+      toolCalls: { count: 1 },
+    })
+    const reader = res.stream.getReader()
+    await expect(reader.read()).resolves.toEqual({
+      done: false,
+      value: { type: 'text_delta', text: 'It is sunny', turn: 'final' },
+    })
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
+  })
+
   it('stops the tool loop at MAX_TOOL_ITERATIONS', async () => {
-    mockCreate.mockResolvedValue(toolCallResponse('looping', {}))
+    mockCreate.mockImplementation((payload) =>
+      payload.tool_choice === 'none'
+        ? textResponse('iteration limit answer')
+        : toolCallResponse('looping', {})
+    )
     mockExecuteTool.mockResolvedValue({ success: true, output: {} })
 
     const res = (await openRouterProvider.executeRequest({
@@ -338,9 +579,11 @@ describe('openRouterProvider.executeRequest', () => {
       tools: [tool('looping')],
     })) as ProviderResponse
 
-    expect(mockCreate).toHaveBeenCalledTimes(11)
+    expect(mockCreate).toHaveBeenCalledTimes(12)
     expect(mockExecuteTool).toHaveBeenCalledTimes(10)
     expect(res.toolCalls?.length).toBe(10)
+    expect(res.content).toBe('iteration limit answer')
+    expect(mockCreate.mock.calls.at(-1)?.[0]).toMatchObject({ tool_choice: 'none' })
   })
 
   it('wraps SDK errors in a ProviderError', async () => {

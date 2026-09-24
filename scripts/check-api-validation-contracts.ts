@@ -8,9 +8,20 @@ const CONTRACTS_DIR = path.join(ROOT, 'apps/sim/lib/api/contracts')
 const QUERY_HOOKS_DIR = path.join(ROOT, 'apps/sim/hooks/queries')
 const SELECTOR_HOOKS_DIR = path.join(ROOT, 'apps/sim/hooks/selectors')
 
+/**
+ * `totalRoutes` is reported, never gated.
+ *
+ * The invariant worth holding is that every route is contract-backed, and
+ * `nonZodRoutes` states exactly that: it is 0, and rises the moment a route ships
+ * without one. Failing on the total as well meant a fully compliant new route
+ * still turned CI red, fixable only by editing the number here. A ratchet
+ * survives on the habit of never bumping it casually, and a gate that must be
+ * bumped to add a compliant route teaches precisely the opposite habit — on a
+ * file whose other seven baselines depend on that habit holding.
+ */
 const BASELINE = {
-  totalRoutes: 958,
-  zodRoutes: 958,
+  totalRoutes: 1201,
+  zodRoutes: 1201,
   nonZodRoutes: 0,
 } as const
 
@@ -24,18 +35,51 @@ const BOUNDARY_POLICY_BASELINE = {
   clientHookLocalSchemaConstructors: 0,
   clientHookRawFetches: 0,
   clientSameOriginApiFetches: 0,
-  doubleCasts: 8,
-  rawJsonReads: 6,
+  doubleCasts: 6,
+  rawJsonReads: 5,
   untypedResponses: 0,
   annotationsMissingReason: 0,
 } as const
 
 const INDIRECT_ZOD_ROUTES = new Set([
+  /** Shared MCP protocol factory validates the owner and JSON-RPC envelope before SDK dispatch. */
+  'apps/sim/app/api/mcp/search/[workspaceId]/route.ts',
+  'apps/sim/app/api/mcp/search/organizations/[organizationId]/route.ts',
+  'apps/sim/app/api/mcp/route.ts',
+  // SCIM discovery documents (RFC 7644 section 4). Each serves a fixed document
+  // describing what this server implements and accepts no params, query, or body,
+  // so there is no input to validate and no contract to bind. They are deliberately
+  // unauthenticated: a provider negotiates against them before it holds a
+  // credential. Wrapped in withRouteHandler by `defineScimDiscoveryRoute`.
+  'apps/sim/app/api/scim/v2/ServiceProviderConfig/route.ts',
+  'apps/sim/app/api/scim/v2/ResourceTypes/route.ts',
+  'apps/sim/app/api/scim/v2/ResourceTypes/[id]/route.ts',
+  'apps/sim/app/api/scim/v2/Schemas/route.ts',
+  'apps/sim/app/api/scim/v2/Schemas/[id]/route.ts',
+  // Catch-all JSON 404 for unknown /api/v2 paths. It has no contract by
+  // construction: it exists precisely for requests that match no operation, so
+  // there is no input to validate and its only response is the fixed v2 error
+  // envelope.
+  'apps/sim/app/api/v2/[[...segments]]/route.ts',
   'apps/sim/app/api/demo-requests/route.ts',
+  // Input-less session-bound GET: nothing to validate; response is
+  // contract-typed via `satisfies InvitationDetails` in the route.
+  // Public updater feed: input-less GET, session-less, returns YAML (not JSON),
+  // so it can't be JSON-contract-bound. Wrapped in withRouteHandler.
+  'apps/sim/app/api/desktop/update/latest-mac.yml/route.ts',
+  // Public updater download redirect: input-less GET, session-less, whose only
+  // response is a 302 to a GitHub release asset. Wrapped in withRouteHandler.
+  'apps/sim/app/api/desktop/update/download/route.ts',
+  'apps/sim/app/api/invitations/route.ts',
   'apps/sim/app/api/logs/export/route.ts',
   'apps/sim/app/api/tools/docusign/route.ts',
   // Better Auth handles its own validation for the catch-all route below.
   'apps/sim/app/api/auth/[...all]/route.ts',
+  /** OAuth protocol routes use bounded form or bearer parsing instead of JSON contracts. */
+  'apps/sim/app/api/auth/oauth2/revoke/route.ts',
+  'apps/sim/app/api/auth/oauth2/token/route.ts',
+  /** Input-less RFC 8414 aliases return Better Auth metadata with Sim's supported surface. */
+  'apps/sim/app/api/auth/.well-known/oauth-authorization-server/route.ts',
   // Better Auth handles validation for the Stripe webhook handler.
   'apps/sim/app/api/auth/webhook/stripe/route.ts',
   // Routes with no client-supplied input that previously had no-op
@@ -45,6 +89,7 @@ const INDIRECT_ZOD_ROUTES = new Set([
   'apps/sim/app/api/auth/oauth/connections/route.ts',
   'apps/sim/app/api/auth/providers/route.ts',
   'apps/sim/app/api/auth/socket-token/route.ts',
+  'apps/sim/app/api/desktop/auth/handoff/route.ts',
   'apps/sim/app/api/workspaces/invitations/route.ts',
   // Internal cron entry point that authenticates via `Authorization: Bearer
   // CRON_SECRET` and ignores query/body. The boundary contract is "no
@@ -58,15 +103,26 @@ const INDIRECT_ZOD_ROUTES = new Set([
   'apps/sim/app/api/settings/allowed-providers/route.ts',
   'apps/sim/app/api/settings/allowed-integrations/route.ts',
   'apps/sim/app/api/settings/allowed-mcp-domains/route.ts',
+  'apps/sim/app/api/cron/scim-reconcile/route.ts',
   'apps/sim/app/api/cron/cleanup-tasks/route.ts',
+  'apps/sim/app/api/cron/cleanup-file-versions/route.ts',
   'apps/sim/app/api/cron/cleanup-soft-deletes/route.ts',
+  'apps/sim/app/api/cron/cleanup-table-row-ttl/route.ts',
   'apps/sim/app/api/cron/cleanup-stale-executions/route.ts',
+  'apps/sim/app/api/cron/cleanup-sandbox-images/route.ts',
+  'apps/sim/app/api/cron/cleanup-oauth-tokens/route.ts',
   'apps/sim/app/api/cron/renew-subscriptions/route.ts',
+  'apps/sim/app/api/cron/billing-cycle-close/route.ts',
   'apps/sim/app/api/cron/reconcile-billing-seats/route.ts',
   'apps/sim/app/api/cron/reconcile-inbox-entitlement/route.ts',
   'apps/sim/app/api/cron/run-data-drains/route.ts',
+  // Returns immediately after Trigger.dev accepts the asynchronous dispatcher task.
+  'apps/sim/app/api/cron/workspace-file-search-dispatch/route.ts',
+  'apps/sim/app/api/cron/knowledge-projection/route.ts',
   'apps/sim/app/api/logs/cleanup/route.ts',
   'apps/sim/app/api/knowledge/connectors/sync/route.ts',
+  'apps/sim/app/api/knowledge/connectors/member-sync/route.ts',
+  'apps/sim/app/api/knowledge/connectors/directory-sync/route.ts',
   'apps/sim/app/api/webhooks/outbox/process/route.ts',
   'apps/sim/app/api/webhooks/cleanup/idempotency/route.ts',
   // Shared Slack app event ingest. The body is an opaque, HMAC-verified Slack
@@ -125,8 +181,6 @@ const RAW_JSON_BASELINE_ROUTES = new Set([
   'apps/sim/app/api/mcp/workflow-servers/[id]/tools/route.ts',
   'apps/sim/app/api/mcp/workflow-servers/[id]/tools/[toolId]/route.ts',
   'apps/sim/app/api/organizations/route.ts',
-  'apps/sim/app/api/organizations/[id]/invitations/route.ts',
-  'apps/sim/app/api/organizations/[id]/members/route.ts',
   'apps/sim/app/api/organizations/[id]/transfer-ownership/route.ts',
   'apps/sim/app/api/resume/[workflowId]/[executionId]/[contextId]/route.ts',
   'apps/sim/app/api/speech/token/route.ts',
@@ -134,11 +188,14 @@ const RAW_JSON_BASELINE_ROUTES = new Set([
   'apps/sim/app/api/tools/file/manage/route.ts',
   'apps/sim/app/api/workspaces/invitations/batch/route.ts',
   'apps/sim/app/api/workspaces/[id]/route.ts',
-  'apps/sim/app/api/workspaces/[id]/files/[fileId]/route.ts',
   'apps/sim/app/api/workspaces/[id]/files/[fileId]/content/route.ts',
 ])
 
 const CONTRACT_IMPORT_PATTERN = /\bfrom\s+['"]@\/lib\/api\/contracts(?:\/[^'"]*)?['"]/
+const DECLARATIVE_ROUTE_BUILDER_IMPORT_PATTERN =
+  /\bimport\s*\{[^}]*(?:\bdefineInternalJsonRoute\b|\bdefineV2JsonRoute\b|\bdefineInternalBinaryRoute\b|\bdefineV2BinaryRoute\b)[^}]*\}\s*from\s*['"]@\/lib\/api\/server\/routes['"]|\bimport\s*\{[^}]*\bdefineScimRoute\b[^}]*\}\s*from\s*['"]@\/ee\/scim\/lib\/route['"]/
+const DECLARATIVE_ROUTE_BUILDER_USAGE_PATTERN =
+  /\b(?:defineInternalJsonRoute|defineV2JsonRoute|defineInternalBinaryRoute|defineV2BinaryRoute|defineScimRoute)\s*\(/
 const SERVER_VALIDATION_IMPORT_PATTERN = /\bfrom\s+['"]@\/lib\/api\/server(?:\/validation)?['"]/
 const SCHEMA_PARSE_PATTERN = /\b\w+Schema\.(?:safeParse|parse)\(/
 const CONTRACT_SERVER_HELPER_PATTERN = /\bparseToolRequest\(/
@@ -227,6 +284,16 @@ const SOURCE_SKIP_DIRS = new Set([
 ])
 
 type AnnotationKind = 'raw-fetch' | 'double-cast' | 'raw-json' | 'untyped-response'
+
+const sourceCache = new Map<string, string>()
+
+async function readSource(filePath: string): Promise<string> {
+  const cached = sourceCache.get(filePath)
+  if (cached !== undefined) return cached
+  const content = await readFile(filePath, 'utf8')
+  sourceCache.set(filePath, content)
+  return content
+}
 
 interface AnnotationResult {
   allowed: boolean
@@ -706,6 +773,13 @@ function hasZodUsage(relativePath: string, content: string): boolean {
     /\bparseRequest\(/.test(content) &&
     /\bfrom\s+['"]@\/lib\/api\/server['"]/.test(content) &&
     CONTRACT_IMPORT_PATTERN.test(content)
+  ) {
+    return true
+  }
+  if (
+    CONTRACT_IMPORT_PATTERN.test(content) &&
+    DECLARATIVE_ROUTE_BUILDER_IMPORT_PATTERN.test(content) &&
+    DECLARATIVE_ROUTE_BUILDER_USAGE_PATTERN.test(content)
   ) {
     return true
   }
@@ -1216,7 +1290,7 @@ async function auditQueryHooks(): Promise<QueryHookAudit[]> {
   const audits: QueryHookAudit[] = []
 
   for (const filePath of queryHookFiles) {
-    const content = await readFile(filePath, 'utf8')
+    const content = await readSource(filePath)
     audits.push(auditQueryHook(filePath, content))
   }
 
@@ -1233,7 +1307,7 @@ async function main() {
   let rawJsonExemptions = 0
 
   for (const filePath of routeFiles) {
-    const content = await readFile(filePath, 'utf8')
+    const content = await readSource(filePath)
     audits.push(auditRoute(filePath, content))
 
     const rawJson = findRawJsonFindings(filePath, content)
@@ -1252,12 +1326,14 @@ async function main() {
   let doubleCastExemptions = 0
 
   const appsSimRoot = path.join(ROOT, 'apps/sim')
+  const contractsRoot = path.join(CONTRACTS_DIR, path.sep)
 
   for (const filePath of sourceFiles) {
-    const content = await readFile(filePath, 'utf8')
+    const content = sourceCache.get(filePath) ?? (await readFile(filePath, 'utf8'))
+    if (filePath.startsWith(contractsRoot)) sourceCache.set(filePath, content)
     const normalized = filePath.replace(/\\/g, '/')
 
-    if (isClientHookFile(filePath)) {
+    if (isClientHookFile(filePath) && content.includes('fetch')) {
       const rawFetch = findRawFetchFindings(filePath, content)
       rawFetchFindings.push(...rawFetch.findings)
       rawFetchExemptions += rawFetch.exemptions
@@ -1267,7 +1343,9 @@ async function main() {
     if (
       normalized.startsWith(`${appsSimRoot}/`) &&
       !isApiRouteHandler(filePath) &&
-      filePath !== path.join(ROOT, 'scripts', 'check-api-validation-contracts.ts')
+      filePath !== path.join(ROOT, 'scripts', 'check-api-validation-contracts.ts') &&
+      content.includes('fetch') &&
+      content.includes('/api/')
     ) {
       const sameOrigin = findSameOriginApiFetchFindings(filePath, content)
       sameOriginApiFetchFindings.push(...sameOrigin.findings)
@@ -1275,10 +1353,12 @@ async function main() {
       annotationsMissingReason.push(...sameOrigin.missingReasons)
     }
 
-    const doubleCast = findDoubleCastFindings(filePath, content)
-    doubleCastFindings.push(...doubleCast.findings)
-    doubleCastExemptions += doubleCast.exemptions
-    annotationsMissingReason.push(...doubleCast.missingReasons)
+    if (content.includes('as unknown as')) {
+      const doubleCast = findDoubleCastFindings(filePath, content)
+      doubleCastFindings.push(...doubleCast.findings)
+      doubleCastExemptions += doubleCast.exemptions
+      annotationsMissingReason.push(...doubleCast.missingReasons)
+    }
   }
 
   const contractFiles = await walk(CONTRACTS_DIR, (fileName) => /\.ts$/.test(fileName))
@@ -1286,7 +1366,7 @@ async function main() {
   let untypedResponseExemptions = 0
 
   for (const filePath of contractFiles) {
-    const content = await readFile(filePath, 'utf8')
+    const content = await readSource(filePath)
     const untyped = findUntypedResponseFindings(filePath, content)
     untypedResponseFindings.push(...untyped.findings)
     untypedResponseExemptions += untyped.exemptions
@@ -1347,9 +1427,6 @@ async function main() {
   if (!checkOnly) return
 
   const failures: string[] = []
-  if (totalRoutes > BASELINE.totalRoutes) {
-    failures.push(`route count increased from ${BASELINE.totalRoutes} to ${totalRoutes}`)
-  }
   if (nonZodRoutes > BASELINE.nonZodRoutes) {
     failures.push(
       `non-Zod routes increased from ${BASELINE.nonZodRoutes} to ${nonZodRoutes} (${zodRoutes} Zod-backed routes)`

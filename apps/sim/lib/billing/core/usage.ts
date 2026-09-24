@@ -4,21 +4,25 @@ import { createLogger } from '@sim/logger'
 import { isOrgAdminRole } from '@sim/platform-authz/workspace'
 import { generateId } from '@sim/utils/id'
 import { and, eq, isNull, sql } from 'drizzle-orm'
-import {
-  getEmailSubject,
-  renderCreditsExhaustedEmail,
-  renderFreeTierUpgradeEmail,
-  renderUsageThresholdEmail,
-} from '@/components/emails'
 import { getEffectiveBillingStatus } from '@/lib/billing/core/access'
 import { defaultBillingPeriod } from '@/lib/billing/core/billing-period'
-import { getHighestPrioritySubscription } from '@/lib/billing/core/plan'
-import { getBillingPeriodUsageCost } from '@/lib/billing/core/usage-log'
 import {
-  computeDailyRefreshConsumed,
-  getOrgMemberRefreshBounds,
-} from '@/lib/billing/credits/daily-refresh'
-import { getPlanTierDollars, isEnterprise, isFree, isPaid, isPro } from '@/lib/billing/plan-helpers'
+  getHighestPriorityPersonalSubscription,
+  getHighestPrioritySubscription,
+  type HighestPrioritySubscription,
+} from '@/lib/billing/core/plan'
+import {
+  type ResolvedUsagePeriod,
+  resolveSubscriptionUsagePeriod,
+} from '@/lib/billing/core/reporting-period'
+import { type BillingEntity, getBillingPeriodUsageCost } from '@/lib/billing/core/usage-log'
+import { computeWeeklyRefreshConsumed } from '@/lib/billing/credits/weekly-refresh'
+import {
+  getPlanWeeklyRefreshDollars,
+  isEnterprise,
+  isFree,
+  isPaid,
+} from '@/lib/billing/plan-helpers'
 import {
   canEditUsageLimit,
   getFreeTierLimit,
@@ -28,16 +32,29 @@ import {
   hasUsableSubscriptionAccess,
   isOrgScopedSubscription,
 } from '@/lib/billing/subscriptions/utils'
-import type { BillingData, UsageData, UsageLimitInfo } from '@/lib/billing/types'
+import type { UsageData, UsageLimitInfo } from '@/lib/billing/types'
 import { buildUpgradeHref } from '@/lib/billing/upgrade-reasons'
 import { Decimal, toDecimal, toNumber } from '@/lib/billing/utils/decimal'
 import { isBillingEnabled } from '@/lib/core/config/env-flags'
 import { getBaseUrl } from '@/lib/core/utils/urls'
 import type { DbClient } from '@/lib/db/types'
-import { sendEmail } from '@/lib/messaging/email/mailer'
 import { getEmailPreferences } from '@/lib/messaging/email/unsubscribe'
+import { APP_ENTRY_PATH } from '@/lib/navigation/paths'
 
 const logger = createLogger('UsageManagement')
+
+/**
+ * Email rendering pulls the React templates and every mail provider into the
+ * module graph, which is ~1.2s of imports on every route that reaches billing
+ * attribution. Load it only when a threshold email is actually being sent.
+ */
+async function loadEmailDelivery() {
+  const [emails, mailer] = await Promise.all([
+    import('@/components/emails'),
+    import('@/lib/messaging/email/mailer'),
+  ])
+  return { ...emails, sendEmail: mailer.sendEmail }
+}
 
 export interface OrgUsageLimitResult {
   limit: number
@@ -51,48 +68,35 @@ export interface UsageLimitSubscription {
   seats: number | null
   periodStart: Date | null
   periodEnd: Date | null
+  billingInterval?: string | null
+  metadata?: unknown
+  usagePeriod?: ResolvedUsagePeriod | null
 }
 
 /**
- * Sum `currentPeriodCost` across all members of an organization.
- * The single source of truth for pooled-usage reads so every caller
- * applies identical null-handling and query shape. Does NOT apply
- * daily-refresh deduction — callers layer that on top themselves
- * because refresh math needs the caller's `sub` context (plan,
- * period, seats, per-user bounds).
+ * Pooled previous-period bookkeeping total for an organization — the sum of
+ * member `lastPeriodCost` rows, which the cycle-close sweep writes from
+ * ledger sums. Current-period usage is never read here — it is always the
+ * attributed usage_log ledger.
  *
  * Uses `LEFT JOIN` so members whose `userStats` row is missing still
- * appear (contributing 0), which keeps `memberIds` complete for
- * downstream refresh / bounds computations.
+ * count (contributing 0).
  */
-export async function getPooledOrgCurrentPeriodCost(
+export async function getOrgLastPeriodCost(
   organizationId: string,
   executor: DbClient = db
-): Promise<{ memberIds: string[]; currentPeriodCost: number; lastPeriodCost: number }> {
+): Promise<number> {
   const rows = await executor
-    .select({
-      userId: member.userId,
-      currentPeriodCost: userStats.currentPeriodCost,
-      lastPeriodCost: userStats.lastPeriodCost,
-    })
+    .select({ lastPeriodCost: userStats.lastPeriodCost })
     .from(member)
     .leftJoin(userStats, eq(member.userId, userStats.userId))
     .where(eq(member.organizationId, organizationId))
 
-  let pooled = new Decimal(0)
   let lastPeriodCost = new Decimal(0)
-  const memberIds: string[] = []
   for (const row of rows) {
-    memberIds.push(row.userId)
-    pooled = pooled.plus(toDecimal(row.currentPeriodCost))
     lastPeriodCost = lastPeriodCost.plus(toDecimal(row.lastPeriodCost))
   }
-
-  return {
-    memberIds,
-    currentPeriodCost: toNumber(pooled),
-    lastPeriodCost: toNumber(lastPeriodCost),
-  }
+  return toNumber(lastPeriodCost)
 }
 
 /**
@@ -107,17 +111,40 @@ export async function getOrgUsageLimit(
   seats: number | null,
   executor: DbClient = db
 ): Promise<OrgUsageLimitResult> {
-  const orgData = await executor
+  return (
+    (await findOrgUsageLimit(organizationId, plan, seats, executor)) ??
+    calculateOrgUsageLimit(organizationId, plan, seats, null)
+  )
+}
+
+async function findOrgUsageLimit(
+  organizationId: string,
+  plan: string,
+  seats: number | null,
+  executor: DbClient = db
+): Promise<OrgUsageLimitResult | null> {
+  const [orgData] = await executor
     .select({ orgUsageLimit: organization.orgUsageLimit })
     .from(organization)
     .where(eq(organization.id, organizationId))
     .limit(1)
 
-  const configured =
-    orgData.length > 0 && orgData[0].orgUsageLimit
-      ? toNumber(toDecimal(orgData[0].orgUsageLimit))
-      : null
+  if (!orgData) return null
 
+  return calculateOrgUsageLimit(
+    organizationId,
+    plan,
+    seats,
+    orgData.orgUsageLimit ? toNumber(toDecimal(orgData.orgUsageLimit)) : null
+  )
+}
+
+function calculateOrgUsageLimit(
+  organizationId: string,
+  plan: string,
+  seats: number | null,
+  configured: number | null
+): OrgUsageLimitResult {
   if (isEnterprise(plan)) {
     // Enterprise: Use configured limit directly (no per-seat minimum)
     if (configured !== null) {
@@ -188,13 +215,18 @@ export async function ensureUserStatsExists(userId: string): Promise<void> {
     .onConflictDoNothing({ target: userStats.userId })
 }
 
-/**
- * Get comprehensive usage data for a user
- */
-export async function getUserUsageData(
+export interface ResolvedUserUsageData {
+  usage: UsageData
+  subscription: HighestPrioritySubscription
+  /** The personal balance from the same user-stats row used to calculate usage. */
+  personalCreditBalance: number
+}
+
+/** Resolves comprehensive usage and the subscription that determined its billing scope. */
+export async function getResolvedUserUsageData(
   userId: string,
   executor: DbClient = db
-): Promise<UsageData> {
+): Promise<ResolvedUserUsageData> {
   try {
     // Write — always on the primary regardless of executor routing.
     await ensureUserStatsExists(userId)
@@ -218,44 +250,24 @@ export async function getUserUsageData(
 
     const stats = userStatsData[0]
     const orgScoped = isOrgScopedSubscription(subscription, userId)
-    const billingPeriod =
-      subscription?.periodStart && subscription.periodEnd
-        ? { start: subscription.periodStart, end: subscription.periodEnd }
-        : defaultBillingPeriod()
+    const billingPeriod = resolveSubscriptionUsagePeriod(subscription) ?? {
+      ...defaultBillingPeriod(),
+      source: 'default' as const,
+      anchorDate: null,
+      interval: null,
+    }
 
-    let currentUsageDecimal = toDecimal(stats.currentPeriodCost)
-    if (!orgScoped) {
-      currentUsageDecimal = currentUsageDecimal.plus(
-        await getBillingPeriodUsageCost(
+    let currentUsage = orgScoped
+      ? 0
+      : await getBillingPeriodUsageCost(
           { type: 'user', id: userId },
           billingPeriod,
           undefined,
           executor
         )
-      )
-    }
-
-    // For personally-scoped Pro users, include any snapshotted usage from
-    // a prior org-join so the display reflects their total Pro usage.
-    if (subscription && isPro(subscription.plan) && !orgScoped) {
-      const snapshotUsageDecimal = toDecimal(stats.proPeriodCostSnapshot)
-      if (snapshotUsageDecimal.greaterThan(0)) {
-        currentUsageDecimal = currentUsageDecimal.plus(snapshotUsageDecimal)
-        logger.info('Including Pro snapshot in usage display', {
-          userId,
-          currentPeriodCost: stats.currentPeriodCost,
-          proPeriodCostSnapshot: toNumber(snapshotUsageDecimal),
-          totalUsage: toNumber(currentUsageDecimal),
-        })
-      }
-    }
-    let currentUsage = toNumber(currentUsageDecimal)
     let lastPeriodCost = toNumber(toDecimal(stats.lastPeriodCost))
 
     let limit: number
-    // Shared between the pooled-usage and pooled-refresh blocks so we
-    // don't issue the member lookup twice per org-scoped call.
-    let orgMemberIds: string[] = []
 
     if (orgScoped && subscription) {
       const orgLimit = await getOrgUsageLimit(
@@ -266,83 +278,72 @@ export async function getUserUsageData(
       )
       limit = orgLimit.limit
 
-      const pooled = await getPooledOrgCurrentPeriodCost(subscription.referenceId, executor)
-      orgMemberIds = pooled.memberIds
-      lastPeriodCost = pooled.lastPeriodCost
-      const ledgerUsage = await getBillingPeriodUsageCost(
+      lastPeriodCost = await getOrgLastPeriodCost(subscription.referenceId, executor)
+      currentUsage = await getBillingPeriodUsageCost(
         { type: 'organization', id: subscription.referenceId },
         billingPeriod,
         undefined,
         executor
       )
-      currentUsage = pooled.currentPeriodCost + ledgerUsage
     } else {
       limit = stats.currentUsageLimit
         ? toNumber(toDecimal(stats.currentUsageLimit))
         : getFreeTierLimit()
     }
 
-    const billingPeriodStart = subscription?.periodStart ?? null
-    const billingPeriodEnd = subscription?.periodEnd ?? null
+    const billingPeriodStart = billingPeriod.source === 'default' ? null : billingPeriod.start
+    const billingPeriodEnd = billingPeriod.source === 'default' ? null : billingPeriod.end
 
-    let dailyRefreshConsumed = 0
+    let weeklyRefreshConsumed = 0
     if (subscription && isPaid(subscription.plan) && billingPeriodStart) {
-      const planDollars = getPlanTierDollars(subscription.plan)
-      if (planDollars > 0) {
-        if (orgScoped) {
-          if (orgMemberIds.length > 0) {
-            const userBounds = await getOrgMemberRefreshBounds(
-              subscription.referenceId,
-              billingPeriodStart,
-              executor
-            )
-            dailyRefreshConsumed = await computeDailyRefreshConsumed(
-              {
-                userIds: orgMemberIds,
-                periodStart: billingPeriodStart,
-                periodEnd: billingPeriodEnd,
-                planDollars,
-                seats: subscription.seats || 1,
-                userBounds: Object.keys(userBounds).length > 0 ? userBounds : undefined,
-                billingEntity: { type: 'organization', id: subscription.referenceId },
-              },
-              executor
-            )
-          }
-        } else {
-          dailyRefreshConsumed = await computeDailyRefreshConsumed(
-            {
-              userIds: [userId],
-              periodStart: billingPeriodStart,
-              periodEnd: billingPeriodEnd,
-              planDollars,
-              billingEntity: { type: 'user', id: userId },
-            },
-            executor
-          )
-        }
+      const weeklyRefreshDollars = getPlanWeeklyRefreshDollars(subscription.plan)
+      if (weeklyRefreshDollars > 0) {
+        weeklyRefreshConsumed = await computeWeeklyRefreshConsumed(
+          {
+            billingEntity: orgScoped
+              ? { type: 'organization', id: subscription.referenceId }
+              : { type: 'user', id: userId },
+            periodStart: billingPeriodStart,
+            periodEnd: billingPeriodEnd,
+            weeklyRefreshDollars,
+            seats: orgScoped ? subscription.seats || 1 : undefined,
+          },
+          executor
+        )
       }
     }
 
-    const effectiveUsage = Math.max(0, currentUsage - dailyRefreshConsumed)
+    const effectiveUsage = Math.max(0, currentUsage - weeklyRefreshConsumed)
     const percentUsed = limit > 0 ? Math.min((effectiveUsage / limit) * 100, 100) : 0
     const isWarning = percentUsed >= 80
     const isExceeded = effectiveUsage >= limit
 
     return {
-      currentUsage: effectiveUsage,
-      limit,
-      percentUsed,
-      isWarning,
-      isExceeded,
-      billingPeriodStart,
-      billingPeriodEnd,
-      lastPeriodCost,
+      usage: {
+        currentUsage: effectiveUsage,
+        limit,
+        percentUsed,
+        isWarning,
+        isExceeded,
+        billingPeriodStart,
+        billingPeriodEnd,
+        lastPeriodCost,
+      },
+      subscription,
+      personalCreditBalance: toNumber(toDecimal(stats.creditBalance)),
     }
   } catch (error) {
     logger.error('Failed to get user usage data', { userId, error })
     throw error
   }
+}
+
+/** Get comprehensive usage data for a user. */
+export async function getUserUsageData(
+  userId: string,
+  executor: DbClient = db
+): Promise<UsageData> {
+  return (await getResolvedUserUsageData(userId, executor)).usage
 }
 
 /**
@@ -396,38 +397,6 @@ export async function getUserUsageLimitInfo(userId: string): Promise<UsageLimitI
     logger.error('Failed to get usage limit info', { userId, error })
     throw error
   }
-}
-
-/**
- * Initialize usage limits for a new user
- */
-async function initializeUserUsageLimit(userId: string): Promise<void> {
-  // Check if user already has usage stats
-  const existingStats = await db
-    .select()
-    .from(userStats)
-    .where(eq(userStats.userId, userId))
-    .limit(1)
-
-  if (existingStats.length > 0) {
-    return
-  }
-
-  const subscription = await getHighestPrioritySubscription(userId)
-  const orgScoped = isOrgScopedSubscription(subscription, userId)
-
-  await db.insert(userStats).values({
-    id: generateId(),
-    userId,
-    currentUsageLimit: orgScoped ? null : getFreeTierLimit().toString(),
-    usageLimitUpdatedAt: new Date(),
-  })
-
-  logger.info('Initialized user stats', {
-    userId,
-    plan: subscription?.plan || 'free',
-    hasIndividualLimit: !orgScoped,
-  })
 }
 
 /**
@@ -504,13 +473,11 @@ export async function updateUserUsageLimit(
  * checks). Org-scoped subs return the organization limit;
  * personally-scoped subs return the individual user limit from userStats.
  *
- * Org-scoped members carry a null `currentUsageLimit` by design (see
- * `syncUsageLimitsFromSubscription`). A user whose subscription stops being
- * org-scoped without a resync would otherwise stay null and fail closed on
- * every execution, so a null limit self-heals to the plan/free base plus the
- * exact prepaid balance here. The write-back is best-effort: a limit written
- * concurrently wins, and a failed write still resolves to the fallback
- * instead of blocking execution.
+ * Legacy organization membership syncs may have cleared the personal limit.
+ * A null limit self-heals to the personal plan/free base plus the exact prepaid
+ * balance here. The write-back is best-effort: a limit written concurrently
+ * wins, and a failed write still resolves to the fallback instead of blocking
+ * execution.
  */
 export async function getUserUsageLimit(
   userId: string,
@@ -522,21 +489,16 @@ export async function getUserUsageLimit(
       : await getHighestPrioritySubscription(userId)
 
   if (isOrgScopedSubscription(subscription, userId) && subscription) {
-    const orgExists = await db
-      .select({ id: organization.id })
-      .from(organization)
-      .where(eq(organization.id, subscription.referenceId))
-      .limit(1)
-
-    if (orgExists.length === 0) {
-      throw new Error(`Organization not found: ${subscription.referenceId} for user: ${userId}`)
-    }
-
-    const orgLimit = await getOrgUsageLimit(
+    const orgLimit = await findOrgUsageLimit(
       subscription.referenceId,
       subscription.plan,
       subscription.seats
     )
+
+    if (!orgLimit) {
+      throw new Error(`Organization not found: ${subscription.referenceId} for user: ${userId}`)
+    }
+
     return orgLimit.limit
   }
 
@@ -631,11 +593,12 @@ export async function checkUsageStatus(userId: string): Promise<{
 }
 
 /**
- * Sync usage limits based on subscription changes
+ * Syncs the user's personal billing pool from their exact personal subscription.
+ * Organization subscriptions have a separate pool and never clear personal limits.
  */
 export async function syncUsageLimitsFromSubscription(userId: string): Promise<void> {
   const [subscription, currentUserStats] = await Promise.all([
-    getHighestPrioritySubscription(userId),
+    getHighestPriorityPersonalSubscription(userId, { onError: 'throw' }),
     db.select().from(userStats).where(eq(userStats.userId, userId)).limit(1),
   ])
 
@@ -643,25 +606,6 @@ export async function syncUsageLimitsFromSubscription(userId: string): Promise<v
     throw new Error(`User stats not found for userId: ${userId}`)
   }
 
-  const currentStats = currentUserStats[0]
-
-  if (isOrgScopedSubscription(subscription, userId)) {
-    if (currentStats.currentUsageLimit !== null) {
-      await db
-        .update(userStats)
-        .set({
-          currentUsageLimit: null,
-          usageLimitUpdatedAt: new Date(),
-        })
-        .where(eq(userStats.userId, userId))
-
-      logger.info('Cleared individual limit for org-scoped member', {
-        userId,
-        plan: subscription?.plan,
-      })
-    }
-    return
-  }
   const baseLimit = toDecimal(getPerUserMinimumLimit(subscription)).toString()
   const hasEntitledPersonalSubscription =
     subscription !== null && hasPaidSubscriptionStatus(subscription.status)
@@ -689,11 +633,10 @@ export async function syncUsageLimitsFromSubscription(userId: string): Promise<v
       : 'Reset limit to free-plus-prepaid minimum',
     { userId, baseLimit: Number(baseLimit) }
   )
-  // Keep higher custom limits unchanged only while personal billing is entitled.
 }
 
 /**
- * Returns the effective current period usage cost for a user, with daily
+ * Returns the effective current period usage cost for a user, with weekly
  * refresh credits deducted. Org-scoped subs return the pooled sum across
  * all org members; personally-scoped subs return this user's own cost.
  */
@@ -704,126 +647,38 @@ export async function getEffectiveCurrentPeriodCost(
   const subscription = await getHighestPrioritySubscription(userId, { executor })
   const orgScoped = isOrgScopedSubscription(subscription, userId)
 
-  let rawCost: number
-  let refreshUserIds: string[] = [userId]
-
-  if (orgScoped && subscription) {
-    const pooled = await getPooledOrgCurrentPeriodCost(subscription.referenceId, executor)
-    if (pooled.memberIds.length === 0) return 0
-    refreshUserIds = pooled.memberIds
-    const billingPeriod =
-      subscription.periodStart && subscription.periodEnd
-        ? { start: subscription.periodStart, end: subscription.periodEnd }
-        : defaultBillingPeriod()
-    rawCost =
-      pooled.currentPeriodCost +
-      (await getBillingPeriodUsageCost(
-        { type: 'organization', id: subscription.referenceId },
-        billingPeriod,
-        undefined,
-        executor
-      ))
-  } else {
-    const rows = await executor
-      .select({ current: userStats.currentPeriodCost })
-      .from(userStats)
-      .where(eq(userStats.userId, userId))
-      .limit(1)
-
-    if (rows.length === 0) return 0
-    const billingPeriod =
-      subscription?.periodStart && subscription.periodEnd
-        ? { start: subscription.periodStart, end: subscription.periodEnd }
-        : defaultBillingPeriod()
-    rawCost =
-      toNumber(toDecimal(rows[0].current)) +
-      (await getBillingPeriodUsageCost(
-        { type: 'user', id: userId },
-        billingPeriod,
-        undefined,
-        executor
-      ))
+  const billingPeriod = resolveSubscriptionUsagePeriod(subscription) ?? {
+    ...defaultBillingPeriod(),
+    source: 'default' as const,
+    anchorDate: null,
+    interval: null,
   }
+
+  const billingEntity: BillingEntity =
+    orgScoped && subscription
+      ? { type: 'organization', id: subscription.referenceId }
+      : { type: 'user', id: userId }
+  const rawCost = await getBillingPeriodUsageCost(billingEntity, billingPeriod, undefined, executor)
 
   if (!subscription || !isPaid(subscription.plan) || !subscription.periodStart) {
     return rawCost
   }
 
-  const planDollars = getPlanTierDollars(subscription.plan)
-  if (planDollars <= 0) return rawCost
+  const weeklyRefreshDollars = getPlanWeeklyRefreshDollars(subscription.plan)
+  if (weeklyRefreshDollars <= 0) return rawCost
 
-  const userBounds =
-    orgScoped && subscription.periodStart
-      ? await getOrgMemberRefreshBounds(
-          subscription.referenceId,
-          subscription.periodStart,
-          executor
-        )
-      : {}
-
-  const refreshConsumed = await computeDailyRefreshConsumed(
+  const refreshConsumed = await computeWeeklyRefreshConsumed(
     {
-      userIds: refreshUserIds,
+      billingEntity,
       periodStart: subscription.periodStart,
       periodEnd: subscription.periodEnd ?? null,
-      planDollars,
+      weeklyRefreshDollars,
       seats: subscription.seats || 1,
-      userBounds: Object.keys(userBounds).length > 0 ? userBounds : undefined,
-      billingEntity:
-        orgScoped && subscription
-          ? { type: 'organization', id: subscription.referenceId }
-          : { type: 'user', id: userId },
     },
     executor
   )
 
   return Math.max(0, rawCost - refreshConsumed)
-}
-
-/**
- * Calculate billing projection based on current usage
- */
-async function calculateBillingProjection(userId: string): Promise<BillingData> {
-  try {
-    const usageData = await getUserUsageData(userId)
-
-    if (!usageData.billingPeriodStart || !usageData.billingPeriodEnd) {
-      return {
-        currentPeriodCost: usageData.currentUsage,
-        projectedCost: usageData.currentUsage,
-        limit: usageData.limit,
-        billingPeriodStart: null,
-        billingPeriodEnd: null,
-        daysRemaining: 0,
-      }
-    }
-
-    const now = new Date()
-    const periodStart = new Date(usageData.billingPeriodStart)
-    const periodEnd = new Date(usageData.billingPeriodEnd)
-
-    const totalDays = Math.ceil(
-      (periodEnd.getTime() - periodStart.getTime()) / (1000 * 60 * 60 * 24)
-    )
-    const daysElapsed = Math.ceil((now.getTime() - periodStart.getTime()) / (1000 * 60 * 60 * 24))
-    const daysRemaining = Math.max(0, totalDays - daysElapsed)
-
-    // Project cost based on daily usage rate
-    const dailyRate = daysElapsed > 0 ? usageData.currentUsage / daysElapsed : 0
-    const projectedCost = dailyRate * totalDays
-
-    return {
-      currentPeriodCost: usageData.currentUsage,
-      projectedCost: Math.min(projectedCost, usageData.limit), // Cap at limit
-      limit: usageData.limit,
-      billingPeriodStart: usageData.billingPeriodStart,
-      billingPeriodEnd: usageData.billingPeriodEnd,
-      daysRemaining,
-    }
-  } catch (error) {
-    logger.error('Failed to calculate billing projection', { userId, error })
-    throw error
-  }
 }
 
 /**
@@ -855,27 +710,73 @@ export async function maybeSendUsageThresholdEmail(params: {
 
     const upgradeCreditsLink = params.workspaceId
       ? `${baseUrl}${buildUpgradeHref(params.workspaceId, 'credits')}`
-      : `${baseUrl}/workspace`
+      : `${baseUrl}${APP_ENTRY_PATH}`
+    /**
+     * Organization billing is reached through the workspace the usage occurred in
+     * — that is the only plane that serves it. Without a workspace there is no such
+     * link to build, so the account page is the honest fallback rather than a guess
+     * at which workspace the recipient would want.
+     */
     const billingSettingsLink =
-      params.scope === 'organization' && params.organizationId
-        ? `${baseUrl}/organization/${params.organizationId}/settings/billing`
+      params.scope === 'organization' && params.workspaceId
+        ? `${baseUrl}/workspace/${params.workspaceId}/settings/billing`
         : `${baseUrl}/account/settings/billing`
 
     // Check for 80% threshold crossing — used for paid users (budget warning) and free users (upgrade nudge)
     const crosses80 = params.percentBefore < 80 && params.percentAfter >= 80
-    // Check for 100% threshold (free users only — credits exhausted)
+    // Check for 100% threshold — every plan and scope (usage limit reached)
     const crosses100 = params.percentBefore < 100 && params.percentAfter >= 100
 
     // Skip if no thresholds crossed
     if (!crosses80 && !crosses100) return
 
-    // For 80% threshold email (paid users only)
-    if (crosses80 && !isFreeUser) {
+    /**
+     * Delivers to the account's notification recipients: the payer for personal
+     * scope, every org admin/owner for organization scope. Honors the per-user
+     * billing-notification toggle in both.
+     */
+    const deliverToScope = async (send: (email: string, name?: string) => Promise<void>) => {
+      if (params.scope === 'user' && params.userId && params.userEmail) {
+        const rows = await db
+          .select({ enabled: settings.billingUsageNotificationsEnabled })
+          .from(settings)
+          .where(eq(settings.userId, params.userId))
+          .limit(1)
+        if (rows.length > 0 && rows[0].enabled === false) return
+        await send(params.userEmail, params.userName)
+        return
+      }
+
+      if (params.scope === 'organization' && params.organizationId) {
+        const admins = await db
+          .select({
+            email: user.email,
+            name: user.name,
+            enabled: settings.billingUsageNotificationsEnabled,
+            role: member.role,
+          })
+          .from(member)
+          .innerJoin(user, eq(member.userId, user.id))
+          .leftJoin(settings, eq(settings.userId, member.userId))
+          .where(eq(member.organizationId, params.organizationId))
+
+        for (const a of admins) {
+          if (!isOrgAdminRole(a.role)) continue
+          if (a.enabled === false) continue
+          if (!a.email) continue
+          await send(a.email, a.name || undefined)
+        }
+      }
+    }
+
+    // !crosses100: one "reached" email, not a "nearing" and a "reached" in the same moment
+    if (crosses80 && !isFreeUser && !crosses100) {
       const ctaLink = billingSettingsLink
-      const sendTo = async (email: string, name?: string) => {
+      await deliverToScope(async (email, name) => {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
+        const { renderUsageThresholdEmail, getEmailSubject, sendEmail } = await loadEmailDelivery()
         const html = await renderUsageThresholdEmail({
           userName: name,
           planName: params.planName,
@@ -891,46 +792,17 @@ export async function maybeSendUsageThresholdEmail(params: {
           html,
           emailType: 'notifications',
         })
-      }
-
-      if (params.scope === 'user' && params.userId && params.userEmail) {
-        const rows = await db
-          .select({ enabled: settings.billingUsageNotificationsEnabled })
-          .from(settings)
-          .where(eq(settings.userId, params.userId))
-          .limit(1)
-        if (rows.length > 0 && rows[0].enabled === false) return
-        await sendTo(params.userEmail, params.userName)
-      } else if (params.scope === 'organization' && params.organizationId) {
-        const admins = await db
-          .select({
-            email: user.email,
-            name: user.name,
-            enabled: settings.billingUsageNotificationsEnabled,
-            role: member.role,
-          })
-          .from(member)
-          .innerJoin(user, eq(member.userId, user.id))
-          .leftJoin(settings, eq(settings.userId, member.userId))
-          .where(eq(member.organizationId, params.organizationId))
-
-        for (const a of admins) {
-          const isAdmin = isOrgAdminRole(a.role)
-          if (!isAdmin) continue
-          if (a.enabled === false) continue
-          if (!a.email) continue
-          await sendTo(a.email, a.name || undefined)
-        }
-      }
+      })
     }
 
     // For 80% threshold email (free users only — skip if they also crossed 100% in same call)
     if (crosses80 && isFreeUser && !crosses100) {
       const upgradeLink = upgradeCreditsLink
-      const sendFreeTierEmail = async (email: string, name?: string) => {
+      await deliverToScope(async (email, name) => {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
+        const { renderFreeTierUpgradeEmail, getEmailSubject, sendEmail } = await loadEmailDelivery()
         const html = await renderFreeTierUpgradeEmail({
           userName: name,
           percentUsed: Math.min(100, Math.round(params.percentAfter)),
@@ -952,56 +824,56 @@ export async function maybeSendUsageThresholdEmail(params: {
           currentUsage: params.currentUsageAfter,
           limit: params.limit,
         })
-      }
-
-      // Free users are always individual scope (not organization)
-      if (params.scope === 'user' && params.userId && params.userEmail) {
-        const rows = await db
-          .select({ enabled: settings.billingUsageNotificationsEnabled })
-          .from(settings)
-          .where(eq(settings.userId, params.userId))
-          .limit(1)
-        if (rows.length > 0 && rows[0].enabled === false) return
-        await sendFreeTierEmail(params.userEmail, params.userName)
-      }
+      })
     }
 
-    // For 100% threshold email (free users only — credits exhausted)
-    if (crosses100 && isFreeUser) {
-      const upgradeLink = upgradeCreditsLink
-      const sendExhaustedEmail = async (email: string, name?: string) => {
+    // Paid and org accounts get raise-your-limit copy — upgrading is not their remedy
+    if (crosses100) {
+      const useFreeCopy = isFreeUser && params.scope === 'user'
+
+      await deliverToScope(async (email, name) => {
         const prefs = await getEmailPreferences(email)
         if (prefs?.unsubscribeAll || prefs?.unsubscribeNotifications) return
 
-        const html = await renderCreditsExhaustedEmail({
-          userName: name,
-          limit: params.limit,
-          upgradeLink,
-        })
+        const {
+          renderCreditsExhaustedEmail,
+          renderUsageLimitReachedEmail,
+          getEmailSubject,
+          getLimitEmailSubject,
+          sendEmail,
+        } = await loadEmailDelivery()
+        const html = useFreeCopy
+          ? await renderCreditsExhaustedEmail({
+              userName: name,
+              limit: params.limit,
+              upgradeLink: upgradeCreditsLink,
+            })
+          : await renderUsageLimitReachedEmail({
+              userName: name,
+              planName: params.planName,
+              scope: params.scope,
+              currentUsage: params.currentUsageAfter,
+              limit: params.limit,
+              ctaLink: billingSettingsLink,
+            })
 
         await sendEmail({
           to: email,
-          subject: getEmailSubject('free-tier-exhausted'),
+          subject: useFreeCopy
+            ? getEmailSubject('free-tier-exhausted')
+            : getLimitEmailSubject('credits', 'reached'),
           html,
           emailType: 'notifications',
         })
 
-        logger.info('Free tier credits exhausted email sent', {
+        logger.info('Usage limit reached email sent', {
           email,
+          scope: params.scope,
+          planName: params.planName,
           currentUsage: params.currentUsageAfter,
           limit: params.limit,
         })
-      }
-
-      if (params.scope === 'user' && params.userId && params.userEmail) {
-        const rows = await db
-          .select({ enabled: settings.billingUsageNotificationsEnabled })
-          .from(settings)
-          .where(eq(settings.userId, params.userId))
-          .limit(1)
-        if (rows.length > 0 && rows[0].enabled === false) return
-        await sendExhaustedEmail(params.userEmail, params.userName)
-      }
+      })
     }
   } catch (error) {
     logger.error('Failed to send usage threshold email', {

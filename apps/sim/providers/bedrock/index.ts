@@ -1,5 +1,4 @@
 import {
-  type Message as BedrockMessage,
   BedrockRuntimeClient,
   type BedrockRuntimeClientConfig,
   type ContentBlock,
@@ -7,7 +6,7 @@ import {
   ConverseCommand,
   type ConverseResponse,
   ConverseStreamCommand,
-  type SystemContentBlock,
+  type OutputConfig,
   type Tool,
   type ToolConfiguration,
   type ToolResultBlock,
@@ -15,18 +14,41 @@ import {
 } from '@aws-sdk/client-bedrock-runtime'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
-import type { IterationToolCall, StreamingExecution } from '@/executor/types'
+import { isRecordLike } from '@sim/utils/object'
+import { validateAwsRegion } from '@/lib/core/security/input-validation'
+import type { IterationToolCall, NormalizedBlockOutput, StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
-import { buildBedrockMessageContent } from '@/providers/attachments'
+import { getBedrockBaseModelId } from '@/providers/bedrock/model-id'
+import { convertBedrockRequestHistory } from '@/providers/bedrock/request-history'
+import { createBedrockStreamingToolLoopStream } from '@/providers/bedrock/streaming-tool-loop'
 import {
   checkForForcedToolUsage,
   createReadableStreamFromBedrockStream,
   generateToolUseId,
   getBedrockInferenceProfileId,
+  supportsToolResultStatus,
+  toBedrockConversationUsage,
 } from '@/providers/bedrock/utils'
 import { getCachedProviderClient } from '@/providers/client-cache'
-import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
+import {
+  getModelCapabilities,
+  getProviderDefaultModel,
+  getProviderModels,
+  isKnownModelId,
+  supportsNativeStructuredOutputs,
+} from '@/providers/models'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError } from '@/providers/streaming-tool-loop-shared'
 import { enrichLastModelSegment } from '@/providers/trace-enrichment'
 import type {
   FunctionCallResponse,
@@ -42,7 +64,6 @@ import {
   prepareToolsWithUsageControl,
   sumToolCosts,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('BedrockProvider')
 
@@ -66,10 +87,7 @@ function enrichLastModelSegmentFromBedrockResponse(
       return {
         id: b.toolUse.toolUseId ?? '',
         name: b.toolUse.name ?? '',
-        arguments:
-          input && typeof input === 'object' && !Array.isArray(input)
-            ? (input as Record<string, unknown>)
-            : {},
+        arguments: isRecordLike(input) ? (input as Record<string, unknown>) : {},
       }
     })
 
@@ -114,6 +132,15 @@ export const bedrockProvider: ProviderConfig = {
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
     const region = request.bedrockRegion || 'us-east-1'
+
+    // The AWS SDK interpolates the region into the Bedrock endpoint hostname, so an
+    // unvalidated value can redirect the signed request to an attacker-chosen host.
+    const regionValidation = validateAwsRegion(region, 'bedrockRegion')
+    if (!regionValidation.isValid) {
+      logger.warn('Blocked invalid Bedrock region', { error: regionValidation.error })
+      throw new Error(`Invalid Bedrock region: ${regionValidation.error}`)
+    }
+
     const bedrockModelId = getBedrockInferenceProfileId(request.model, region)
 
     logger.info('Bedrock request', {
@@ -150,82 +177,48 @@ export const bedrockProvider: ProviderConfig = {
       () => new BedrockRuntimeClient(clientConfig)
     )
 
-    const messages: BedrockMessage[] = []
-    const systemContent: SystemContentBlock[] = []
-
-    if (request.systemPrompt) {
-      systemContent.push({ text: request.systemPrompt })
-    }
-
-    if (request.context) {
-      messages.push({
-        role: 'user' as ConversationRole,
-        content: [{ text: request.context }],
-      })
-    }
-
-    if (request.messages) {
-      for (const msg of request.messages) {
-        if (msg.role === 'function' || msg.role === 'tool') {
-          const toolResultBlock: ToolResultBlock = {
-            toolUseId: msg.tool_call_id || msg.name || generateToolUseId('tool'),
-            content: [{ text: msg.content || '' }],
-          }
-          messages.push({
-            role: 'user' as ConversationRole,
-            content: [{ toolResult: toolResultBlock }],
-          })
-        } else if (msg.function_call || msg.tool_calls) {
-          const toolCall = msg.function_call || msg.tool_calls?.[0]?.function
-          if (toolCall) {
-            const toolUseBlock: ToolUseBlock = {
-              toolUseId: msg.tool_calls?.[0]?.id || generateToolUseId(toolCall.name),
-              name: toolCall.name,
-              input: JSON.parse(toolCall.arguments),
-            }
-            messages.push({
-              role: 'assistant' as ConversationRole,
-              content: [{ toolUse: toolUseBlock }],
-            })
-          }
-        } else {
-          const role: ConversationRole = msg.role === 'assistant' ? 'assistant' : 'user'
-          const content = buildBedrockMessageContent(msg.content, msg.files, 'bedrock')
-          messages.push({
-            role,
-            // double-cast-allowed: shared attachment builder emits Bedrock Converse content blocks while keeping provider-neutral attachment types
-            content: content as unknown as ContentBlock[],
-          })
-        }
-      }
-    }
+    const { messages, systemContent } = convertBedrockRequestHistory(request)
 
     if (messages.length === 0) {
       messages.push({
         role: 'user' as ConversationRole,
-        content: [{ text: request.systemPrompt || 'Hello' }],
+        content: [{ text: 'Hello' }],
       })
-      systemContent.length = 0
     }
 
     let structuredOutputTool: Tool | undefined
+    let outputConfig: OutputConfig | undefined
     const structuredOutputToolName = 'structured_output'
 
     if (request.responseFormat) {
       const schema = request.responseFormat.schema || request.responseFormat
       const schemaName = request.responseFormat.name || 'response'
 
-      structuredOutputTool = {
-        toolSpec: {
-          name: structuredOutputToolName,
-          description: `Output the response as structured JSON matching the ${schemaName} schema. You MUST call this tool to provide your final response.`,
-          inputSchema: {
-            json: schema,
+      if (supportsNativeStructuredOutputs(request.model) && !request.tools?.length) {
+        outputConfig = {
+          textFormat: {
+            type: 'json_schema',
+            structure: {
+              jsonSchema: {
+                name: schemaName,
+                schema: JSON.stringify(schema),
+              },
+            },
           },
-        },
+        }
+        logger.info(`Using native structured outputs: ${schemaName}`)
+      } else {
+        structuredOutputTool = {
+          toolSpec: {
+            name: structuredOutputToolName,
+            description: `Output the response as structured JSON matching the ${schemaName} schema. You MUST call this tool to provide your final response.`,
+            inputSchema: {
+              json: schema,
+            },
+          },
+        }
+        logger.info(`Using tool-based structured outputs: ${schemaName}`)
       }
-
-      logger.info(`Using Tool Use approach for structured outputs: ${schemaName}`)
     }
 
     let bedrockTools: Tool[] | undefined
@@ -247,52 +240,56 @@ export const bedrockProvider: ProviderConfig = {
         },
       }))
 
-      try {
-        preparedTools = prepareToolsWithUsageControl(
-          bedrockTools.map((t) => ({
-            name: t.toolSpec?.name || '',
-            description: t.toolSpec?.description || '',
-            input_schema: t.toolSpec?.inputSchema?.json,
-          })),
-          request.tools,
-          logger,
-          'bedrock'
-        )
+      preparedTools = prepareToolsWithUsageControl(
+        bedrockTools.map((t) => ({
+          name: t.toolSpec?.name || '',
+          description: t.toolSpec?.description || '',
+          input_schema: t.toolSpec?.inputSchema?.json,
+        })),
+        request.tools,
+        logger,
+        'bedrock'
+      )
 
-        const { tools: filteredTools, toolChoice: tc } = preparedTools
-
-        if (filteredTools?.length) {
-          bedrockTools = filteredTools.map((t: any) => ({
+      const { tools: filteredTools, toolChoice: preparedToolChoice } = preparedTools
+      bedrockTools = filteredTools?.length
+        ? filteredTools.map((tool) => ({
             toolSpec: {
-              name: t.name,
-              description: t.description,
-              inputSchema: { json: t.input_schema },
+              name: tool.name,
+              description: tool.description,
+              inputSchema: { json: tool.input_schema },
             },
           }))
+        : undefined
 
-          if (typeof tc === 'object' && tc !== null) {
-            if (tc.type === 'tool' && tc.name) {
-              toolChoice = { tool: { name: tc.name } }
-              logger.info(`Using Bedrock tool_choice format: force tool "${tc.name}"`)
-            } else if (tc.type === 'function' && tc.function?.name) {
-              toolChoice = { tool: { name: tc.function.name } }
-              logger.info(`Using Bedrock tool_choice format: force tool "${tc.function.name}"`)
-            } else if (tc.type === 'any') {
-              toolChoice = { any: {} }
-              logger.info('Using Bedrock tool_choice format: any tool')
-            } else {
-              toolChoice = { auto: {} }
-            }
-          } else if (tc === 'none') {
-            toolChoice = undefined
-            bedrockTools = undefined
-          } else {
-            toolChoice = { auto: {} }
-          }
+      if (bedrockTools?.length) {
+        if (preparedToolChoice === 'auto') {
+          toolChoice = { auto: {} }
+        } else if (preparedToolChoice === 'none') {
+          toolChoice = undefined
+          bedrockTools = undefined
+        } else if (
+          preparedToolChoice?.type === 'tool' &&
+          typeof preparedToolChoice.name === 'string' &&
+          preparedToolChoice.name.length > 0
+        ) {
+          toolChoice = { tool: { name: preparedToolChoice.name } }
+          logger.info(`Using Bedrock tool_choice format: force tool "${preparedToolChoice.name}"`)
+        } else if (
+          preparedToolChoice?.type === 'function' &&
+          typeof preparedToolChoice.function?.name === 'string' &&
+          preparedToolChoice.function.name.length > 0
+        ) {
+          toolChoice = { tool: { name: preparedToolChoice.function.name } }
+          logger.info(
+            `Using Bedrock tool_choice format: force tool "${preparedToolChoice.function.name}"`
+          )
+        } else if (preparedToolChoice?.type === 'any') {
+          toolChoice = { any: {} }
+          logger.info('Using Bedrock tool_choice format: any tool')
+        } else {
+          throw new Error('Invalid Bedrock tool choice returned by tool preparation')
         }
-      } catch (error) {
-        logger.error('Error in prepareToolsWithUsageControl:', { error })
-        toolChoice = { auto: {} }
       }
     } else if (structuredOutputTool) {
       bedrockTools = [structuredOutputTool]
@@ -340,14 +337,80 @@ export const bedrockProvider: ProviderConfig = {
 
     const systemPromptWithSchema = systemContent
 
-    const inferenceConfig: { temperature: number; maxTokens?: number } = {
-      temperature: Number.parseFloat(String(request.temperature ?? 0.7)),
+    const canonicalModelId = `bedrock/${getBedrockBaseModelId(request.model)}`
+    const knownModel = isKnownModelId(canonicalModelId)
+    const modelCapabilities = getModelCapabilities(canonicalModelId)
+    const inferenceConfig: { temperature?: number; maxTokens?: number } = {}
+    if (
+      (knownModel && modelCapabilities?.temperature) ||
+      (!knownModel && request.temperature != null)
+    ) {
+      inferenceConfig.temperature = Number.parseFloat(String(request.temperature ?? 0.7))
     }
     if (request.maxTokens != null) {
       inferenceConfig.maxTokens = Number.parseInt(String(request.maxTokens))
     }
 
-    const shouldStreamToolCalls = request.streamToolCalls ?? false
+    /**
+     * The live tool loop cannot honor responseFormat — structured output on
+     * Bedrock rides a final forced `structured_output` tool call that only the
+     * silent loop performs — so those requests fall back to the silent path.
+     */
+    const liveToolLoopSupported = !request.responseFormat
+
+    if (request.stream && liveToolLoopSupported && bedrockTools && bedrockTools.length > 0) {
+      logger.info('Using streaming tool loop for Bedrock request')
+
+      const providerStartTime = Date.now()
+      const providerStartTimeISO = new Date(providerStartTime).toISOString()
+      const timeSegments: TimeSegment[] = []
+      const forcedTools = preparedTools?.forcedTools || []
+
+      return createStreamingExecution({
+        model: request.model,
+        providerStartTime,
+        providerStartTimeISO,
+        timing: {
+          kind: 'accumulated',
+          modelTime: 0,
+          toolsTime: 0,
+          firstResponseTime: 0,
+          iterations: 1,
+          timeSegments,
+        },
+        initialTokens: { input: 0, output: 0, total: 0 },
+        initialCost: { total: 0.0, input: 0.0, output: 0.0 },
+        isStreaming: true,
+        streamFormat: 'agent-events-v1',
+        createStream: ({ output, finalizeTiming }) =>
+          createBedrockStreamingToolLoopStream({
+            client,
+            modelId: bedrockModelId,
+            request,
+            messages,
+            system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
+            inferenceConfig,
+            bedrockTools,
+            toolChoice,
+            logger,
+            timeSegments,
+            forcedTools,
+            onComplete: (result) => {
+              output.content = result.content
+              output.tokens = result.tokens
+              output.cost = result.cost
+              output.toolCalls = result.toolCalls as NormalizedBlockOutput['toolCalls']
+              if (output.providerTiming) {
+                output.providerTiming.modelTime = result.modelTime
+                output.providerTiming.toolsTime = result.toolsTime
+                output.providerTiming.firstResponseTime = result.firstResponseTime
+                output.providerTiming.iterations = result.iterations
+              }
+              finalizeTiming()
+            },
+          }),
+      })
+    }
 
     if (request.stream && (!bedrockTools || bedrockTools.length === 0)) {
       logger.info('Using streaming response for Bedrock request (no tools)')
@@ -355,12 +418,15 @@ export const bedrockProvider: ProviderConfig = {
       const providerStartTime = Date.now()
       const providerStartTimeISO = new Date(providerStartTime).toISOString()
 
-      const command = new ConverseStreamCommand({
-        modelId: bedrockModelId,
-        messages,
-        system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
-        inferenceConfig,
-      })
+      const command = new ConverseStreamCommand(
+        await prepareConversationGeneration(request, 'bedrock', {
+          modelId: bedrockModelId,
+          messages,
+          system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
+          inferenceConfig,
+          outputConfig,
+        })
+      )
 
       const streamResponse = await client.send(
         command,
@@ -380,8 +446,16 @@ export const bedrockProvider: ProviderConfig = {
         initialTokens: { input: 0, output: 0, total: 0 },
         initialCost: { total: 0.0, input: 0.0, output: 0.0 },
         isStreaming: true,
+        streamFormat: 'agent-events-v1',
         createStream: ({ output, finalizeTiming }) =>
-          createReadableStreamFromBedrockStream(bedrockStream, (content, usage) => {
+          createReadableStreamFromBedrockStream(bedrockStream, async (content, usage, message) => {
+            await captureProviderConversationStep(
+              request,
+              'bedrock',
+              message,
+              toBedrockConversationUsage(usage, request.model),
+              { requestHistory: messages }
+            )
             output.content = content
             output.tokens = {
               input: usage.inputTokens,
@@ -403,6 +477,29 @@ export const bedrockProvider: ProviderConfig = {
       return streamingResult
     }
 
+    const captureConversationResponse = async (
+      response: ConverseResponse,
+      requestHistory: readonly unknown[]
+    ) => {
+      const message = response.output?.message
+      if (!message) return
+      const structured =
+        structuredOutputTool &&
+        message.content?.find((block) => block.toolUse?.name === structuredOutputToolName)
+      await captureProviderConversationStep(
+        request,
+        'bedrock',
+        structured?.toolUse
+          ? {
+              role: 'assistant',
+              content: [{ text: JSON.stringify(structured.toolUse.input, null, 2) }],
+            }
+          : message,
+        toBedrockConversationUsage(response.usage, request.model),
+        { requestHistory }
+      )
+    }
+
     const providerStartTime = Date.now()
     const providerStartTimeISO = new Date(providerStartTime).toISOString()
 
@@ -412,22 +509,26 @@ export const bedrockProvider: ProviderConfig = {
       const forcedTools = preparedTools?.forcedTools || []
       let usedForcedTools: string[] = []
 
-      const command = new ConverseCommand({
-        modelId: bedrockModelId,
-        messages,
-        system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
-        inferenceConfig,
-        toolConfig,
-      })
+      const command = new ConverseCommand(
+        await prepareConversationGeneration(request, 'bedrock', {
+          modelId: bedrockModelId,
+          messages,
+          system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
+          inferenceConfig,
+          outputConfig,
+          toolConfig,
+        })
+      )
 
       let currentResponse = await client.send(
         command,
         request.abortSignal ? { abortSignal: request.abortSignal } : undefined
       )
+      await captureConversationResponse(currentResponse, messages)
+
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = ''
-      let hasExtractedStructuredOutput = false
       if (currentResponse.output?.message?.content) {
         const structuredOutputCall = currentResponse.output.message.content.find(
           (block): block is ContentBlock & { toolUse: ToolUseBlock } =>
@@ -436,7 +537,6 @@ export const bedrockProvider: ProviderConfig = {
 
         if (structuredOutputCall && structuredOutputTool) {
           content = JSON.stringify(structuredOutputCall.toolUse.input, null, 2)
-          hasExtractedStructuredOutput = true
           logger.info('Extracted structured output from tool call')
         } else {
           const textBlocks = currentResponse.output.message.content.filter(
@@ -520,7 +620,12 @@ export const bedrockProvider: ProviderConfig = {
         )
         const currentToolUses = toolUseContentBlocks.map((block) => block.toolUse)
 
-        if (!currentToolUses || currentToolUses.length === 0) {
+        if (currentToolUses.length > 0 && currentResponse.stopReason !== 'tool_use') {
+          throw new Error(
+            `Bedrock returned tool use with stop reason ${currentResponse.stopReason ?? 'missing'}`
+          )
+        }
+        if (currentToolUses.length === 0) {
           break
         }
 
@@ -529,31 +634,78 @@ export const bedrockProvider: ProviderConfig = {
         const toolExecutionPromises = currentToolUses.map(async (toolUse: ToolUseBlock) => {
           const toolCallStartTime = Date.now()
           const toolName = toolUse.name || ''
-          const toolArgs = (toolUse.input as Record<string, any>) || {}
+          const toolArgs = isRecordLike(toolUse.input)
+            ? (toolUse.input as Record<string, unknown>)
+            : undefined
           const toolUseId = toolUse.toolUseId || generateToolUseId(toolName)
 
           try {
-            const tool = request.tools?.find((t) => t.id === toolName)
-            if (!tool) return null
+            if (!toolArgs) {
+              throw new Error(`Arguments for tool "${toolName}" must be an object`)
+            }
 
-            const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-            const result = await executeTool(toolName, executionParams, {
-              signal: request.abortSignal,
-            })
+            const tool = request.tools?.find((t) => t.id === toolName)
+            if (!tool) {
+              await recordProviderConversationToolError(
+                request,
+                toolUse.toolUseId,
+                toolName,
+                `Tool "${toolName}" is not available`
+              )
+              const toolCallEndTime = Date.now()
+              return {
+                toolUseId,
+                toolName,
+                toolArgs,
+                toolParams: {},
+                result: {
+                  success: false,
+                  output: undefined,
+                  error: `Tool not found: ${toolName}`,
+                },
+                startTime: toolCallStartTime,
+                endTime: toolCallEndTime,
+                duration: toolCallEndTime - toolCallStartTime,
+              }
+            }
+
+            const { toolParams, executionParams } = prepareToolExecution(
+              tool,
+              toolArgs,
+              request,
+              toolUse.toolUseId
+            )
+            const { rawResponse, modelResponse } = await executeProviderTool(
+              toolName,
+              executionParams,
+              {
+                signal: request.abortSignal,
+              }
+            )
             const toolCallEndTime = Date.now()
 
             return {
               toolUseId,
               toolName,
-              toolArgs,
+              toolArgs: toolArgs ?? {},
               toolParams,
-              result,
+              result: rawResponse,
+              modelResult: modelResponse,
               startTime: toolCallStartTime,
               endTime: toolCallEndTime,
               duration: toolCallEndTime - toolCallStartTime,
             }
           } catch (error) {
+            if (isAbortError(error) || request.abortSignal?.aborted) {
+              throw error
+            }
             const toolCallEndTime = Date.now()
+            await recordProviderConversationToolError(
+              request,
+              toolUse.toolUseId,
+              toolName,
+              getErrorMessage(error, 'Tool execution failed')
+            )
             logger.error('Error processing tool call:', { error, toolName })
 
             return {
@@ -573,15 +725,13 @@ export const bedrockProvider: ProviderConfig = {
           }
         })
 
-        const executionResults = await Promise.allSettled(toolExecutionPromises)
+        const executionResults = await Promise.all(toolExecutionPromises)
 
-        const assistantContent: ContentBlock[] = currentToolUses.map((toolUse: ToolUseBlock) => ({
-          toolUse: {
-            toolUseId: toolUse.toolUseId,
-            name: toolUse.name,
-            input: toolUse.input,
-          },
-        }))
+        // Bedrock rejects a blank text block on replay even when it produced
+        // one itself, so drop whitespace-only text while echoing the rest.
+        const assistantContent: ContentBlock[] = (
+          currentResponse.output?.message?.content ?? []
+        ).filter((block) => !('text' in block) || Boolean(block.text?.trim()))
         currentMessages.push({
           role: 'assistant' as ConversationRole,
           content: assistantContent,
@@ -589,9 +739,7 @@ export const bedrockProvider: ProviderConfig = {
 
         const toolResultContent: ContentBlock[] = []
 
-        for (const settledResult of executionResults) {
-          if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+        for (const executionResult of executionResults) {
           const {
             toolUseId,
             toolName,
@@ -601,7 +749,11 @@ export const bedrockProvider: ProviderConfig = {
             startTime,
             endTime,
             duration,
-          } = settledResult.value
+          } = executionResult
+          const modelResult =
+            'modelResult' in executionResult && executionResult.modelResult
+              ? executionResult.modelResult
+              : result
 
           timeSegments.push({
             type: 'tool',
@@ -611,10 +763,12 @@ export const bedrockProvider: ProviderConfig = {
             duration,
           })
 
-          let resultContent: any
+          let resultContent: unknown
           if (result.success) {
-            toolResults.push(result.output!)
-            resultContent = result.output
+            if (isRecordLike(result.output)) {
+              toolResults.push(result.output)
+            }
+            resultContent = result.output ?? null
           } else {
             resultContent = {
               error: true,
@@ -622,6 +776,13 @@ export const bedrockProvider: ProviderConfig = {
               tool: toolName,
             }
           }
+          const modelResultContent = modelResult.success
+            ? (modelResult.output ?? null)
+            : {
+                error: true,
+                message: modelResult.error || 'Tool execution failed',
+                tool: toolName,
+              }
 
           toolCalls.push({
             name: toolName,
@@ -635,7 +796,10 @@ export const bedrockProvider: ProviderConfig = {
 
           const toolResultBlock: ToolResultBlock = {
             toolUseId,
-            content: [{ text: JSON.stringify(resultContent) }],
+            content: [{ text: JSON.stringify(modelResultContent) }],
+            ...(supportsToolResultStatus(bedrockModelId)
+              ? { status: modelResult.success ? 'success' : 'error' }
+              : {}),
           }
           toolResultContent.push({ toolResult: toolResultBlock })
         }
@@ -668,20 +832,24 @@ export const bedrockProvider: ProviderConfig = {
 
         const nextModelStartTime = Date.now()
 
-        const nextCommand = new ConverseCommand({
-          modelId: bedrockModelId,
-          messages: currentMessages,
-          system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
-          inferenceConfig,
-          toolConfig: bedrockTools?.length
-            ? { tools: bedrockTools, toolChoice: nextToolChoice }
-            : undefined,
-        })
+        const nextCommand = new ConverseCommand(
+          await prepareConversationGeneration(request, 'bedrock', {
+            modelId: bedrockModelId,
+            messages: currentMessages,
+            system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
+            inferenceConfig,
+            toolConfig: bedrockTools?.length
+              ? { tools: bedrockTools, toolChoice: nextToolChoice }
+              : undefined,
+          })
+        )
 
         currentResponse = await client.send(
           nextCommand,
           request.abortSignal ? { abortSignal: request.abortSignal } : undefined
         )
+
+        await captureConversationResponse(currentResponse, currentMessages)
 
         const nextToolUseContentBlocks = (currentResponse.output?.message?.content || []).filter(
           (block): block is ContentBlock & { toolUse: ToolUseBlock } => 'toolUse' in block
@@ -742,21 +910,24 @@ export const bedrockProvider: ProviderConfig = {
 
         const structuredOutputStartTime = Date.now()
 
-        const structuredOutputCommand = new ConverseCommand({
-          modelId: bedrockModelId,
-          messages: currentMessages,
-          system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
-          inferenceConfig,
-          toolConfig: {
-            tools: [structuredOutputTool],
-            toolChoice: { tool: { name: structuredOutputToolName } },
-          },
-        })
+        const structuredOutputCommand = new ConverseCommand(
+          await prepareConversationGeneration(request, 'bedrock', {
+            modelId: bedrockModelId,
+            messages: currentMessages,
+            system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
+            inferenceConfig,
+            toolConfig: {
+              tools: [structuredOutputTool],
+              toolChoice: { tool: { name: structuredOutputToolName } },
+            },
+          })
+        )
 
         const structuredResponse = await client.send(
           structuredOutputCommand,
           request.abortSignal ? { abortSignal: request.abortSignal } : undefined
         )
+        await captureConversationResponse(structuredResponse, currentMessages)
         const structuredOutputEndTime = Date.now()
 
         timeSegments.push({
@@ -780,7 +951,6 @@ export const bedrockProvider: ProviderConfig = {
 
         if (structuredOutputCall) {
           content = JSON.stringify(structuredOutputCall.toolUse.input, null, 2)
-          hasExtractedStructuredOutput = true
           logger.info('Extracted structured output from forced tool call')
         } else {
           logger.warn('Structured output tool was forced but no tool call found in response')
@@ -808,54 +978,9 @@ export const bedrockProvider: ProviderConfig = {
       const providerEndTimeISO = new Date(providerEndTime).toISOString()
       const totalDuration = providerEndTime - providerStartTime
 
-      if (request.stream && !shouldStreamToolCalls && !hasExtractedStructuredOutput) {
-        logger.info('Using streaming for final Bedrock response after tool processing')
-
-        const messagesHaveToolContent = currentMessages.some((msg) =>
-          msg.content?.some(
-            (block) =>
-              ('toolUse' in block && block.toolUse) || ('toolResult' in block && block.toolResult)
-          )
-        )
-
-        const streamToolConfig: ToolConfiguration | undefined =
-          messagesHaveToolContent && request.tools?.length
-            ? {
-                tools: request.tools.map((tool) => ({
-                  toolSpec: {
-                    name: tool.id,
-                    description: tool.description,
-                    inputSchema: {
-                      json: {
-                        type: 'object',
-                        properties: tool.parameters.properties,
-                        required: tool.parameters.required,
-                      },
-                    },
-                  },
-                })),
-                toolChoice: { auto: {} },
-              }
-            : undefined
-
-        const streamCommand = new ConverseStreamCommand({
-          modelId: bedrockModelId,
-          messages: currentMessages,
-          system: systemPromptWithSchema.length > 0 ? systemPromptWithSchema : undefined,
-          inferenceConfig,
-          toolConfig: streamToolConfig,
-        })
-
-        const streamResponse = await client.send(
-          streamCommand,
-          request.abortSignal ? { abortSignal: request.abortSignal } : undefined
-        )
-
-        if (!streamResponse.stream) {
-          throw new Error('No stream returned from Bedrock')
-        }
-
-        const bedrockStream = streamResponse.stream
+      if (request.stream && !liveToolLoopSupported) {
+        logger.info('Projecting settled Bedrock response after tool processing')
+        const toolCost = sumToolCosts(toolResults)
         const streamingResult = createStreamingExecution({
           model: request.model,
           providerStartTime,
@@ -865,39 +990,25 @@ export const bedrockProvider: ProviderConfig = {
             modelTime,
             toolsTime,
             firstResponseTime,
-            iterations: iterationCount + 1,
+            iterations: timeSegments.filter((segment) => segment.type === 'model').length,
             timeSegments,
           },
           initialTokens: { input: tokens.input, output: tokens.output, total: tokens.total },
           initialCost: {
             input: cost.input,
             output: cost.output,
-            toolCost: undefined as number | undefined,
-            total: cost.total,
+            toolCost: toolCost || undefined,
+            total: cost.total + toolCost,
           },
           toolCalls:
             toolCalls.length > 0 ? { list: toolCalls, count: toolCalls.length } : undefined,
           isStreaming: true,
-          createStream: ({ output, finalizeTiming }) =>
-            createReadableStreamFromBedrockStream(bedrockStream, (streamContent, usage) => {
-              output.content = streamContent
-              output.tokens = {
-                input: tokens.input + usage.inputTokens,
-                output: tokens.output + usage.outputTokens,
-                total: tokens.total + usage.inputTokens + usage.outputTokens,
-              }
-
-              const streamCost = calculateCost(request.model, usage.inputTokens, usage.outputTokens)
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: cost.input + streamCost.input,
-                output: cost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: cost.total + streamCost.total + tc,
-              }
-
-              finalizeTiming()
-            }),
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
         })
 
         return streamingResult
@@ -932,7 +1043,7 @@ export const bedrockProvider: ProviderConfig = {
           modelTime,
           toolsTime,
           firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments,
         },
       }
@@ -945,6 +1056,14 @@ export const bedrockProvider: ProviderConfig = {
         error,
         duration: totalDuration,
       })
+
+      if (
+        isAbortError(error) ||
+        request.abortSignal?.aborted ||
+        isConversationContextError(error)
+      ) {
+        throw error
+      }
 
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,

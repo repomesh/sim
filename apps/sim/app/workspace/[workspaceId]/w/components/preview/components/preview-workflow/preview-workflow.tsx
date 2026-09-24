@@ -1,23 +1,39 @@
 'use client'
 
 import { useEffect, useMemo, useRef } from 'react'
-import { useParams } from 'next/navigation'
-import ReactFlow, {
+import {
   ConnectionLineType,
   type Edge,
   type EdgeTypes,
   type Node,
   type NodeTypes,
+  ReactFlow,
   ReactFlowProvider,
   useReactFlow,
-} from 'reactflow'
-import 'reactflow/dist/style.css'
+} from '@xyflow/react'
+import { useParams } from 'next/navigation'
+import '@xyflow/react/dist/style.css'
 
 import { cn } from '@sim/emcn'
 import { createLogger } from '@sim/logger'
-import { BLOCK_DIMENSIONS, CONTAINER_DIMENSIONS } from '@sim/workflow-renderer'
+import {
+  BLOCK_DIMENSIONS,
+  BLOCK_Z_BASE,
+  CANVAS_Z_INDEX_MODE,
+  CONTAINER_CHILD_Z_BASE,
+  CONTAINER_DIMENSIONS,
+  EDGE_Z_BASE,
+  EDGE_Z_MAX,
+  getEdgeZIndexForTarget,
+  sortNodesParentsFirst,
+  useCanvasColorMode,
+} from '@sim/workflow-renderer'
+import { normalizeWorkflowEdgeHandles } from '@sim/workflow-types/workflow'
 import { WorkflowEdge } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/workflow-edge/workflow-edge'
-import { estimateBlockDimensions } from '@/app/workspace/[workspaceId]/w/[workflowId]/utils'
+import {
+  estimateBlockDimensions,
+  SUBFLOW_CHILD_NODE_CLASS,
+} from '@/app/workspace/[workspaceId]/w/[workflowId]/utils'
 import { PreviewBlock } from '@/app/workspace/[workspaceId]/w/components/preview/components/preview-workflow/components/block'
 import { PreviewSubflow } from '@/app/workspace/[workspaceId]/w/components/preview/components/preview-workflow/components/subflow'
 import { useWorkflowMap } from '@/hooks/queries/workflows'
@@ -241,6 +257,7 @@ export function PreviewWorkflow({
   // placeholder map must not mislabel valid workflows as deleted.
   const workflowLabelsReady = isWorkflowMapLoaded && !isWorkflowMapPlaceholderData
   const containerRef = useRef<HTMLDivElement>(null)
+  const colorMode = useCanvasColorMode()
   const nodeTypes = previewNodeTypes
   const isValidWorkflowState = workflowState?.blocks && workflowState.edges
 
@@ -363,18 +380,30 @@ export function PreviewWorkflow({
     }
   }, [workflowState.edges, isValidWorkflowState])
 
+  /**
+   * Blocks that already route failures somewhere, as a content key.
+   *
+   * Such a block keeps its error port whatever its own flag says — React Flow
+   * drops an edge whose handle never mounts. A string rather than a Set so a
+   * re-received edges array with the same content does not rebuild every node.
+   * The raw handle is safe to test: `normalizeWorkflowEdgeHandles` only rewrites
+   * the side-anchored source ids, never `error`.
+   */
+  const errorSourceBlockKey = useMemo(() => {
+    const ids = new Set<string>()
+    for (const edge of workflowState.edges ?? []) {
+      if (edge.sourceHandle === 'error') ids.add(edge.source)
+    }
+    return [...ids].sort().join(',')
+  }, [workflowState.edges])
+
   const nodes: Node[] = useMemo(() => {
     if (!isValidWorkflowState) return []
 
     const nodeArray: Node[] = []
+    const blocksWithErrorEdge = new Set(errorSourceBlockKey ? errorSourceBlockKey.split(',') : [])
 
-    const sortedBlocks = Object.entries(workflowState.blocks || {}).sort(
-      ([, left], [, right]) =>
-        calculateNestingDepth(left, workflowState.blocks) -
-        calculateNestingDepth(right, workflowState.blocks)
-    )
-
-    sortedBlocks.forEach(([blockId, block]) => {
+    Object.entries(workflowState.blocks || {}).forEach(([blockId, block]) => {
       if (!block || !block.type) {
         logger.warn(`Skipping invalid block: ${blockId}`)
         return
@@ -389,22 +418,22 @@ export function PreviewWorkflow({
 
         // Check for direct error on the subflow block itself (e.g., loop resolution errors)
         // before falling back to children-derived status
-        const directExecution = blockExecutionMap.get(blockId)
+        const blockExecution = blockExecutionMap.get(blockId)
         const subflowExecutionStatus: ExecutionStatus | undefined =
-          directExecution?.status === 'error'
+          blockExecution?.status === 'error'
             ? 'error'
             : (getSubflowExecutionStatus(blockId) ??
-              (directExecution ? (directExecution.status as ExecutionStatus) : undefined))
+              (blockExecution ? (blockExecution.status as ExecutionStatus) : undefined))
 
         nodeArray.push({
           id: blockId,
           type: 'subflowNode',
           position: block.position,
           parentId,
+          className: parentId ? SUBFLOW_CHILD_NODE_CLASS : undefined,
           extent: block.data?.extent || undefined,
           draggable: false,
           zIndex: nestingDepth,
-          className: parentId ? 'nested-subflow-node' : undefined,
           data: {
             ...block.data,
             name: block.name,
@@ -445,9 +474,10 @@ export function PreviewWorkflow({
         type: nodeType,
         position: block.position,
         parentId,
+        className: parentId ? SUBFLOW_CHILD_NODE_CLASS : undefined,
         extent: block.data?.extent || undefined,
         draggable: false,
-        zIndex: parentId ? 1000 : undefined,
+        zIndex: parentId ? CONTAINER_CHILD_Z_BASE : BLOCK_Z_BASE,
         data: {
           type: block.type,
           name: block.name,
@@ -459,12 +489,14 @@ export function PreviewWorkflow({
           isPreviewSelected: isSelected,
           executionStatus,
           subBlockValues: block.subBlocks,
+          errorEnabled: block.errorEnabled === true,
+          hasErrorConnection: blocksWithErrorEdge.has(blockId),
           lightweight,
         },
       })
     })
 
-    return nodeArray
+    return sortNodesParentsFirst(nodeArray)
   }, [
     blocksStructure,
     loopsStructure,
@@ -476,6 +508,7 @@ export function PreviewWorkflow({
     getSubflowExecutionStatus,
     workflowMap,
     workflowLabelsReady,
+    errorSourceBlockKey,
     lightweight,
   ])
 
@@ -529,9 +562,24 @@ export function PreviewWorkflow({
       }
     }
 
-    return (workflowState.edges || []).map((edge) => {
+    /*
+     * Deployment versions and run snapshots are raw jsonb blobs that never
+     * pass through `loadWorkflowFromNormalizedTables`, so unlike the editor
+     * canvas their handles arrive un-canonicalized. React Flow drops an edge
+     * whose handle matches no mounted handle, so without this the preview
+     * renders the cards with no lines between them.
+     */
+    return normalizeWorkflowEdgeHandles(workflowState.edges).map((edge) => {
       const status = getEdgeExecutionStatus(edge)
       const isErrorEdge = edge.sourceHandle === 'error'
+      const baseZIndex =
+        status === 'success' ? EDGE_Z_MAX : isErrorEdge ? EDGE_Z_BASE + 2 : EDGE_Z_BASE
+      const targetBlock = workflowState.blocks[edge.target]
+      const targetContainerZIndex =
+        targetBlock?.type === 'loop' || targetBlock?.type === 'parallel'
+          ? calculateNestingDepth(targetBlock, workflowState.blocks)
+          : undefined
+
       return {
         id: edge.id,
         source: edge.source,
@@ -542,11 +590,17 @@ export function PreviewWorkflow({
           ...(status ? { executionStatus: status } : {}),
           sourceHandle: edge.sourceHandle,
         },
-        zIndex: status === 'success' ? 10 : isErrorEdge ? 5 : 0,
+        /* Inside the shared edge band, so a line clears the opaque container it
+           crosses and still passes behind cards. Execution status orders edges
+           within the band: a successful path draws over an error one, which
+           draws over an unexecuted one. A Loop/Parallel target overrides that
+           ordering so its node paints over the incoming segment. */
+        zIndex: getEdgeZIndexForTarget(baseZIndex, targetContainerZIndex),
       }
     })
   }, [
     edgesStructure,
+    workflowState.blocks,
     workflowState.edges,
     isValidWorkflowState,
     blockExecutionMap,
@@ -560,7 +614,7 @@ export function PreviewWorkflow({
         className='flex items-center justify-center rounded-lg border border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-900'
       >
         <div className='text-center text-gray-500 dark:text-gray-400'>
-          <div className='mb-2 font-medium text-lg'>⚠️ Logged State Not Found</div>
+          <div className='mb-2 text-lg'>⚠️ Logged State Not Found</div>
           <div className='text-sm'>
             This log was migrated from the old system and doesn't contain workflow state data.
           </div>
@@ -603,6 +657,8 @@ export function PreviewWorkflow({
           .preview-mode.interactive-nodes .react-flow__node * { cursor: pointer !important; }
         `}</style>
         <ReactFlow
+          colorMode={colorMode}
+          zIndexMode={CANVAS_Z_INDEX_MODE}
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
@@ -643,6 +699,7 @@ export function PreviewWorkflow({
               : undefined
           }
           onPaneClick={onPaneClick}
+          className='[--xy-background-color:var(--bg)]'
         />
         <FitViewOnChange
           nodeIds={blocksStructure.ids}

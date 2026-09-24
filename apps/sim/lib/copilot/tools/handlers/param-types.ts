@@ -32,8 +32,10 @@ export interface GetBlockUpstreamReferencesParams {
 export interface CreateWorkflowParams {
   name?: string
   workspaceId?: string
+  /** Canonical workflow-folder VFS path, for example `workflows/Dream`. */
+  folderPath?: string
+  /** Legacy executor input. New tool calls use folderPath and resolve the ID internally. */
   folderId?: string
-  description?: string
 }
 
 export interface CreateFolderParams {
@@ -46,6 +48,8 @@ export interface RunWorkflowParams {
   workflowId?: string
   workflow_input?: unknown
   input?: unknown
+  /** Queue the deployed workflow and return immediately instead of waiting for its output. */
+  async?: boolean
   /** Optional trigger block ID when the workflow has multiple entrypoints and the caller wants a specific one. */
   triggerBlockId?: string
   /** When true, run with the resolved trigger's generated mock payload instead of workflow_input. */
@@ -54,6 +58,11 @@ export interface RunWorkflowParams {
   inputFromExecutionId?: string
   /** When true, runs the deployed version instead of the draft. Default: false (draft). */
   useDeployedState?: boolean
+}
+
+export interface CancelWorkflowRunParams {
+  /** The workflow execution ID returned by run_workflow or query_logs. */
+  executionId: string
 }
 
 export interface RunWorkflowUntilBlockParams {
@@ -156,6 +165,8 @@ export interface DeployChatParams {
   subdomain?: string
   allowedEmails?: string[]
   outputConfigs?: unknown[]
+  includeThinking?: boolean
+  includeToolCalls?: boolean
 }
 
 export interface DeployMcpParams {
@@ -247,12 +258,6 @@ export interface RenameWorkflowParams {
   name: string
 }
 
-export interface UpdateWorkflowParams {
-  workflowId: string
-  name?: string
-  description?: string
-}
-
 export interface DeleteWorkflowParams {
   workflowIds: string[]
 }
@@ -302,6 +307,8 @@ export interface OpenResourceItem {
   type?: OpenResourceType
   id?: string
   path?: string
+  /** Saved-view id or exact name to open a table pinned to (table type only). */
+  view?: string
 }
 
 export interface OpenResourceParams {
@@ -315,4 +322,5 @@ export interface ValidOpenResourceParams {
   type: OpenResourceType
   id?: string
   path?: string
+  view?: string
 }

@@ -2,7 +2,7 @@ import { db } from '@sim/db'
 import { copilotChats } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
-import { and, eq, sql } from 'drizzle-orm'
+import { and, eq, isNull, sql } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import {
   deleteMothershipChatContract,
@@ -18,7 +18,7 @@ import {
 } from '@/lib/copilot/chat/lifecycle'
 import { normalizeMessage } from '@/lib/copilot/chat/persisted-message'
 import { reconcileChatStreamMarkers } from '@/lib/copilot/chat/stream-liveness'
-import { chatPubSub } from '@/lib/copilot/chat-status'
+import { publishChatStatusChanged } from '@/lib/copilot/chat-status'
 import {
   authenticateCopilotRequestSessionOnly,
   createInternalServerErrorResponse,
@@ -36,7 +36,7 @@ const logger = createLogger('MothershipChatAPI')
 export const GET = withRouteHandler(
   async (request: NextRequest, context: { params: Promise<{ chatId: string }> }) => {
     try {
-      const { userId, isAuthenticated } = await authenticateCopilotRequestSessionOnly()
+      const { userId, isAuthenticated, principal } = await authenticateCopilotRequestSessionOnly()
       if (!isAuthenticated || !userId) {
         return createUnauthorizedResponse()
       }
@@ -45,12 +45,17 @@ export const GET = withRouteHandler(
       if (!paramsResult.success) return paramsResult.response
       const { chatId } = paramsResult.data.params
 
-      const chat = await getAccessibleCopilotChatWithMessages(chatId, userId)
+      const chat = await getAccessibleCopilotChatWithMessages(chatId, userId, { principal })
       if (!chat || chat.type !== 'mothership') {
         return NextResponse.json({ success: false, error: 'Chat not found' }, { status: 404 })
       }
 
-      let streamSnapshot: {
+      // The Redis replay buffer is read here only to synthesize the in-flight
+      // assistant turn for the initial paint. The raw events are NOT shipped
+      // to the client: when `activeStreamId` is set, the client reconnects to
+      // the replay buffer (from seq 0) via the stream resume endpoint, which
+      // is the source of truth for streaming state.
+      let liveTurnSnapshot: {
         events: StreamBatchEvent[]
         previewSessions: FilePreviewSession[]
         status: string
@@ -84,7 +89,7 @@ export const GET = withRouteHandler(
             return null
           })
 
-          streamSnapshot = {
+          liveTurnSnapshot = {
             events: events.map(toStreamBatchEvent),
             previewSessions,
             status:
@@ -111,7 +116,7 @@ export const GET = withRouteHandler(
       const effectiveMessages = buildEffectiveChatTranscript({
         messages: normalizedMessages,
         activeStreamId: liveStreamId,
-        ...(streamSnapshot ? { streamSnapshot } : {}),
+        ...(liveTurnSnapshot ? { streamSnapshot: liveTurnSnapshot } : {}),
       })
 
       return NextResponse.json({
@@ -124,7 +129,19 @@ export const GET = withRouteHandler(
           resources: Array.isArray(chat.resources) ? chat.resources : [],
           createdAt: chat.createdAt,
           updatedAt: chat.updatedAt,
-          ...(streamSnapshot ? { streamSnapshot } : {}),
+          // Events stay out of the payload (the resume endpoint replays them),
+          // but the client still needs the run status to skip reconnecting to
+          // an already-terminal stream, and the preview sessions to seed the
+          // file preview panel before the reconnect lands.
+          ...(liveTurnSnapshot
+            ? {
+                streamSnapshot: {
+                  events: [],
+                  previewSessions: liveTurnSnapshot.previewSessions,
+                  status: liveTurnSnapshot.status,
+                },
+              }
+            : {}),
         },
       })
     } catch (error) {
@@ -137,7 +154,7 @@ export const GET = withRouteHandler(
 export const PATCH = withRouteHandler(
   async (request: NextRequest, context: { params: Promise<{ chatId: string }> }) => {
     try {
-      const { userId, isAuthenticated } = await authenticateCopilotRequestSessionOnly()
+      const { userId, isAuthenticated, principal } = await authenticateCopilotRequestSessionOnly()
       if (!isAuthenticated || !userId) {
         return createUnauthorizedResponse()
       }
@@ -146,6 +163,10 @@ export const PATCH = withRouteHandler(
       if (!parsed.success) return parsed.response
       const { chatId } = parsed.data.params
       const { title, isUnread, pinned } = parsed.data.body
+      const chat = await getAccessibleCopilotChatAuth(chatId, userId, { principal })
+      if (!chat || chat.type !== 'mothership') {
+        return NextResponse.json({ success: false, error: 'Chat not found' }, { status: 404 })
+      }
 
       const updates: Record<string, unknown> = {}
 
@@ -171,25 +192,29 @@ export const PATCH = withRouteHandler(
           and(
             eq(copilotChats.id, chatId),
             eq(copilotChats.userId, userId),
-            eq(copilotChats.type, 'mothership')
+            eq(copilotChats.type, 'mothership'),
+            isNull(copilotChats.deletedAt)
           )
         )
         .returning({
           id: copilotChats.id,
           workspaceId: copilotChats.workspaceId,
+          organizationId: copilotChats.organizationId,
         })
 
       if (!updatedChat) {
         return NextResponse.json({ success: false, error: 'Chat not found' }, { status: 404 })
       }
 
+      publishChatStatusChanged(
+        { ...updatedChat, userId },
+        {
+          chatId,
+          type: title !== undefined ? 'renamed' : 'updated',
+        }
+      )
       if (updatedChat.workspaceId) {
         if (title !== undefined) {
-          chatPubSub?.publishStatusChanged({
-            workspaceId: updatedChat.workspaceId,
-            chatId,
-            type: 'renamed',
-          })
           captureServerEvent(
             userId,
             'task_renamed',
@@ -232,7 +257,7 @@ export const PATCH = withRouteHandler(
 export const DELETE = withRouteHandler(
   async (request: NextRequest, context: { params: Promise<{ chatId: string }> }) => {
     try {
-      const { userId, isAuthenticated } = await authenticateCopilotRequestSessionOnly()
+      const { userId, isAuthenticated, principal } = await authenticateCopilotRequestSessionOnly()
       if (!isAuthenticated || !userId) {
         return createUnauthorizedResponse()
       }
@@ -241,34 +266,33 @@ export const DELETE = withRouteHandler(
       if (!parsed.success) return parsed.response
       const { chatId } = parsed.data.params
 
-      const chat = await getAccessibleCopilotChatAuth(chatId, userId)
+      const chat = await getAccessibleCopilotChatAuth(chatId, userId, { principal })
       if (!chat || chat.type !== 'mothership') {
         return NextResponse.json({ success: true })
       }
 
       const [deletedChat] = await db
-        .delete(copilotChats)
+        .update(copilotChats)
+        .set({ deletedAt: new Date() })
         .where(
           and(
             eq(copilotChats.id, chatId),
             eq(copilotChats.userId, userId),
-            eq(copilotChats.type, 'mothership')
+            eq(copilotChats.type, 'mothership'),
+            isNull(copilotChats.deletedAt)
           )
         )
         .returning({
           workspaceId: copilotChats.workspaceId,
+          organizationId: copilotChats.organizationId,
         })
 
       if (!deletedChat) {
         return NextResponse.json({ success: false, error: 'Chat not found' }, { status: 404 })
       }
 
+      publishChatStatusChanged({ ...deletedChat, userId }, { chatId, type: 'deleted' })
       if (deletedChat.workspaceId) {
-        chatPubSub?.publishStatusChanged({
-          workspaceId: deletedChat.workspaceId,
-          chatId,
-          type: 'deleted',
-        })
         captureServerEvent(
           userId,
           'task_deleted',

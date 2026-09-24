@@ -1,47 +1,23 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { dbChainMockFns, resetDbChainMock, resetEnvFlagsMock, setEnvFlags } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-  mockFlags,
   mockCheckBillingBlocked,
   mockCheckBillingEntityBlocked,
   mockCheckOrganizationMemberUsageLimit,
   mockCheckUsageStatus,
   mockGetHighestPriorityPersonalSubscription,
   mockGetOrganizationSubscription,
-  mockLimit,
 } = vi.hoisted(() => ({
-  mockFlags: { isBillingEnabled: true, isHosted: true },
   mockCheckBillingBlocked: vi.fn(),
   mockCheckBillingEntityBlocked: vi.fn(),
   mockCheckOrganizationMemberUsageLimit: vi.fn(),
   mockCheckUsageStatus: vi.fn(),
   mockGetHighestPriorityPersonalSubscription: vi.fn(),
   mockGetOrganizationSubscription: vi.fn(),
-  mockLimit: vi.fn(),
-}))
-
-vi.mock('@/lib/core/config/env-flags', () => ({
-  get isBillingEnabled() {
-    return mockFlags.isBillingEnabled
-  },
-  get isHosted() {
-    return mockFlags.isHosted
-  },
-}))
-
-vi.mock('@sim/db', () => ({
-  db: {
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          limit: mockLimit,
-        })),
-      })),
-    })),
-  },
 }))
 
 vi.mock('@/lib/billing/calculations/usage-monitor', () => ({
@@ -60,6 +36,7 @@ vi.mock('@/lib/billing/core/plan', () => ({
 }))
 
 import {
+  assertBillingAttributionOwner,
   assertBillingAttributionSnapshot,
   billingAttributionsEqual,
   checkAttributedBillingBlocks,
@@ -67,7 +44,9 @@ import {
   createAttributedBillingRequestEnvelope,
   requireAccountBillingDecisionHeader,
   requireBillingAttributionHeader,
+  requireBillingCallbackAttribution,
   requireBillingRequestIdHeader,
+  requireWorkspaceBillingAttributionHeader,
   resolveBillingAttribution,
   resolveLegacyV0BillingAttribution,
   resolveSystemBillingAttribution,
@@ -75,6 +54,10 @@ import {
   serializeBillingAttributionHeader,
   toBillingContext,
 } from '@/lib/billing/core/billing-attribution'
+
+afterAll(() => {
+  resetDbChainMock()
+})
 
 const ORG_SUBSCRIPTION = {
   id: 'sub-org-b',
@@ -86,9 +69,12 @@ const ORG_SUBSCRIPTION = {
   periodEnd: new Date('2026-08-01T00:00:00.000Z'),
 }
 
+afterAll(resetEnvFlagsMock)
+
 describe('resolveBillingAttribution', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     mockCheckBillingBlocked.mockResolvedValue({ blocked: false })
     mockCheckBillingEntityBlocked.mockResolvedValue({ blocked: false })
     mockCheckUsageStatus.mockResolvedValue({
@@ -108,7 +94,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('bills the workspace organization while retaining an external session actor', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -127,6 +113,7 @@ describe('resolveBillingAttribution', () => {
       billingEntity: { id: 'org-b', type: 'organization' },
       billingPeriod: {
         end: '2026-08-01T00:00:00.000Z',
+        source: 'stripe',
         start: '2026-07-01T00:00:00.000Z',
       },
       organizationId: 'org-b',
@@ -150,7 +137,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('resolves the system actor and payer from one workspace row', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -167,11 +154,11 @@ describe('resolveBillingAttribution', () => {
       organizationId: 'org-b',
       workspaceId: 'workspace-b',
     })
-    expect(mockLimit).toHaveBeenCalledTimes(1)
+    expect(dbChainMockFns.limit).toHaveBeenCalledTimes(1)
   })
 
   it('uses the workspace organization reference even when its billed owner has other memberships', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'multi-org-owner',
         organizationId: 'org-b',
@@ -192,7 +179,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('bills a personal workspace billed account without changing the API-key actor', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'personal-owner',
         organizationId: null,
@@ -222,7 +209,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('retains the exact personal payer when it has no subscription', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'personal-owner',
         organizationId: null,
@@ -245,7 +232,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('serializes only the payer fields needed by later billing gates', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -275,8 +262,8 @@ describe('resolveBillingAttribution', () => {
     expect(JSON.stringify(attribution)).not.toContain('stripe-subscription')
   })
 
-  it('carries only the normalized Enterprise concurrency metadata needed by admission', async () => {
-    mockLimit.mockResolvedValue([
+  it('carries only normalized Enterprise execution metadata needed by admission', async () => {
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -285,7 +272,11 @@ describe('resolveBillingAttribution', () => {
     mockGetOrganizationSubscription.mockResolvedValue({
       ...ORG_SUBSCRIPTION,
       plan: 'enterprise',
-      metadata: { concurrencyLimit: '1250', secret: 'must-not-cross-boundary' },
+      metadata: {
+        concurrencyLimit: '1250',
+        workflowExecutionTimeoutSeconds: '86400',
+        secret: 'must-not-cross-boundary',
+      },
     })
 
     const attribution = await resolveBillingAttribution({
@@ -296,12 +287,13 @@ describe('resolveBillingAttribution', () => {
     expect(attribution.payerSubscription).toMatchObject({
       plan: 'enterprise',
       enterpriseConcurrencyLimit: 1250,
+      enterpriseWorkflowExecutionTimeoutSeconds: 86_400,
     })
     expect(JSON.stringify(attribution)).not.toContain('must-not-cross-boundary')
   })
 
   it('rejects a subscription that does not belong to the exact workspace payer', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -321,7 +313,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('fails closed when the workspace payer cannot be resolved', async () => {
-    mockLimit.mockResolvedValue([])
+    dbChainMockFns.limit.mockResolvedValue([])
 
     await expect(
       resolveBillingAttribution({
@@ -332,7 +324,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('resolves markerless legacy-v0 from the current workspace payer', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -354,7 +346,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('returns no workspace payer for an opaque markerless legacy-v0 workspace', async () => {
-    mockLimit.mockResolvedValue([])
+    dbChainMockFns.limit.mockResolvedValue([])
 
     await expect(
       resolveLegacyV0BillingAttribution({
@@ -367,7 +359,7 @@ describe('resolveBillingAttribution', () => {
   })
 
   it('converts the serialized period back to the exact runtime billing context', async () => {
-    mockLimit.mockResolvedValue([
+    dbChainMockFns.limit.mockResolvedValue([
       {
         billedAccountUserId: 'owner-b',
         organizationId: 'org-b',
@@ -383,6 +375,7 @@ describe('resolveBillingAttribution', () => {
       billingEntity: { type: 'organization', id: 'org-b' },
       billingPeriod: {
         end: new Date('2026-08-01T00:00:00.000Z'),
+        source: 'stripe',
         start: new Date('2026-07-01T00:00:00.000Z'),
       },
     })
@@ -397,6 +390,7 @@ describe('serialized attribution boundaries', () => {
     billingPeriod: {
       start: '2026-07-01T00:00:00.000Z',
       end: '2026-08-01T00:00:00.000Z',
+      source: 'stripe',
     },
     organizationId: 'org-b',
     payerSubscription: {
@@ -410,6 +404,36 @@ describe('serialized attribution boundaries', () => {
     },
     workspaceId: 'workspace-b',
   }
+
+  it('settles the immutable organization owner without inventing a workspace on ledger replay', () => {
+    const snapshot = { ...attribution, workspaceId: null }
+    const headers = new Headers({
+      'x-sim-billing-attribution': serializeBillingAttributionHeader(snapshot),
+    })
+    expect(
+      requireBillingAttributionHeader(headers, { actorUserId: 'actor-a', organizationId: 'org-b' })
+    ).toEqual(snapshot)
+    expect(requireBillingCallbackAttribution(headers, { actorUserId: 'actor-a' })).toEqual(snapshot)
+    expect(() => requireBillingCallbackAttribution(headers, { actorUserId: 'other' })).toThrow()
+    expect(() =>
+      requireBillingCallbackAttribution(headers, {
+        actorUserId: 'actor-a',
+        workspaceId: 'workspace-b',
+      })
+    ).toThrow()
+    expect(() =>
+      requireBillingCallbackAttribution(headers, {
+        actorUserId: 'actor-a',
+        organizationId: 'org-other',
+      })
+    ).toThrow()
+    const workspaceHeaders = new Headers({
+      'x-sim-billing-attribution': serializeBillingAttributionHeader(attribution),
+    })
+    expect(() =>
+      requireBillingCallbackAttribution(workspaceHeaders, { actorUserId: 'actor-a' })
+    ).toThrow()
+  })
 
   it('round-trips and freezes a trusted internal-request snapshot', () => {
     const headers = new Headers({
@@ -433,6 +457,19 @@ describe('serialized attribution boundaries', () => {
         workspaceId: 'workspace-b',
       })
     ).toThrow('Billing attribution header is required')
+  })
+
+  it('restores an executor snapshot by canonical workspace without making its actor authority', () => {
+    const headers = new Headers({
+      'x-sim-billing-attribution': serializeBillingAttributionHeader(attribution),
+    })
+
+    expect(
+      requireWorkspaceBillingAttributionHeader(headers, { workspaceId: 'workspace-b' })
+    ).toEqual(attribution)
+    expect(() =>
+      requireWorkspaceBillingAttributionHeader(headers, { workspaceId: 'workspace-other' })
+    ).toThrow('does not match the authenticated request scope')
   })
 
   it('rejects inconsistent or cross-scope serialized snapshots', () => {
@@ -476,6 +513,7 @@ describe('serialized attribution boundaries', () => {
         billingPeriod: {
           start: '2026-06-30T20:00:00.000-04:00',
           end: '2026-07-31T20:00:00.000-04:00',
+          source: 'stripe',
         },
       })
     ).toBe(true)
@@ -485,8 +523,9 @@ describe('serialized attribution boundaries', () => {
 describe('checkAttributedUsageLimits', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockFlags.isBillingEnabled = true
-    mockFlags.isHosted = true
+    resetDbChainMock()
+    setEnvFlags({ isBillingEnabled: true })
+    setEnvFlags({ isHosted: true })
     mockCheckBillingBlocked.mockResolvedValue({ blocked: false })
     mockCheckBillingEntityBlocked.mockResolvedValue({ blocked: false })
     mockCheckUsageStatus.mockResolvedValue({
@@ -527,7 +566,7 @@ describe('checkAttributedUsageLimits', () => {
   }
 
   it('skips hosted freezes and caps when billing is disabled', async () => {
-    mockFlags.isBillingEnabled = false
+    setEnvFlags({ isBillingEnabled: false })
 
     await expect(checkAttributedUsageLimits(attribution)).resolves.toEqual({
       isExceeded: false,
@@ -685,6 +724,19 @@ describe('checkAttributedUsageLimits', () => {
       start: new Date('2026-07-01T00:00:00.000Z'),
     })
   })
+
+  it('preserves a custom reporting-period source for the per-member cap', async () => {
+    await checkAttributedUsageLimits({
+      ...attribution,
+      billingPeriod: { ...attribution.billingPeriod, source: 'reporting' },
+    })
+
+    expect(mockCheckOrganizationMemberUsageLimit).toHaveBeenCalledWith('external-a', 'org-b', {
+      end: new Date('2026-08-01T00:00:00.000Z'),
+      source: 'reporting',
+      start: new Date('2026-07-01T00:00:00.000Z'),
+    })
+  })
 })
 
 describe('modern billing envelopes', () => {
@@ -722,11 +774,43 @@ describe('modern billing envelopes', () => {
       billingPeriod: {
         start: '2026-07-01T00:00:00.000Z',
         end: '2026-08-01T00:00:00.000Z',
+        source: 'reporting' as const,
       },
     }
     const serialized = serializeAccountBillingDecisionHeader(decision)
     const headers = new Headers({ 'x-sim-billing-account-decision': serialized })
 
     expect(requireAccountBillingDecisionHeader(headers)).toEqual(decision)
+  })
+})
+
+describe('Search billing ownership', () => {
+  const attribution = {
+    actorUserId: 'reader',
+    workspaceId: null,
+    organizationId: 'org',
+    billedAccountUserId: 'owner',
+    billingEntity: { type: 'organization' as const, id: 'org' },
+    billingPeriod: { start: '2026-09-01T00:00:00.000Z', end: '2026-10-01T00:00:00.000Z' },
+    payerSubscription: null,
+  }
+  it('accepts the organization owner and preserves the actual actor', () => {
+    expect(assertBillingAttributionSnapshot(attribution)).toEqual(attribution)
+    expect(() =>
+      assertBillingAttributionOwner(attribution, { organizationId: 'org' })
+    ).not.toThrow()
+  })
+  it('rejects another organization and a workspace using the same ID', () => {
+    expect(() => assertBillingAttributionOwner(attribution, { organizationId: 'other' })).toThrow()
+    expect(() => assertBillingAttributionOwner(attribution, { workspaceId: 'org' })).toThrow()
+  })
+  it('does not turn a workspace billing organization into a resource grant', () => {
+    const workspaceAttribution = { ...attribution, workspaceId: 'workspace' }
+    expect(() =>
+      assertBillingAttributionOwner(workspaceAttribution, { workspaceId: 'workspace' })
+    ).not.toThrow()
+    expect(() =>
+      assertBillingAttributionOwner(workspaceAttribution, { organizationId: 'org' })
+    ).toThrow()
   })
 })

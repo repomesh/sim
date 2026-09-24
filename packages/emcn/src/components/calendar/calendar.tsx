@@ -1,7 +1,8 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { z } from 'zod'
+import { ChevronLeft, ChevronRight } from '../../icons'
 import { cn } from '../../lib/cn'
 import { Chip, chipVariants } from '../chip/chip'
 import { chipContentLabelClass } from '../chip/chip-chrome'
@@ -27,6 +28,7 @@ const WEEKDAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'] as const
 
 const DEFAULT_RANGE_START_TIME = '00:00'
 const DEFAULT_RANGE_END_TIME = '23:59'
+const localDateTimePartsSchema = z.tuple([z.iso.date(), z.iso.time()])
 
 function getDaysInMonth(year: number, month: number): number {
   return new Date(year, month + 1, 0).getDate()
@@ -131,8 +133,9 @@ function timeOfDayFrom(date: Date): string {
 
 /**
  * Parses a date value into its local day plus an optional time-of-day. Bare
- * `YYYY-MM-DD` strings are pure days (no time). Datetime strings parse through
- * `Date` so an explicit offset (`Z`, `-07:00`) resolves to the **local** day —
+ * `YYYY-MM-DD` strings are pure days (no time). Offset-free ISO datetimes keep
+ * their literal clock and fractional precision. Explicit offsets (`Z`, `-07:00`)
+ * parse through `Date` and resolve to the **local** day —
  * unlike {@link parseDateValue}'s date-slice fast path, which would read the
  * UTC day.
  *
@@ -153,6 +156,16 @@ export function parseDateTimeValue(value: string | Date | undefined): {
   }
   const parsed = value instanceof Date ? value : new Date(value)
   if (Number.isNaN(parsed.getTime())) return { date: null, time: null }
+  if (typeof value === 'string') {
+    const wallTime = localDateTimePartsSchema.safeParse(value.split('T'))
+    if (wallTime.success) {
+      const [, time] = wallTime.data
+      return {
+        date: parsed,
+        time: time.length === 8 && time.endsWith(':00') ? time.slice(0, 5) : time,
+      }
+    }
+  }
   if (typeof value === 'string' && value.includes('T')) {
     return { date: parsed, time: timeOfDayFrom(parsed) }
   }
@@ -206,16 +219,18 @@ interface CalendarSingleProps extends CalendarBaseProps {
   value?: string | Date
   /**
    * Called with the picked date in `YYYY-MM-DD` format — or, with `showTime`
-   * and a set time, the local wall time `YYYY-MM-DDTHH:mm[:ss]`.
+   * and a set time, the local wall time `YYYY-MM-DDTHH:mm[:ss[.fraction]]`.
    */
   onChange?: (value: string) => void
   /**
    * Adds a time-of-day input under the grid. Day picks keep the current time
-   * (seconds included when the seeded value had them); time edits re-emit on
+   * (seconds and fractional seconds included when supplied); time edits re-emit on
    * the selected (or today's) day. Without a time set, day picks emit bare
    * `YYYY-MM-DD` days.
    */
   showTime?: boolean
+  /** Label beside the time picker when `showTime` is enabled. Defaults to `Time`. */
+  timeLabel?: string
   /**
    * Today's calendar day (`YYYY-MM-DD`) in the caller's effective timezone;
    * drives the Today button and today ring. Defaults to the runtime's local
@@ -350,6 +365,7 @@ function SingleCalendarView({
   value,
   onChange,
   showTime = false,
+  timeLabel = 'Time',
   today: todayValue,
   className,
 }: CalendarSingleProps) {
@@ -424,23 +440,15 @@ function SingleCalendarView({
 
       {showTime && (
         <div className='mt-1 flex items-center gap-2'>
-          <span className='shrink-0 text-[var(--text-muted)] text-caption'>Time</span>
-          <ChipTimePicker
-            value={timeOfDay?.slice(0, 5)}
-            onChange={handleTimeChange}
-            fullWidth
-            flush
-          />
+          <span className='shrink-0 text-[var(--text-muted)] text-caption'>{timeLabel}</span>
+          <ChipTimePicker value={timeOfDay?.slice(0, 5)} onChange={handleTimeChange} fullWidth />
         </div>
       )}
 
       <button
         type='button'
         onClick={goToToday}
-        className={cn(
-          chipVariants({ variant: 'filled', fullWidth: true, flush: true }),
-          'mt-1 justify-center'
-        )}
+        className={cn(chipVariants({ variant: 'filled', fullWidth: true }), 'mt-1 justify-center')}
       >
         <span className={chipContentLabelClass}>Today</span>
       </button>
@@ -547,9 +555,9 @@ function RangeCalendarView({
 
       {showTime && (
         <div className='mt-1 flex items-center gap-2'>
-          <ChipTimePicker value={startTime} onChange={setStartTime} fullWidth flush />
+          <ChipTimePicker value={startTime} onChange={setStartTime} fullWidth />
           <span className='shrink-0 text-[var(--text-muted)] text-caption'>to</span>
-          <ChipTimePicker value={endTime} onChange={setEndTime} fullWidth flush />
+          <ChipTimePicker value={endTime} onChange={setEndTime} fullWidth />
         </div>
       )}
 

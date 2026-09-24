@@ -1,23 +1,32 @@
 /**
  * @vitest-environment node
  */
+
+import { environmentUtilsMockFns, resetEnvironmentUtilsMock } from '@sim/testing'
 import type { NextRequest } from 'next/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockGetEffectiveDecryptedEnv, mockGetProviderHandler } = vi.hoisted(() => ({
-  mockGetEffectiveDecryptedEnv: vi.fn(),
+const { mockGetEffectiveDecryptedEnv, mockGetExecutionEnvironment } = environmentUtilsMockFns
+
+afterAll(resetEnvironmentUtilsMock)
+
+const { mockGetProviderHandler, mockGetWorkspaceBilledAccountUserId } = vi.hoisted(() => ({
   mockGetProviderHandler: vi.fn(),
-}))
-
-vi.mock('@/lib/environment/utils', () => ({
-  getEffectiveDecryptedEnv: mockGetEffectiveDecryptedEnv,
+  mockGetWorkspaceBilledAccountUserId: vi.fn(),
 }))
 
 vi.mock('@/lib/webhooks/providers', () => ({
   getProviderHandler: mockGetProviderHandler,
 }))
 
-import { createExternalWebhookSubscription } from '@/lib/webhooks/provider-subscriptions'
+vi.mock('@/lib/billing/core/billing-attribution', () => ({
+  getWorkspaceBilledAccountUserId: mockGetWorkspaceBilledAccountUserId,
+}))
+
+import {
+  cleanupExternalWebhook,
+  createExternalWebhookSubscription,
+} from '@/lib/webhooks/provider-subscriptions'
 
 describe('createExternalWebhookSubscription', () => {
   beforeEach(() => {
@@ -117,5 +126,58 @@ describe('createExternalWebhookSubscription', () => {
     expect(mockGetEffectiveDecryptedEnv).not.toHaveBeenCalled()
     expect(result.externalSubscriptionCreated).toBe(false)
     expect(result.updatedProviderConfig.token).toBe('{{SLACK_TOKEN}}')
+  })
+})
+
+describe('cleanupExternalWebhook', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetEffectiveDecryptedEnv.mockResolvedValue({ CALENDLY_API_KEY: 'real-secret-key' })
+    mockGetWorkspaceBilledAccountUserId.mockResolvedValue('billing-1')
+    mockGetExecutionEnvironment.mockResolvedValue({
+      personalDecrypted: {},
+      workspaceDecrypted: { CALENDLY_API_KEY: 'real-secret-key' },
+    })
+  })
+
+  /**
+   * Cleanup resolves through the same two-identity reader as the delivery that
+   * created the subscription — owner for personal variables, the workspace
+   * billing account for workspace ones. Reading both slices as the owner let a
+   * non-admin owner without a credential grant leave `{{VAR}}` unresolved, and
+   * the provider was handed the literal reference as its credential.
+   */
+  it('resolves {{ENV_VAR}} references before deleting the provider subscription', async () => {
+    const deleteSubscription = vi.fn().mockResolvedValue(undefined)
+    mockGetProviderHandler.mockReturnValue({ deleteSubscription })
+
+    const webhook = {
+      id: 'webhook-1',
+      provider: 'calendly',
+      providerConfig: {
+        apiKey: '{{CALENDLY_API_KEY}}',
+        externalId: 'external-1',
+      },
+    }
+    const workflow = {
+      id: 'workflow-1',
+      userId: 'user-1',
+      workspaceId: 'workspace-1',
+    }
+
+    await cleanupExternalWebhook(webhook, workflow, 'request-1')
+
+    expect(mockGetExecutionEnvironment).toHaveBeenCalledWith('user-1', 'billing-1', 'workspace-1')
+    expect(deleteSubscription).toHaveBeenCalledWith(
+      expect.objectContaining({
+        webhook: expect.objectContaining({
+          providerConfig: {
+            apiKey: 'real-secret-key',
+            externalId: 'external-1',
+          },
+        }),
+      })
+    )
+    expect(webhook.providerConfig.apiKey).toBe('{{CALENDLY_API_KEY}}')
   })
 })

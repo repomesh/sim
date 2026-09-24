@@ -2,8 +2,15 @@ import { createLogger } from '@sim/logger'
 import { z } from 'zod'
 import type { BaseServerTool } from '@/lib/copilot/tools/server/base-tool'
 import { getAllowedIntegrationsFromEnv } from '@/lib/core/config/env-flags'
+import { isIntegrationDeploymentAvailableForVisibility } from '@/lib/integrations/availability.server'
+import { isBlockTypeAccessControlExempt } from '@/lib/permission-groups/block-access'
+import { resolvePermissionGroupConfig } from '@/lib/permission-groups/config-scope.server'
+import {
+  intersectIntegrationAllowlists,
+  resolveAccessControlBlockType,
+} from '@/lib/permission-groups/integration-allowlist'
 import { getAllBlocks } from '@/blocks/registry'
-import { getUserPermissionConfig } from '@/ee/access-control/utils/permission-check'
+import { overlayVisibility } from '@/blocks/visibility/context'
 
 export const GetTriggerBlocksInput = z.object({})
 export const GetTriggerBlocksResult = z.object({
@@ -23,17 +30,25 @@ export const getTriggerBlocksServerTool: BaseServerTool<
 
     const permissionConfig =
       context?.userId && context?.workspaceId
-        ? await getUserPermissionConfig(context.userId, context.workspaceId)
+        ? await resolvePermissionGroupConfig(context.userId, context.workspaceId, undefined)
         : null
-    const allowedIntegrations =
-      permissionConfig?.allowedIntegrations ?? getAllowedIntegrationsFromEnv()
+    const allowedIntegrations = intersectIntegrationAllowlists(
+      permissionConfig?.allowedIntegrations ?? null,
+      getAllowedIntegrationsFromEnv()
+    )
+    const visibility = overlayVisibility()
 
     const triggerBlockIds: string[] = []
 
     for (const blockConfig of getAllBlocks()) {
       const blockType = blockConfig.type
       if (blockConfig.hideFromToolbar) continue
-      if (allowedIntegrations != null && !allowedIntegrations.includes(blockType.toLowerCase()))
+      if (!isIntegrationDeploymentAvailableForVisibility(blockType, visibility)) continue
+      if (
+        allowedIntegrations != null &&
+        !isBlockTypeAccessControlExempt(blockType) &&
+        !allowedIntegrations.includes(resolveAccessControlBlockType(blockType.toLowerCase()))
+      )
         continue
 
       if (blockConfig.category === 'triggers') {

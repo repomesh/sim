@@ -1,23 +1,37 @@
 import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
-import { sleep } from '@sim/utils/helpers'
 import { generateId } from '@sim/utils/id'
-import { isRecordLike } from '@sim/utils/object'
+import { isPlainRecord } from '@sim/utils/object'
 import {
   ASYNC_TOOL_CONFIRMATION_STATUS,
-  type AsyncCompletionData,
   type AsyncConfirmationStatus,
 } from '@/lib/copilot/async-runs/lifecycle'
-import { COPILOT_CONFIRM_API_PATH } from '@/lib/copilot/constants'
+import {
+  COPILOT_CONFIRM_API_PATH,
+  COPILOT_WORKFLOW_EXECUTION_CONFLICT_CODE,
+} from '@/lib/copilot/constants'
 import { MothershipStreamV1ToolOutcome } from '@/lib/copilot/generated/mothership-stream-v1'
 import {
   RunBlock,
   RunFromBlock,
+  RunWorkflow,
   RunWorkflowUntilBlock,
 } from '@/lib/copilot/generated/tool-catalog-v1'
-import { traceparentHeader } from '@/lib/copilot/tools/client/trace-context'
+import {
+  CompletionReportError,
+  reportClientToolCompletion as reportCompletion,
+} from '@/lib/copilot/tools/client/completion'
+import {
+  type AsyncWorkflowDeploymentError,
+  getAsyncWorkflowDeploymentError,
+  getWorkflowToolCompletionMessage,
+} from '@/lib/copilot/tools/workflow-tools'
 import { executeWorkflowWithFullLogging } from '@/app/workspace/[workspaceId]/w/[workflowId]/utils/workflow-execution-utils'
-import { SSEEventHandlerError, SSEStreamInterruptedError } from '@/hooks/use-execution-stream'
+import {
+  isExecutionStreamHttpError,
+  SSEEventHandlerError,
+  SSEStreamInterruptedError,
+} from '@/hooks/use-execution-stream'
 import { useExecutionStore } from '@/stores/execution/store'
 import {
   clearExecutionPointer,
@@ -31,19 +45,24 @@ const logger = createLogger('CopilotRunToolExecution')
 const activeRunToolByWorkflowId = new Map<string, string>()
 const activeRunAbortByWorkflowId = new Map<string, AbortController>()
 const manuallyStoppedToolCallIds = new Set<string>()
+type RunToolReleaseListener = (workflowId: string) => void
+const runToolReleaseListeners = new Set<RunToolReleaseListener>()
 const PENDING_COMPLETION_STORAGE_PREFIX = 'sim:copilot:run-tool-completion:'
 
+/**
+ * Tab-local record of a completion this tab still owes Sim for a tool call,
+ * written just before the report is sent and cleared once it lands, so a reload
+ * mid-report can re-send it instead of re-running the tool.
+ */
 interface PendingCompletionReport {
   status: AsyncConfirmationStatus
-  message?: string
-  data?: AsyncCompletionData
-}
-
-class CompletionReportError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'CompletionReportError'
-  }
+  executionId?: string
+  /**
+   * Written by earlier clients for async launches, which also wrote a terminal
+   * execution pointer for a run that has no reconnectable stream. Honoured so
+   * that pointer is cleaned up once the pending report is delivered.
+   */
+  clearExecutionPointerAfterReport?: boolean
 }
 
 function resolveWorkflowInput(params: Record<string, unknown>): unknown {
@@ -60,6 +79,135 @@ function resolveTriggerBlockId(params: Record<string, unknown>): string | undefi
   return typeof params.triggerBlockId === 'string' && params.triggerBlockId.length > 0
     ? params.triggerBlockId
     : undefined
+}
+
+/** The execute endpoint's "this tool call is already bound to another run" body. */
+function isWorkflowExecutionConflict(responseBody: unknown): boolean {
+  return (
+    isPlainRecord(responseBody) && responseBody.code === COPILOT_WORKFLOW_EXECUTION_CONFLICT_CODE
+  )
+}
+
+async function enqueueAsyncWorkflowRun(
+  toolCallId: string,
+  workflowId: string,
+  params: Record<string, unknown>,
+  workflowInput: unknown,
+  triggerBlockId: string | undefined
+): Promise<void> {
+  const requestedExecutionId = generateId()
+  const inputFromExecutionId =
+    typeof params.inputFromExecutionId === 'string' && params.inputFromExecutionId.length > 0
+      ? params.inputFromExecutionId
+      : undefined
+
+  logger.info('[RunTool] Queueing asynchronous workflow execution', {
+    toolCallId,
+    workflowId,
+    executionId: requestedExecutionId,
+    hasInput: workflowInput !== undefined,
+    triggerBlockId,
+  })
+
+  let responseExecutionId = requestedExecutionId
+  let acceptanceIsAmbiguous = false
+  let deploymentError: AsyncWorkflowDeploymentError | undefined
+  try {
+    // boundary-raw-fetch: this execution endpoint switches to a JSON 202 response via X-Execution-Mode
+    const response = await fetch(`/api/workflows/${workflowId}/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Execution-Mode': 'async',
+      },
+      body: JSON.stringify({
+        input: workflowInput,
+        executionId: requestedExecutionId,
+        triggerType: 'copilot',
+        isClientSession: true,
+        copilotToolCallId: toolCallId,
+        ...(triggerBlockId ? { triggerBlockId } : {}),
+        ...(workflowInput === undefined && inputFromExecutionId ? { inputFromExecutionId } : {}),
+      }),
+    })
+    const responseBody: unknown = await response.json().catch(() => undefined)
+    deploymentError = getAsyncWorkflowDeploymentError(responseBody)
+    responseExecutionId =
+      isPlainRecord(responseBody) && typeof responseBody.executionId === 'string'
+        ? responseBody.executionId
+        : requestedExecutionId
+    acceptanceIsAmbiguous =
+      isPlainRecord(responseBody) && responseBody.code === 'ASYNC_ENQUEUE_AMBIGUOUS'
+
+    // Someone else — another tab, or the server's own fallback — already owns
+    // this tool call. Stay silent so the winner reports the result; reporting
+    // an error here would overwrite a run that is happily in flight. Mirrors
+    // the streamed path's handling of the same conflict.
+    if (response.status === 409 && isWorkflowExecutionConflict(responseBody)) {
+      logger.info('[RunTool] Ignoring duplicate async workflow launch', {
+        toolCallId,
+        workflowId,
+      })
+      return
+    }
+
+    if (!response.ok && !acceptanceIsAmbiguous) {
+      const responseError =
+        deploymentError?.message ??
+        (isPlainRecord(responseBody) && typeof responseBody.error === 'string'
+          ? responseBody.error
+          : `Async workflow queue request failed with status ${response.status}`)
+      throw new Error(responseError)
+    }
+  } catch (error) {
+    const message = toError(error).message
+    logger.error('[RunTool] Failed to queue asynchronous workflow execution', {
+      toolCallId,
+      workflowId,
+      error: message,
+    })
+    await reportCompletion(toolCallId, MothershipStreamV1ToolOutcome.error, message, {
+      success: false,
+      workflowId,
+      ...(deploymentError ? { code: deploymentError.code } : {}),
+    })
+    return
+  }
+
+  const pendingCompletion: PendingCompletionReport = {
+    status: ASYNC_TOOL_CONFIRMATION_STATUS.background,
+    executionId: responseExecutionId,
+  }
+  savePendingCompletionReport(toolCallId, pendingCompletion)
+
+  try {
+    await reportCompletion(
+      toolCallId,
+      pendingCompletion.status,
+      getWorkflowToolCompletionMessage(pendingCompletion.status),
+      undefined,
+      pendingCompletion.executionId
+    )
+    clearPendingCompletionReport(toolCallId)
+  } catch (error) {
+    logger.error(
+      '[RunTool] Async workflow was queued but background status could not be reported',
+      {
+        toolCallId,
+        workflowId,
+        executionId: responseExecutionId,
+        error: toError(error).message,
+      }
+    )
+    return
+  }
+
+  logger.info('[RunTool] Asynchronous workflow execution queued', {
+    toolCallId,
+    workflowId,
+    executionId: responseExecutionId,
+    acceptanceIsAmbiguous,
+  })
 }
 
 function pendingCompletionStorageKey(toolCallId: string): string {
@@ -106,6 +254,15 @@ function clearPendingCompletionReport(toolCallId: string): void {
   }
 }
 
+/**
+ * Re-binds a tool call that the server still shows as executing to whatever
+ * this tab already knows about it, instead of running the tool again.
+ *
+ * Two tab-local records can answer: a pending completion report (a report this
+ * tab owed Sim and never delivered) is re-sent as is, and otherwise a terminal
+ * execution pointer (a live run this tab was observing) is reported as
+ * continuing in the background. With neither, the caller runs the tool.
+ */
 export async function bindRunToolToExecution(
   toolCallId: string,
   workflowId: string
@@ -128,6 +285,40 @@ export async function bindRunToolToExecution(
   }
 
   const pointer = await loadExecutionPointer(workflowId).catch(() => null)
+  const pendingCompletion = loadPendingCompletionReport(toolCallId)
+  if (pendingCompletion) {
+    const executionId = pendingCompletion.executionId ?? pointer?.executionId
+    logger.info('[RunTool] Recovery re-sending pending completion report', {
+      workflowId,
+      toolCallId,
+      executionId,
+      status: pendingCompletion.status,
+    })
+    try {
+      await reportCompletion(
+        toolCallId,
+        pendingCompletion.status,
+        getWorkflowToolCompletionMessage(pendingCompletion.status),
+        pendingCompletion.status === MothershipStreamV1ToolOutcome.cancelled
+          ? { reason: 'user_cancelled', cancelledByUser: true }
+          : undefined,
+        executionId
+      )
+      clearPendingCompletionReport(toolCallId)
+      if (pendingCompletion.clearExecutionPointerAfterReport) {
+        await clearExecutionPointer(workflowId)
+      }
+    } catch (error) {
+      logger.warn('[RunTool] Failed to report recovered terminal completion', {
+        workflowId,
+        toolCallId,
+        executionId,
+        error: toError(error).message,
+      })
+    }
+    return true
+  }
+
   if (!pointer?.executionId) {
     logger.info('[RunTool] Recovery skipped: no tab-local execution pointer', {
       workflowId,
@@ -141,37 +332,14 @@ export async function bindRunToolToExecution(
     toolCallId,
     executionId: pointer.executionId,
   })
-  const pendingCompletion = loadPendingCompletionReport(toolCallId)
-  if (pendingCompletion) {
-    try {
-      await reportCompletion(
-        toolCallId,
-        pendingCompletion.status,
-        pendingCompletion.message,
-        pendingCompletion.data
-      )
-      clearPendingCompletionReport(toolCallId)
-    } catch (error) {
-      logger.warn('[RunTool] Failed to report recovered terminal completion', {
-        workflowId,
-        toolCallId,
-        executionId: pointer.executionId,
-        error: toError(error).message,
-      })
-    }
-    return true
-  }
 
   try {
     await reportCompletion(
       toolCallId,
       ASYNC_TOOL_CONFIRMATION_STATUS.background,
-      'Client recovered an existing workflow execution; continuing in background.',
-      {
-        workflowId,
-        executionId: pointer.executionId,
-        lastEventId: pointer.lastEventId,
-      }
+      getWorkflowToolCompletionMessage(ASYNC_TOOL_CONFIRMATION_STATUS.background),
+      undefined,
+      pointer.executionId
     )
   } catch (error) {
     logger.warn('[RunTool] Failed to report recovered execution as background', {
@@ -192,8 +360,8 @@ export async function bindRunToolToExecution(
  * Mirrors staging's RunWorkflowClientTool.handleAccept():
  * 1. Execute via executeWorkflowWithFullLogging
  * 2. Update client tool state directly (success/error)
- * 3. Report completion to server via /api/copilot/confirm (Redis),
- *    where the server-side handler picks it up and tells Go
+ * 3. Report a structural completion notification; the server restores the
+ *    bound execution result from its log before resuming Copilot
  */
 export function executeRunToolOnClient(
   toolCallId: string,
@@ -229,6 +397,38 @@ export function isRunToolActiveForId(toolCallId: string): boolean {
   return false
 }
 
+/**
+ * Whether a client run tool in this tab currently owns the workflow's run.
+ *
+ * While it does, its live execute stream is the source of truth for the run and
+ * for the completion it reports to Sim, so the terminal's reconnect flow must
+ * not claim the execution pointer the tool writes before the server has
+ * acknowledged the run.
+ */
+export function isRunToolActiveForWorkflow(workflowId: string): boolean {
+  return activeRunToolByWorkflowId.has(workflowId)
+}
+
+/**
+ * Subscribes to a client run tool releasing a workflow run whose stream dropped
+ * before the run finished. The run keeps executing server-side and its
+ * execution pointer is retained, so a subscriber that can re-attach to the
+ * execution stream should do so once this fires. It does not fire for runs the
+ * tool observed to completion, even when reporting that completion failed.
+ */
+export function subscribeToRunToolRelease(listener: RunToolReleaseListener): () => void {
+  runToolReleaseListeners.add(listener)
+  return () => {
+    runToolReleaseListeners.delete(listener)
+  }
+}
+
+function notifyRunToolReleased(workflowId: string): void {
+  for (const listener of runToolReleaseListeners) {
+    listener(workflowId)
+  }
+}
+
 export function cancelRunToolExecution(workflowId: string): void {
   const controller = activeRunAbortByWorkflowId.get(workflowId)
   if (!controller) return
@@ -252,15 +452,19 @@ export async function reportManualRunToolStop(
     manuallyStoppedToolCallIds.add(toolCallId)
   }
 
+  const executionId =
+    useExecutionStore.getState().getCurrentExecutionId(workflowId) ??
+    (await loadExecutionPointer(workflowId).catch(() => null))?.executionId
+
   await reportCompletion(
     toolCallId,
     MothershipStreamV1ToolOutcome.cancelled,
-    'Workflow execution was stopped manually by the user.',
+    getWorkflowToolCompletionMessage(MothershipStreamV1ToolOutcome.cancelled),
     {
       reason: 'user_cancelled',
       cancelledByUser: true,
-      workflowId,
-    }
+    },
+    executionId
   )
 }
 
@@ -322,6 +526,23 @@ async function doExecuteRunTool(
   const triggerBlockId = resolveTriggerBlockId(params)
   const useDraftState = params.useDeployedState !== true
 
+  if (toolName === RunWorkflow.id && params.async === true) {
+    try {
+      await enqueueAsyncWorkflowRun(
+        toolCallId,
+        targetWorkflowId,
+        params,
+        workflowInput,
+        triggerBlockId
+      )
+    } finally {
+      if (activeRunToolByWorkflowId.get(targetWorkflowId) === toolCallId) {
+        activeRunToolByWorkflowId.delete(targetWorkflowId)
+      }
+    }
+    return
+  }
+
   const stopAfterBlockId = (() => {
     if (toolName === RunWorkflowUntilBlock.id) return params.stopAfterBlockId as string | undefined
     if (toolName === RunBlock.id) return params.blockId as string | undefined
@@ -348,17 +569,16 @@ async function doExecuteRunTool(
   const abortController = new AbortController()
   activeRunAbortByWorkflowId.set(targetWorkflowId, abortController)
 
-  consolePersistence.executionStarted()
+  const persistenceExecution = consolePersistence.executionStarted()
   setIsExecuting(targetWorkflowId, true)
   const executionId = generateId()
   setCurrentExecutionId(targetWorkflowId, executionId)
   saveExecutionPointer({ workflowId: targetWorkflowId, executionId, lastEventId: 0 })
-  const executionStartTime = new Date().toISOString()
   const releaseVisibleExecutionForBackground = () => {
     const { setCurrentExecutionId: clearExecId, setActiveBlocks } = useExecutionStore.getState()
     if (activeRunToolByWorkflowId.get(targetWorkflowId) === toolCallId) {
       clearExecId(targetWorkflowId, null)
-      consolePersistence.executionEnded()
+      consolePersistence.executionEnded(persistenceExecution)
       setIsExecuting(targetWorkflowId, false)
       setActiveBlocks(targetWorkflowId, new Set())
     }
@@ -366,12 +586,15 @@ async function doExecuteRunTool(
 
   const onPageHide = () => {
     if (manuallyStoppedToolCallIds.has(toolCallId)) return
+    const activeExecutionId =
+      useExecutionStore.getState().getCurrentExecutionId(targetWorkflowId) ?? executionId
     navigator.sendBeacon(
       COPILOT_CONFIRM_API_PATH,
       new Blob(
         [
           JSON.stringify({
             toolCallId,
+            executionId: activeExecutionId,
             status: 'background',
             message: 'Client disconnected, execution continuing server-side',
           }),
@@ -397,12 +620,14 @@ async function doExecuteRunTool(
   })
 
   let leaveExecutionRecoverable = false
+  let streamInterrupted = false
 
   try {
     const result = await executeWorkflowWithFullLogging({
       workflowId: targetWorkflowId,
       workflowInput,
       executionId,
+      copilotToolCallId: toolCallId,
       overrideTriggerType: 'copilot',
       triggerBlockId,
       useDraftState,
@@ -412,28 +637,16 @@ async function doExecuteRunTool(
       preserveExecutionOnTerminal: true,
     })
 
+    const completedExecutionId =
+      useExecutionStore.getState().getCurrentExecutionId(targetWorkflowId) ?? executionId
+
     // Determine success (same logic as staging's RunWorkflowClientTool)
-    let succeeded = true
-    let errorMessage: string | undefined
-    try {
-      if (result && typeof result === 'object' && 'success' in (result as any)) {
-        succeeded = Boolean((result as any).success)
-        if (!succeeded) {
-          errorMessage = (result as any)?.error || (result as any)?.output?.error
-        }
-      } else if (
-        result &&
-        typeof result === 'object' &&
-        'execution' in (result as any) &&
-        (result as any).execution
-      ) {
-        succeeded = Boolean((result as any).execution.success)
-        if (!succeeded) {
-          errorMessage =
-            (result as any).execution?.error || (result as any).execution?.output?.error
-        }
-      }
-    } catch {}
+    const succeeded =
+      isPlainRecord(result) && Object.hasOwn(result, 'success')
+        ? Boolean(result.success)
+        : isPlainRecord(result) && isPlainRecord(result.execution)
+          ? Boolean(result.execution.success)
+          : true
 
     if (manuallyStoppedToolCallIds.has(toolCallId)) {
       logger.info('[RunTool] Skipping generic completion — already manually stopped', {
@@ -444,31 +657,30 @@ async function doExecuteRunTool(
       logger.info('[RunTool] Workflow execution succeeded', { toolCallId, toolName })
       const pendingCompletion = {
         status: MothershipStreamV1ToolOutcome.success,
-        message: `Workflow execution completed. Started at: ${executionStartTime}`,
-        data: buildResultData(result),
+        executionId: completedExecutionId,
       }
       savePendingCompletionReport(toolCallId, pendingCompletion)
       await reportCompletion(
         toolCallId,
         pendingCompletion.status,
-        pendingCompletion.message,
-        pendingCompletion.data
+        getWorkflowToolCompletionMessage(pendingCompletion.status),
+        undefined,
+        pendingCompletion.executionId
       )
       clearPendingCompletionReport(toolCallId)
     } else {
-      const msg = errorMessage || 'Workflow execution failed'
-      logger.error('[RunTool] Workflow execution failed', { toolCallId, toolName, error: msg })
+      logger.error('[RunTool] Workflow execution failed', { toolCallId, toolName })
       const pendingCompletion = {
         status: MothershipStreamV1ToolOutcome.error,
-        message: msg,
-        data: buildResultData(result),
+        executionId: completedExecutionId,
       }
       savePendingCompletionReport(toolCallId, pendingCompletion)
       await reportCompletion(
         toolCallId,
         pendingCompletion.status,
-        pendingCompletion.message,
-        pendingCompletion.data
+        getWorkflowToolCompletionMessage(pendingCompletion.status),
+        undefined,
+        pendingCompletion.executionId
       )
       clearPendingCompletionReport(toolCallId)
     }
@@ -478,10 +690,21 @@ async function doExecuteRunTool(
         toolCallId,
         toolName,
       })
+    } else if (
+      isExecutionStreamHttpError(err) &&
+      err.httpStatus === 409 &&
+      err.code === COPILOT_WORKFLOW_EXECUTION_CONFLICT_CODE
+    ) {
+      logger.info('[RunTool] Ignoring duplicate client workflow execution', {
+        toolCallId,
+        toolName,
+        workflowId: targetWorkflowId,
+      })
     } else {
       const msg = toError(err).message
       if (err instanceof SSEEventHandlerError || err instanceof SSEStreamInterruptedError) {
         leaveExecutionRecoverable = true
+        streamInterrupted = true
         logger.warn(
           '[RunTool] Execution stream interrupted; leaving workflow execution in background',
           {
@@ -495,7 +718,9 @@ async function doExecuteRunTool(
         await reportCompletion(
           toolCallId,
           ASYNC_TOOL_CONFIRMATION_STATUS.background,
-          'Client lost local stream processing; workflow execution may still be continuing server-side.'
+          getWorkflowToolCompletionMessage(ASYNC_TOOL_CONFIRMATION_STATUS.background),
+          undefined,
+          err.executionId ?? executionId
         )
         return
       }
@@ -510,7 +735,24 @@ async function doExecuteRunTool(
         return
       }
       logger.error('[RunTool] Workflow execution threw', { toolCallId, toolName, error: msg })
-      await reportCompletion(toolCallId, MothershipStreamV1ToolOutcome.error, msg)
+      const failedExecutionId =
+        useExecutionStore.getState().getCurrentExecutionId(targetWorkflowId) ?? executionId
+      // Carry the real failure through instead of the generic "Workflow execution
+      // failed." — the agent can only correct a bad request (a rejected binding,
+      // an undeployed workflow) if it is told what was wrong.
+      const failureCode = isExecutionStreamHttpError(err) ? err.code : undefined
+      await reportCompletion(
+        toolCallId,
+        MothershipStreamV1ToolOutcome.error,
+        msg,
+        {
+          success: false,
+          workflowId: targetWorkflowId,
+          error: msg,
+          ...(failureCode ? { code: failureCode } : {}),
+        },
+        failedExecutionId
+      )
     }
   } finally {
     if (typeof window !== 'undefined') {
@@ -529,110 +771,12 @@ async function doExecuteRunTool(
     if (!leaveExecutionRecoverable && activeToolCallId === toolCallId) {
       clearExecId(targetWorkflowId, null)
       clearExecutionPointer(targetWorkflowId)
-      consolePersistence.executionEnded()
+      consolePersistence.executionEnded(persistenceExecution)
       setIsExecuting(targetWorkflowId, false)
       setActiveBlocks(targetWorkflowId, new Set())
     }
-  }
-}
-
-/**
- * Extract a structured result payload from the raw execution result
- * for the LLM to see the actual workflow output.
- */
-function buildResultData(result: unknown): Record<string, unknown> | undefined {
-  if (!result || typeof result !== 'object') return undefined
-
-  const r = result as Record<string, unknown>
-
-  if ('success' in r) {
-    return {
-      success: r.success,
-      output: r.output,
-      logs: r.logs,
-      error: r.error,
+    if (streamInterrupted && activeToolCallId === toolCallId) {
+      notifyRunToolReleased(targetWorkflowId)
     }
   }
-
-  if ('execution' in r && r.execution && typeof r.execution === 'object') {
-    const exec = r.execution as Record<string, unknown>
-    return {
-      success: exec.success,
-      output: exec.output,
-      logs: exec.logs,
-      error: exec.error,
-    }
-  }
-
-  return undefined
-}
-
-/**
- * Report tool completion to the server via the existing /api/copilot/confirm endpoint.
- * This persists the durable async-tool row and wakes the server-side waiter so
- * it can continue the paused Copilot run and notify Go.
- */
-async function reportCompletion(
-  toolCallId: string,
-  status: AsyncConfirmationStatus,
-  message?: string,
-  data?: AsyncCompletionData
-): Promise<void> {
-  const basePayload = {
-    toolCallId,
-    status,
-    message: message || (status === 'success' ? 'Tool completed' : 'Tool failed'),
-    ...(data !== undefined ? { data } : {}),
-  }
-  const send = async (body: string) =>
-    fetch(COPILOT_CONFIRM_API_PATH, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...traceparentHeader() },
-      body,
-    })
-
-  const body = JSON.stringify(basePayload)
-  const LARGE_PAYLOAD_THRESHOLD = 10 * 1024 * 1024
-  const bodySize = new Blob([body]).size
-  let lastError: Error | null = null
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await send(body)
-      if (res.ok) return
-
-      if (isRecordLike(data) && bodySize > LARGE_PAYLOAD_THRESHOLD) {
-        const { logs: _logs, ...dataWithoutLogs } = data
-        logger.warn('[RunTool] reportCompletion failed with large payload, retrying without logs', {
-          toolCallId,
-          status: res.status,
-          bodySize,
-        })
-        const retryRes = await send(
-          JSON.stringify({
-            toolCallId,
-            status,
-            message: message || (status === 'success' ? 'Tool completed' : 'Tool failed'),
-            data: dataWithoutLogs,
-          })
-        )
-        if (retryRes.ok) return
-        lastError = new Error(`reportCompletion retry failed with status ${retryRes.status}`)
-      } else {
-        lastError = new Error(`reportCompletion failed with status ${res.status}`)
-      }
-    } catch (err) {
-      lastError = toError(err)
-    }
-
-    if (attempt < 2) {
-      await sleep(250)
-    }
-  }
-
-  logger.error('[RunTool] reportCompletion failed after retries', {
-    toolCallId,
-    error: lastError?.message,
-  })
-  throw new CompletionReportError(lastError?.message ?? 'Failed to report tool completion')
 }

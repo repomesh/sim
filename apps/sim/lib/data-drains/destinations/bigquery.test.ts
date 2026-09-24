@@ -32,6 +32,7 @@ vi.mock('@sim/logger', () => ({
   logger: loggerInstance,
   runWithRequestContext: <T>(_ctx: unknown, fn: () => T): T => fn(),
   getRequestContext: () => undefined,
+  setRequestAuth: vi.fn(),
 }))
 vi.mock('@sim/utils/helpers', () => ({
   sleep: vi.fn(async () => {}),
@@ -67,6 +68,7 @@ const meta = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.stubGlobal('fetch', fetchMock)
   fetchMock.mockResolvedValue(
     new Response(JSON.stringify({}), {
       status: 200,

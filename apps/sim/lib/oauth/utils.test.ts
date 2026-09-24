@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest'
+import { OAUTH_PROVIDERS } from './oauth'
 import type { OAuthProvider, OAuthServiceMetadata } from './types'
 import {
+  canonicalizeServiceProviderId,
+  credentialProviderMatchesService,
   getAllOAuthServices,
   getCanonicalScopesForProvider,
   getMissingRequiredScopes,
   getProviderIdFromServiceId,
+  getScopeDescription,
   getScopesForService,
   getServiceByProviderAndId,
   getServiceConfigByProviderId,
   getServiceConfigByServiceId,
   parseProvider,
+  providerIdsForService,
+  usesCredentialConfiguredOAuthClient,
 } from './utils'
 
 describe('getAllOAuthServices', () => {
@@ -25,14 +31,18 @@ describe('getAllOAuthServices', () => {
 
     services.forEach((service) => {
       expect(service).toHaveProperty('providerId')
+      expect(service).toHaveProperty('serviceId')
       expect(service).toHaveProperty('name')
       expect(service).toHaveProperty('description')
       expect(service).toHaveProperty('baseProvider')
+      expect(service).toHaveProperty('authType')
 
       expect(typeof service.providerId).toBe('string')
+      expect(typeof service.serviceId).toBe('string')
       expect(typeof service.name).toBe('string')
       expect(typeof service.description).toBe('string')
       expect(typeof service.baseProvider).toBe('string')
+      expect(['oauth', 'service_account']).toContain(service.authType)
     })
   })
 
@@ -71,6 +81,11 @@ describe('getAllOAuthServices', () => {
     expect(slackService).toBeDefined()
     expect(slackService?.name).toBe('Slack')
     expect(slackService?.baseProvider).toBe('slack')
+
+    const quickbooksService = services.find((s) => s.providerId === 'quickbooks')
+    expect(quickbooksService).toBeDefined()
+    expect(quickbooksService?.name).toBe('QuickBooks')
+    expect(quickbooksService?.baseProvider).toBe('quickbooks')
   })
 
   it.concurrent('should not include duplicate services', () => {
@@ -87,9 +102,24 @@ describe('getAllOAuthServices', () => {
     services.forEach((service) => {
       const metadata: OAuthServiceMetadata = service
       expect(metadata.providerId).toBeDefined()
+      expect(metadata.serviceId).toBeDefined()
       expect(metadata.name).toBeDefined()
       expect(metadata.description).toBeDefined()
       expect(metadata.baseProvider).toBeDefined()
+      expect(metadata.authType).toBeDefined()
+    })
+  })
+
+  it.concurrent('preserves service-account auth metadata', () => {
+    const services = getAllOAuthServices()
+
+    expect(services.find((service) => service.providerId === 'claude-platform')).toMatchObject({
+      serviceId: 'claude-platform',
+      authType: 'service_account',
+    })
+    expect(services.find((service) => service.providerId === 'google-email')).toMatchObject({
+      serviceId: 'gmail',
+      authType: 'oauth',
     })
   })
 })
@@ -148,6 +178,14 @@ describe('getServiceByProviderAndId', () => {
     expect(Array.isArray(service.scopes)).toBe(true)
     expect(service.scopes.length).toBeGreaterThan(0)
     expect(service.scopes).toContain('https://www.googleapis.com/auth/gmail.send')
+  })
+})
+
+describe('usesCredentialConfiguredOAuthClient', () => {
+  it.concurrent('distinguishes user-supplied OAuth apps from deployment OAuth clients', () => {
+    expect(usesCredentialConfiguredOAuthClient('quickbooks')).toBe(true)
+    expect(usesCredentialConfiguredOAuthClient('slack')).toBe(false)
+    expect(usesCredentialConfiguredOAuthClient('unknown-provider')).toBe(false)
   })
 })
 
@@ -252,6 +290,14 @@ describe('getServiceConfigByProviderId', () => {
     expect(service?.name).toBe('Slack')
   })
 
+  it.concurrent('should work for QuickBooks', () => {
+    const service = getServiceConfigByProviderId('quickbooks')
+
+    expect(service).toBeDefined()
+    expect(service?.providerId).toBe('quickbooks')
+    expect(service?.name).toBe('QuickBooks')
+  })
+
   it.concurrent('should return service with scopes', () => {
     const service = getServiceConfigByProviderId('google-drive')
 
@@ -335,11 +381,31 @@ describe('getCanonicalScopesForProvider', () => {
 
     expect(outlookScopes.length).toBeGreaterThan(0)
     expect(outlookScopes).toContain('Mail.ReadWrite')
+    expect(outlookScopes).toContain('Calendars.ReadWrite')
+    // .Shared is deliberately absent: unconfirmed for personal MSA, and this provider
+    // serves personal accounts whose mail access would break if consent failed.
+    expect(outlookScopes).not.toContain('Calendars.ReadWrite.Shared')
 
     const excelScopes = getCanonicalScopesForProvider('microsoft-excel')
 
     expect(excelScopes.length).toBeGreaterThan(0)
     expect(excelScopes).toContain('Files.Read')
+  })
+
+  it.concurrent('should return the exact canonical QuickBooks scopes', () => {
+    const expected = ['openid', 'profile', 'email', 'com.intuit.quickbooks.accounting']
+
+    expect(getCanonicalScopesForProvider('quickbooks')).toEqual(expected)
+    expect(getScopesForService('quickbooks')).toEqual(expected)
+  })
+
+  it.concurrent('requests the group and user reads used by Confluence permission syncing', () => {
+    const scopes = getCanonicalScopesForProvider('confluence')
+
+    expect(scopes).toEqual(
+      expect.arrayContaining(['read:group:confluence', 'read:user:confluence'])
+    )
+    expect(getScopesForService('confluence')).toEqual(scopes)
   })
 
   it.concurrent('should handle providers with empty scopes array', () => {
@@ -354,6 +420,48 @@ describe('getCanonicalScopesForProvider', () => {
 
     expect(Array.isArray(scopes)).toBe(true)
     expect(scopes.length).toBe(0)
+  })
+})
+
+describe('getScopeDescription', () => {
+  it('describes Confluence directory access', () => {
+    expect(getScopeDescription('read:group:confluence', 'confluence')).toBe(
+      'View Confluence groups and memberships'
+    )
+  })
+  it.concurrent('uses provider-specific labels for Bitbucket scope names', () => {
+    expect(getScopeDescription('account', 'bitbucket')).toBe(
+      'View your Bitbucket account and workspace memberships'
+    )
+    expect(getScopeDescription('pipeline:write', 'bitbucket')).toBe('Run and stop pipelines')
+    expect(getScopeDescription('webhook', 'bitbucket')).toBe('Manage repository webhooks')
+  })
+
+  it.concurrent('preserves the existing Reddit meaning of the account scope', () => {
+    expect(getScopeDescription('account', 'reddit')).toBe('Update account preferences and settings')
+    expect(getScopeDescription('account')).toBe('Update account preferences and settings')
+  })
+
+  /**
+   * The consent screen is where a user decides what to grant, so a write scope
+   * has to read as one. `w_member_social` previously said 'Access LinkedIn
+   * profile', describing a posting grant as a profile read.
+   *
+   * The wording tracks LinkedIn's own: "Post, comment, and like posts on behalf
+   * of an authenticated member." It names all three verbs even though Sim only
+   * posts -- the label describes the grant the token carries, not Sim's current
+   * use of it, and LinkedIn's scopes cannot be sub-selected.
+   */
+  it.concurrent('describes w_member_social as the write grant it is', () => {
+    const description = getScopeDescription('w_member_social', 'linkedin')
+
+    expect(description).toBe('Post, comment, and like posts on your behalf')
+    expect(description).not.toMatch(/access .*profile/i)
+  })
+
+  it.concurrent('leaves the read-only LinkedIn scopes read-only', () => {
+    expect(getScopeDescription('profile', 'linkedin')).toBe('Access profile information')
+    expect(getScopeDescription('email', 'linkedin')).toBe('Access email address')
   })
 })
 
@@ -618,6 +726,21 @@ describe('getScopesForService', () => {
 
     expect(scopes.length).toBeGreaterThan(0)
     expect(scopes).toContain('Mail.ReadWrite')
+    expect(scopes).toContain('Calendars.ReadWrite')
+    expect(scopes).not.toContain('Calendars.ReadWrite.Shared')
+  })
+
+  it.concurrent('should include webhook management in Bitbucket consent scopes', () => {
+    expect(getScopesForService('bitbucket')).toEqual([
+      'account',
+      'repository',
+      'repository:write',
+      'pullrequest',
+      'pullrequest:write',
+      'pipeline',
+      'pipeline:write',
+      'webhook',
+    ])
   })
 
   it.concurrent('should return empty array for empty string', () => {
@@ -643,11 +766,31 @@ describe('getMissingRequiredScopes', () => {
     expect(missing).toEqual(['write'])
   })
 
+  it.concurrent('requires older Confluence OAuth grants to reconnect for group access', () => {
+    const scopes = getCanonicalScopesForProvider('confluence')
+    const previousGrant = scopes.filter((scope) => scope !== 'read:group:confluence')
+
+    expect(getMissingRequiredScopes({ scopes: previousGrant }, scopes)).toEqual([
+      'read:group:confluence',
+    ])
+    expect(getMissingRequiredScopes({ scopes }, scopes)).toEqual([])
+  })
+
   it.concurrent('should return all required scopes when credential is undefined', () => {
     const missing = getMissingRequiredScopes(undefined, ['read', 'write'])
 
     expect(missing).toEqual(['read', 'write'])
   })
+
+  it.concurrent(
+    'should report nothing missing for a service account, which grants no scopes',
+    () => {
+      const credential = { type: 'service_account', scopes: undefined }
+      const missing = getMissingRequiredScopes(credential, ['read', 'write'])
+
+      expect(missing).toEqual([])
+    }
+  )
 
   it.concurrent('should return all required scopes when credential has undefined scopes', () => {
     const missing = getMissingRequiredScopes({ scopes: undefined }, ['read', 'write'])
@@ -667,6 +810,34 @@ describe('getMissingRequiredScopes', () => {
     const missing = getMissingRequiredScopes(credential, ['read', 'refresh_token'])
 
     expect(missing).toEqual([])
+  })
+
+  it.concurrent('accepts calendar for a required calendar.readonly via the generic rule', () => {
+    const credential = { scopes: ['https://www.googleapis.com/auth/calendar'] }
+    const missing = getMissingRequiredScopes(credential, [
+      'https://www.googleapis.com/auth/calendar.readonly',
+    ])
+
+    expect(missing).toEqual([])
+  })
+
+  /**
+   * The rule derives only the bare read-write scope. Sim requests `gmail.send`,
+   * `gmail.modify` and `gmail.labels` but never `.../auth/gmail`, so a consumer
+   * must require one of the scopes actually granted rather than `gmail.readonly`.
+   */
+  it.concurrent('does not treat unrelated gmail scopes as covering gmail.readonly', () => {
+    const credential = {
+      scopes: [
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/gmail.labels',
+      ],
+    }
+    const missing = getMissingRequiredScopes(credential, [
+      'https://www.googleapis.com/auth/gmail.readonly',
+    ])
+
+    expect(missing).toEqual(['https://www.googleapis.com/auth/gmail.readonly'])
   })
 
   it.concurrent('should ignore offline.access in required scopes', () => {
@@ -694,5 +865,74 @@ describe('getMissingRequiredScopes', () => {
     const missing = getMissingRequiredScopes(credential)
 
     expect(missing).toEqual([])
+  })
+})
+
+describe('providerIdsForService', () => {
+  it('widens a service primary id to its alternate authorization servers', () => {
+    // The SQL counterpart to credentialProviderMatchesService: the block
+    // picker queries by 'salesforce', and a sandbox credential is stored under
+    // 'salesforce-sandbox'. Without the widening it is filtered out at the DB
+    // and never reaches the picker, however correct the in-memory resolvers.
+    expect(providerIdsForService('salesforce')).toEqual(['salesforce', 'salesforce-sandbox'])
+  })
+
+  it('does not widen an alternate server id back into the primary', () => {
+    expect(providerIdsForService('salesforce-sandbox')).toEqual(['salesforce-sandbox'])
+  })
+
+  it('does not widen a service-account id into the OAuth family', () => {
+    // Broadening here would leak OAuth credentials into a service-account query.
+    expect(providerIdsForService('salesforce-service-account')).toEqual([
+      'salesforce-service-account',
+    ])
+  })
+
+  it('returns a single-id list for providers with no alternate server', () => {
+    expect(providerIdsForService('hubspot')).toEqual(['hubspot'])
+    expect(providerIdsForService('not-a-real-provider')).toEqual(['not-a-real-provider'])
+  })
+})
+
+describe('credentialProviderMatchesService', () => {
+  const salesforce = OAUTH_PROVIDERS.salesforce.services.salesforce
+
+  it('matches the primary OAuth id, an alternate server, and the service account', () => {
+    expect(credentialProviderMatchesService('salesforce', salesforce)).toBe(true)
+    // The alternate-server clause: without it a sandbox credential is invisible
+    // to every surface that resolves a credential to its service.
+    expect(credentialProviderMatchesService('salesforce-sandbox', salesforce)).toBe(true)
+    expect(credentialProviderMatchesService('salesforce-service-account', salesforce)).toBe(true)
+  })
+
+  it('does not match an unrelated provider', () => {
+    expect(credentialProviderMatchesService('hubspot', salesforce)).toBe(false)
+  })
+})
+
+describe('canonicalizeServiceProviderId', () => {
+  const salesforce = OAUTH_PROVIDERS.salesforce.services.salesforce
+  const gmail = OAUTH_PROVIDERS.google.services.gmail
+
+  it('folds an alternate authorization server onto its service', () => {
+    expect(canonicalizeServiceProviderId('salesforce-sandbox', salesforce)).toBe('salesforce')
+  })
+
+  it('leaves the primary id untouched', () => {
+    expect(canonicalizeServiceProviderId('salesforce', salesforce)).toBe('salesforce')
+  })
+
+  it('never folds a family-wide service-account id onto one product', () => {
+    // `google-service-account` authenticates every Google service, so folding it
+    // onto whichever one matched first would mark exactly one as connected.
+    expect(canonicalizeServiceProviderId('google-service-account', gmail)).toBe(
+      'google-service-account'
+    )
+  })
+
+  it('leaves an id untouched when no service resolved', () => {
+    expect(canonicalizeServiceProviderId('salesforce-sandbox', undefined)).toBe(
+      'salesforce-sandbox'
+    )
   })
 })

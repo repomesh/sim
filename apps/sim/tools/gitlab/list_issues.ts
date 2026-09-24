@@ -4,6 +4,7 @@ import type { ToolConfig } from '@/tools/types'
 
 export const gitlabListIssuesTool: ToolConfig<GitLabListIssuesParams, GitLabListIssuesResponse> = {
   id: 'gitlab_list_issues',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab List Issues',
   description: 'List issues in a GitLab project',
   version: '1.0.0',
@@ -25,7 +26,7 @@ export const gitlabListIssuesTool: ToolConfig<GitLabListIssuesParams, GitLabList
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     state: {
       type: 'string',
@@ -62,7 +63,7 @@ export const gitlabListIssuesTool: ToolConfig<GitLabListIssuesParams, GitLabList
       required: false,
       visibility: 'user-or-llm',
       description:
-        'Order by field (created_at, updated_at, priority, due_date, relative_position, label_priority, milestone_due, popularity, title, weight)',
+        'Order by field (created_at, updated_at, priority, due_date, relative_position, label_priority, milestone_due, popularity, weight)',
     },
     sort: {
       type: 'string',

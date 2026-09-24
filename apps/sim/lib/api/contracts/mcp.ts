@@ -1,12 +1,14 @@
 import { z } from 'zod'
 import { type ContractJsonResponse, defineRouteContract } from '@/lib/api/contracts/types'
+import { v2TimestampSchema } from '@/lib/api/contracts/v2/shared'
+import { MANAGED_MCP_CONNECTOR_IDS } from '@/lib/credential-groups/managed-mcp-connectors'
 import type { McpToolSchema, McpToolSchemaProperty } from '@/lib/mcp/types'
 
 const MAX_MCP_REFRESH_SERVER_IDS = 100
 
 const dateStringSchema = z.preprocess(
   (value) => (value instanceof Date ? value.toISOString() : value),
-  z.string()
+  v2TimestampSchema
 )
 
 const optionalStringFromNullableSchema = z.preprocess(
@@ -17,7 +19,7 @@ const optionalStringFromNullableSchema = z.preprocess(
 const optionalDateStringFromNullableSchema = z.preprocess((value) => {
   if (value instanceof Date) return value.toISOString()
   return value === null ? undefined : value
-}, z.string().optional())
+}, v2TimestampSchema.optional())
 
 const optionalNumberFromNullableSchema = z.preprocess(
   (value) => (value === null ? undefined : value),
@@ -26,7 +28,12 @@ const optionalNumberFromNullableSchema = z.preprocess(
 
 const optionalConnectionStatusFromNullableSchema = z.preprocess(
   (value) => (value === null ? undefined : value),
-  z.enum(['connected', 'disconnected', 'error']).optional()
+  // `connection_status` is a free-text column; tolerate an off-enum value as undefined
+  // rather than failing the whole list's validation.
+  z
+    .enum(['connected', 'disconnected', 'error'])
+    .optional()
+    .catch(undefined)
 )
 
 const optionalHeadersFromNullableSchema = z.preprocess(
@@ -36,7 +43,18 @@ const optionalHeadersFromNullableSchema = z.preprocess(
 
 export const mcpTransportSchema = z.enum(['streamable-http'])
 
+/**
+ * Transport as read back from storage. The `transport` column is free text, and
+ * rows predating the Streamable HTTP consolidation (or copied verbatim by an
+ * older fork) may still hold legacy `http`/`sse` values. Every server is operated
+ * over Streamable HTTP regardless, so any non-canonical value normalizes to the
+ * supported transport — this stops a single legacy row from failing the entire
+ * server list's response validation.
+ */
+const mcpTransportResponseSchema = mcpTransportSchema.catch('streamable-http')
+
 export const mcpAuthTypeSchema = z.enum(['none', 'headers', 'oauth'])
+export const managedMcpConnectorIdSchema = z.enum(MANAGED_MCP_CONNECTOR_IDS)
 
 const consecutiveFailuresSchema = z.preprocess(
   (value) => (typeof value === 'number' ? value : undefined),
@@ -80,7 +98,9 @@ export const mcpToolSchema = z.object({
   description: z.string().optional(),
   inputSchema: mcpToolInputSchema,
   serverId: z.string(),
+  canonicalServerId: z.string().optional(),
   serverName: z.string(),
+  managedConnectorId: managedMcpConnectorIdSchema.optional(),
 })
 
 export const storedMcpToolSchema = z.object({
@@ -95,15 +115,25 @@ export const storedMcpToolSchema = z.object({
 export const mcpServerSchema = z
   .object({
     id: z.string(),
+    canonicalServerId: z.string().optional(),
+    canonicalServerName: z.string().optional(),
     workspaceId: z.string(),
     name: z.string(),
     description: optionalStringFromNullableSchema,
-    transport: mcpTransportSchema,
-    authType: mcpAuthTypeSchema.optional(),
+    transport: mcpTransportResponseSchema,
+    // Response-side tolerance: `auth_type` is a free-text column, so a value outside
+    // the enum normalizes to undefined rather than failing the whole list's validation.
+    authType: mcpAuthTypeSchema.optional().catch(undefined),
     url: optionalStringFromNullableSchema,
     timeout: optionalNumberFromNullableSchema,
     retries: optionalNumberFromNullableSchema,
+    /**
+     * Header *values* are the upstream credential and are served only to callers
+     * who may already rewrite them; readers get `hasHeaders`/`headerNames` alone.
+     */
     headers: optionalHeadersFromNullableSchema,
+    hasHeaders: z.boolean().optional(),
+    headerNames: z.array(z.string()).optional(),
     enabled: z.boolean(),
     connectionStatus: optionalConnectionStatusFromNullableSchema,
     lastError: z.string().nullable().optional(),
@@ -119,9 +149,21 @@ export const mcpServerSchema = z
     deletedAt: optionalDateStringFromNullableSchema,
     oauthClientId: optionalStringFromNullableSchema,
     hasOauthClientSecret: z.boolean().optional(),
+    credentialGroupId: optionalStringFromNullableSchema,
+    managedConnectorId: z.preprocess(
+      (value) => (value === null ? undefined : value),
+      managedMcpConnectorIdSchema.optional()
+    ),
   })
   .passthrough()
 export type McpServer = z.output<typeof mcpServerSchema>
+
+export const managedMcpCatalogSchema = z.object({
+  servers: z.array(mcpServerSchema).max(500),
+  tools: z.array(mcpToolSchema).max(500_000),
+})
+
+export type ManagedMcpCatalog = z.output<typeof managedMcpCatalogSchema>
 
 export const mcpWorkspaceQuerySchema = z.object({
   workspaceId: z.string().min(1),
@@ -146,6 +188,7 @@ export const createMcpServerBodySchema = z
     workspaceId: z.string().optional(),
     oauthClientId: z.string().nullable().optional(),
     oauthClientSecret: z.string().nullable().optional(),
+    managedConnectorId: z.never().optional(),
   })
   .passthrough()
 
@@ -195,16 +238,6 @@ export const mcpToolDiscoveryQuerySchema = z.object({
   refresh: z.string().optional(),
 })
 
-export const mcpToolExecutionBodySchema = z
-  .object({
-    serverId: z.string().min(1),
-    toolName: z.string().min(1),
-    arguments: z.record(z.string(), z.unknown()).optional(),
-    workflowId: z.string().optional(),
-  })
-  .passthrough()
-export type McpToolExecutionBody = z.input<typeof mcpToolExecutionBodySchema>
-
 export const mcpToolResultSchema = z
   .object({
     content: z.array(z.unknown()).optional(),
@@ -212,13 +245,6 @@ export const mcpToolResultSchema = z
     structuredContent: z.unknown().optional(),
   })
   .passthrough()
-
-export const mcpToolExecutionResultSchema = z.object({
-  success: z.boolean(),
-  output: mcpToolResultSchema.optional(),
-  error: z.string().optional(),
-})
-export type McpToolExecutionResult = z.output<typeof mcpToolExecutionResultSchema>
 
 export const mcpJsonRpcRequestSchema = z
   .object({
@@ -242,11 +268,6 @@ export const mcpJsonRpcMessageSchema = z
     jsonrpc: z.literal('2.0'),
   })
   .passthrough()
-
-export const mcpRequestBodySchema = z.union([
-  mcpJsonRpcMessageSchema,
-  z.array(mcpJsonRpcMessageSchema),
-])
 
 export const mcpToolCallParamsSchema = z
   .object({
@@ -313,6 +334,16 @@ export const listMcpServersContract = defineRouteContract({
         servers: z.array(mcpServerSchema),
       })
     ),
+  },
+})
+
+export const listManagedMcpCatalogContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/mcp/managed-connections',
+  query: mcpWorkspaceQuerySchema,
+  response: {
+    mode: 'json',
+    schema: managedMcpCatalogSchema,
   },
 })
 export type ListMcpServersResponse = ContractJsonResponse<typeof listMcpServersContract>
@@ -391,27 +422,6 @@ export const discoverMcpToolsContract = defineRouteContract({
 })
 export type DiscoverMcpToolsResponse = ContractJsonResponse<typeof discoverMcpToolsContract>
 
-export const refreshMcpToolsContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/mcp/tools/discover',
-  query: mcpWorkspaceQuerySchema,
-  body: refreshMcpToolsBodySchema,
-  response: {
-    mode: 'json',
-    schema: mcpSuccessResponseSchema(
-      z.object({
-        refreshed: z.array(z.object({ serverId: z.string(), toolCount: z.number() })),
-        failed: z.array(z.object({ serverId: z.string(), error: z.string() })),
-        summary: z.object({
-          total: z.number(),
-          successful: z.number(),
-          failed: z.number(),
-        }),
-      })
-    ),
-  },
-})
-
 export const listStoredMcpToolsContract = defineRouteContract({
   method: 'GET',
   path: '/api/mcp/tools/stored',
@@ -435,17 +445,6 @@ export const testMcpServerConnectionContract = defineRouteContract({
     schema: mcpSuccessResponseSchema(mcpServerTestResultSchema),
   },
 })
-
-export const executeMcpToolContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/mcp/tools/execute',
-  body: mcpToolExecutionBodySchema,
-  response: {
-    mode: 'json',
-    schema: mcpSuccessResponseSchema(mcpToolExecutionResultSchema),
-  },
-})
-export type ExecuteMcpToolResponse = ContractJsonResponse<typeof executeMcpToolContract>
 
 export const startMcpOauthQuerySchema = z.object({
   serverId: z.string().min(1, 'serverId is required'),

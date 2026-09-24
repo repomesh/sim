@@ -2,13 +2,18 @@
  * @vitest-environment node
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { StreamingExecution } from '@/executor/types'
 
 const {
+  mockRecordUsage,
+  mockCapture,
   mockCreate,
   mockSupportsNativeStructuredOutputs,
   mockPrepareToolsWithUsageControl,
   mockExecuteTool,
 } = vi.hoisted(() => ({
+  mockRecordUsage: vi.fn(),
+  mockCapture: vi.fn(),
   mockCreate: vi.fn(),
   mockSupportsNativeStructuredOutputs: vi.fn(),
   mockPrepareToolsWithUsageControl: vi.fn(),
@@ -21,6 +26,13 @@ vi.mock('openai', () => ({
       chat = { completions: { create: mockCreate } }
     }
   ),
+}))
+
+vi.mock('@/providers/conversation-history', () => ({
+  getConversationRequestContext: () => undefined,
+  captureProviderConversationStep: mockCapture,
+  recordProviderConversationUsage: mockRecordUsage,
+  recordProviderConversationToolError: vi.fn(),
 }))
 
 vi.mock('@/providers', () => ({ MAX_TOOL_ITERATIONS: 5 }))
@@ -40,7 +52,9 @@ vi.mock('@/providers/attachments', () => ({
 
 vi.mock('@/providers/together/utils', () => ({
   supportsNativeStructuredOutputs: mockSupportsNativeStructuredOutputs,
-  createReadableStreamFromOpenAIStream: vi.fn(() => ({}) as ReadableStream),
+  createReadableStreamFromOpenAIStream: vi.fn(
+    () => new ReadableStream({ start: (controller) => controller.close() })
+  ),
   checkForForcedToolUsage: vi.fn(() => ({ hasUsedForcedTool: false, usedForcedTools: [] })),
 }))
 
@@ -49,6 +63,11 @@ vi.mock('@/providers/trace-enrichment', () => ({
 }))
 
 vi.mock('@/providers/utils', () => ({
+  isFunctionToolCall: (toolCall: unknown) =>
+    typeof toolCall === 'object' &&
+    toolCall !== null &&
+    'function' in toolCall &&
+    (toolCall as { function?: unknown }).function != null,
   calculateCost: vi.fn().mockReturnValue({ input: 0, output: 0, total: 0 }),
   generateSchemaInstructions: vi.fn(() => 'SCHEMA_INSTRUCTIONS'),
   prepareToolExecution: vi.fn(() => ({ toolParams: { x: 1 }, executionParams: { x: 1 } })),
@@ -66,11 +85,12 @@ const textResponse = (content: string) => ({
   usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
 })
 
-const toolCallResponse = () => ({
+const toolCallResponse = (assistant: { content?: string | null; reasoning?: string } = {}) => ({
   choices: [
     {
       message: {
-        content: null,
+        content: assistant.content ?? null,
+        ...(assistant.reasoning !== undefined ? { reasoning: assistant.reasoning } : {}),
         tool_calls: [
           { id: 'call_1', type: 'function', function: { name: 'my_tool', arguments: '{"x":1}' } },
         ],
@@ -110,6 +130,55 @@ describe('togetherProvider', () => {
     apiKey: 'together-test-key',
   }
 
+  it.each([false, true])(
+    'keeps capped decisions unexecuted and accounts usage when synthesis failure is %s',
+    async (failsSynthesis) => {
+      let generated = 0
+      mockCreate.mockImplementation((payload) => {
+        const final = payload.tool_choice === 'none'
+        if (final && failsSynthesis) return Promise.reject(new Error('synthesis failed'))
+        return Promise.resolve({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: final ? 'Tool limit reached' : null,
+                tool_calls: final
+                  ? []
+                  : [
+                      {
+                        id: `call-${++generated}`,
+                        type: 'function',
+                        function: { name: 'my_tool', arguments: '{}' },
+                      },
+                    ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        })
+      })
+      const result = togetherProvider.executeRequest({ ...baseRequest, tools: [toolDef] })
+      if (failsSynthesis) await expect(result).rejects.toThrow('synthesis failed')
+      else
+        await expect(result).resolves.toMatchObject({
+          tokens: { input: 35, output: 21, total: 56 },
+        })
+      expect(mockExecuteTool).toHaveBeenCalledTimes(5)
+      expect(generated).toBe(6)
+      expect(mockRecordUsage).toHaveBeenCalledExactlyOnceWith(expect.anything(), {
+        input: 5,
+        output: 3,
+        cacheRead: 0,
+      })
+      const capturedCalls = mockCapture.mock.calls.flatMap(
+        ([, , message]) => message.tool_calls?.map((call: { id: string }) => call.id) ?? []
+      )
+      expect(capturedCalls).toEqual(Array.from({ length: 5 }, (_, index) => `call-${index + 1}`))
+      expect(capturedCalls).not.toContain('call-6')
+    }
+  )
+
   it('throws when the API key is missing', async () => {
     await expect(
       togetherProvider.executeRequest({ ...baseRequest, apiKey: undefined })
@@ -143,6 +212,14 @@ describe('togetherProvider', () => {
     expect(lastCallBody()).toMatchObject({ stream: true, stream_options: { include_usage: true } })
     expect(result).toHaveProperty('stream')
     expect(result).toHaveProperty('execution')
+  })
+
+  it('preserves custom model casing after an uppercase provider prefix', async () => {
+    mockCreate.mockResolvedValueOnce(textResponse('ok'))
+
+    await togetherProvider.executeRequest({ ...baseRequest, model: 'TOGETHER/Org/Custom-Model' })
+
+    expect(callBody(0).model).toBe('Org/Custom-Model')
   })
 
   it('sends a json_schema response_format with no strict field', async () => {
@@ -217,15 +294,54 @@ describe('togetherProvider', () => {
     )
   })
 
-  it("forces tool_choice 'none' on the final streaming call after tools run", async () => {
+  it('replays Together assistant content and reasoning on the second request', async () => {
     mockCreate
-      .mockResolvedValueOnce(toolCallResponse())
-      .mockResolvedValueOnce(textResponse('done'))
-      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce(
+        toolCallResponse({
+          content: 'I will use the tool.',
+          reasoning: 'Need the tool result.',
+        })
+      )
+      .mockResolvedValueOnce(textResponse('final answer'))
 
-    await togetherProvider.executeRequest({ ...baseRequest, stream: true, tools: [toolDef] })
+    await togetherProvider.executeRequest({ ...baseRequest, tools: [toolDef] })
 
-    expect(mockCreate).toHaveBeenCalledTimes(3)
-    expect(lastCallBody()).toMatchObject({ tool_choice: 'none', stream: true })
+    expect(
+      callBody(1).messages.find((message: { role: string }) => message.role === 'assistant')
+    ).toEqual({
+      role: 'assistant',
+      content: 'I will use the tool.',
+      reasoning: 'Need the tool result.',
+      tool_calls: [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'my_tool', arguments: '{"x":1}' },
+        },
+      ],
+    })
+  })
+
+  it('streams the settled tool-loop answer without a duplicate provider request', async () => {
+    mockCreate.mockResolvedValueOnce(toolCallResponse()).mockResolvedValueOnce(textResponse('done'))
+
+    const result = (await togetherProvider.executeRequest({
+      ...baseRequest,
+      stream: true,
+      tools: [toolDef],
+    })) as StreamingExecution
+
+    expect(mockCreate).toHaveBeenCalledTimes(2)
+    expect(result.execution.output).toMatchObject({
+      content: 'done',
+      tokens: { input: 18, output: 9, total: 27 },
+      toolCalls: { count: 1 },
+    })
+    const reader = result.stream.getReader()
+    await expect(reader.read()).resolves.toEqual({
+      done: false,
+      value: { type: 'text_delta', text: 'done', turn: 'final' },
+    })
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
   })
 })

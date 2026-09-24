@@ -1,16 +1,18 @@
 import { createLogger } from '@sim/logger'
-import { RenameFile } from '@/lib/copilot/generated/tool-catalog-v1'
-import { ensureWorkspaceAccess } from '@/lib/copilot/tools/handlers/access'
+import {
+  executeCopilotFileUseCase,
+  resolveCopilotWorkspaceFileReference,
+} from '@/lib/copilot/application/execute-file-use-case'
+import { messageForCopilotFileError } from '@/lib/copilot/auth/file-delegation'
 import {
   assertServerToolNotAborted,
   type BaseServerTool,
   type ServerToolContext,
 } from '@/lib/copilot/tools/server/base-tool'
-import {
-  getWorkspaceFile,
-  resolveWorkspaceFileReference,
-} from '@/lib/uploads/contexts/workspace/workspace-file-manager'
-import { performRenameWorkspaceFile } from '@/lib/workspace-files/orchestration'
+import { asOrchestrationError } from '@/lib/core/orchestration/types'
+import { fileOperations } from '@/lib/workspace-files/application/operations'
+import { readWorkspaceFileMetadata } from '@/lib/workspace-files/application/read-workspace-file-metadata'
+import { renameWorkspaceFile } from '@/lib/workspace-files/application/rename-workspace-file'
 import { validateFlatWorkspaceFileName } from './workspace-file'
 
 const logger = createLogger('RenameFileServerTool')
@@ -31,8 +33,13 @@ interface RenameFileResult {
   }
 }
 
+/**
+ * Removed from the mothership catalog in favor of mv; the executor stays
+ * registered under its literal name so in-flight checkpoints paused on
+ * rename_file still resume. Delete after the mv release soaks.
+ */
 export const renameFileServerTool: BaseServerTool<RenameFileArgs, RenameFileResult> = {
-  name: RenameFile.id,
+  name: 'rename_file',
   async execute(params: RenameFileArgs, context?: ServerToolContext): Promise<RenameFileResult> {
     if (!context?.userId) {
       throw new Error('Authentication required')
@@ -41,8 +48,6 @@ export const renameFileServerTool: BaseServerTool<RenameFileArgs, RenameFileResu
     if (!workspaceId) {
       return { success: false, message: 'Workspace ID is required' }
     }
-    await ensureWorkspaceAccess(workspaceId, context.userId, 'write')
-
     const nested = params.args
     const path = params.path || (nested?.path as string) || ''
     const legacyFileId = params.fileId || (nested?.fileId as string) || ''
@@ -54,23 +59,41 @@ export const renameFileServerTool: BaseServerTool<RenameFileArgs, RenameFileResu
     const nameError = validateFlatWorkspaceFileName(newName)
     if (nameError) return { success: false, message: nameError }
 
-    const existingFile = path
-      ? await resolveWorkspaceFileReference(workspaceId, path)
-      : await getWorkspaceFile(workspaceId, legacyFileId)
+    let existingFile
+    try {
+      existingFile = path
+        ? await resolveCopilotWorkspaceFileReference(context, fileOperations.rename, {
+            workspaceId,
+            reference: path,
+          })
+        : (
+            await executeCopilotFileUseCase(
+              context,
+              readWorkspaceFileMetadata,
+              { fileId: legacyFileId, assertedWorkspaceId: workspaceId },
+              { fileId: legacyFileId }
+            )
+          ).file
+    } catch (error) {
+      const classified = asOrchestrationError(error)
+      if (classified?.code !== 'not_found') throw error
+      return { success: false, message: `File not found: ${targetRef}` }
+    }
     if (!existingFile) {
       return { success: false, message: `File not found: ${targetRef}` }
     }
     const fileId = existingFile.id
 
     assertServerToolNotAborted(context)
-    const result = await performRenameWorkspaceFile({
-      workspaceId,
-      fileId,
-      name: newName,
-      userId: context.userId,
-    })
-    if (!result.success) {
-      return { success: false, message: result.error || 'Failed to rename file' }
+    try {
+      await executeCopilotFileUseCase(
+        context,
+        renameWorkspaceFile,
+        { fileId, assertedWorkspaceId: workspaceId, name: newName },
+        { fileId }
+      )
+    } catch (error) {
+      return { success: false, message: messageForCopilotFileError(error, 'Failed to rename file') }
     }
 
     logger.info('File renamed via rename_file', {

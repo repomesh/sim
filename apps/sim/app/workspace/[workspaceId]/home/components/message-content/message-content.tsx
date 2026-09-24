@@ -1,23 +1,60 @@
 'use client'
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Read as ReadTool, WorkspaceFile } from '@/lib/copilot/generated/tool-catalog-v1'
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { cn } from '@sim/emcn'
+import { CircleStop } from '@sim/emcn/icons'
+import { PrepareFileEdit, Read as ReadTool } from '@/lib/copilot/generated/tool-catalog-v1'
 import { isToolHiddenInUi } from '@/lib/copilot/tools/client/hidden-tools'
 import { resolveToolDisplay } from '@/lib/copilot/tools/client/store-utils'
 import { ClientToolCallState } from '@/lib/copilot/tools/client/tool-call-state'
+import { RETIRED_BROWSER_REQUEST_TAKEOVER_ID } from '@/lib/copilot/tools/retired-tools'
 import {
-  getToolCompletedTitle,
   getToolDisplayTitle,
+  getToolStatusDisplayTitle,
   humanizeToolName,
+  normalizeToolActivityDescription,
 } from '@/lib/copilot/tools/tool-display'
 import { useChatSurface } from '@/app/workspace/[workspaceId]/home/components/chat-surface-context'
-import type { ContentBlock, OptionItem, ToolCallData } from '../../types'
-import { SUBAGENT_LABELS } from '../../types'
+import {
+  collectGroupTools,
+  hasAgentGroupItemContent,
+  hasPendingAgentGroup,
+} from '@/app/workspace/[workspaceId]/home/components/message-content/components/agent-group/agent-group-content'
+import { getActivityStatusTool } from '@/app/workspace/[workspaceId]/home/components/message-content/components/agent-group/tool-activity-group'
+import type { CredentialSubmissionPayload } from '@/app/workspace/[workspaceId]/home/components/message-content/components/special-tags'
+import { collectMessageSources } from '@/app/workspace/[workspaceId]/home/components/message-content/message-sources'
+import { resolveMessageCitations } from '@/app/workspace/[workspaceId]/home/components/message-content/resolve-citations'
+import type {
+  ContentBlock,
+  OptionItem,
+  ToolCallData,
+} from '@/app/workspace/[workspaceId]/home/types'
+import { SUBAGENT_LABELS } from '@/app/workspace/[workspaceId]/home/types'
+import { useCustomBlockOverlayVersion } from '@/blocks/custom/client-overlay'
 import type { AgentGroupItem } from './components'
-import { AgentGroup, ChatContent, CircleStop, Options, PendingTagIndicator } from './components'
+import { AgentGroup, ChatContent, MessageSources, Options, PendingTagIndicator } from './components'
 import { deriveMessagePhase, isToolDone, type MessagePhase } from './utils'
 
 const FILE_SUBAGENT_ID = 'file'
+/** Quiet period before the shimmer takes the slot back from streamed output. */
+const STREAM_IDLE_DELAY_MS = 1_500
+/**
+ * The vertical extent (10px gap + 36px row) shared by the shimmer slot and the
+ * actions row that replaces it at settle. The swap is only jump-free because
+ * these are equal; changing one side without the other reintroduces a scroll
+ * clamp at end of turn. (A stopped turn's stacked rows are exempt — their
+ * extra height is glided-in growth, not a swap.)
+ */
+const TAIL_REGION_CLASSES = 'mt-[10px] flex h-[36px] items-center'
 
 interface TextSegment {
   type: 'text'
@@ -47,6 +84,56 @@ interface StoppedSegment {
 
 type MessageSegment = TextSegment | AgentGroupSegment | OptionsSegment | StoppedSegment
 
+function getAgentGroupActivityKey(items: AgentGroupItem[]): string {
+  return items
+    .map((item) => {
+      if (item.type === 'text') {
+        return `text:${item.content.length}`
+      }
+      if (item.type === 'tool') {
+        return [
+          'tool',
+          item.data.id,
+          item.data.status,
+          item.data.displayTitle,
+          item.data.streamingArgs?.length ?? 0,
+        ].join(':')
+      }
+      return [
+        'agent',
+        item.group.id,
+        item.group.isDelegating ? 1 : 0,
+        item.group.isOpen ? 1 : 0,
+        getAgentGroupActivityKey(item.group.items),
+      ].join(':')
+    })
+    .join('|')
+}
+
+/**
+ * Compact identity for what the transcript is visibly rendering. Main-lane
+ * reasoning and other suppressed blocks intentionally do not affect it, while
+ * activity in every nested/parallel lane does.
+ */
+function getVisibleStreamActivityKey(segments: MessageSegment[]): string {
+  return segments
+    .map((segment) => {
+      if (segment.type === 'text') return `text:${segment.id}:${segment.content.length}`
+      if (segment.type === 'options') {
+        return `options:${segment.items.map((item) => `${item.id}:${item.label.length}`).join(',')}`
+      }
+      if (segment.type === 'stopped') return 'stopped'
+      return [
+        'agent',
+        segment.id,
+        segment.isDelegating ? 1 : 0,
+        segment.isOpen ? 1 : 0,
+        getAgentGroupActivityKey(segment.items),
+      ].join(':')
+    })
+    .join('||')
+}
+
 const SUBAGENT_KEYS = new Set(Object.keys(SUBAGENT_LABELS))
 
 /**
@@ -56,7 +143,7 @@ const SUBAGENT_KEYS = new Set(Object.keys(SUBAGENT_LABELS))
  * group is absorbed so it doesn't render as a separate Mothership entry.
  */
 const SUBAGENT_DISPATCH_TOOLS: Record<string, string> = {
-  [FILE_SUBAGENT_ID]: WorkspaceFile.id,
+  [FILE_SUBAGENT_ID]: PrepareFileEdit.id,
 }
 
 function isToolResultRead(params?: Record<string, unknown>): boolean {
@@ -100,26 +187,42 @@ function getOverrideDisplayTitle(tc: NonNullable<ContentBlock['toolCall']>): str
   if (tc.name === ReadTool.id || tc.name === 'respond' || tc.name.endsWith('_respond')) {
     return resolveToolDisplay(tc.name, mapToolStatusToClientState(tc.status), tc.params)?.text
   }
+  if (tc.name === 'manage_credential' && tc.params?.operation === 'rename') {
+    const output = tc.result?.output
+    const result = output && typeof output === 'object' ? (output as Record<string, unknown>) : null
+    const previousDisplayName = result?.previousDisplayName
+    if (typeof previousDisplayName === 'string' && previousDisplayName.trim()) {
+      return getToolDisplayTitle(tc.name, {
+        ...tc.params,
+        previousDisplayName: previousDisplayName.trim(),
+      })
+    }
+  }
   return undefined
 }
 
 function toToolData(tc: NonNullable<ContentBlock['toolCall']>): ToolCallData {
+  const activityDescription = normalizeToolActivityDescription(tc.activityDescription)
   const overrideDisplayTitle = getOverrideDisplayTitle(tc)
   const resolvedTitle =
     overrideDisplayTitle || tc.displayTitle || getToolDisplayTitle(tc.name, tc.params)
-  const displayTitle =
-    tc.status === 'success'
-      ? (getToolCompletedTitle(resolvedTitle) ?? resolvedTitle)
-      : resolvedTitle
+  const displayTitle = getToolStatusDisplayTitle(
+    resolvedTitle,
+    tc.status,
+    tc.name,
+    activityDescription
+  )
 
   return {
     id: tc.id,
     toolName: tc.name,
     displayTitle,
+    activityDescription,
     status: tc.status,
     params: tc.params,
     result: tc.result,
     streamingArgs: tc.streamingArgs,
+    startedAt: tc.startedAtMs,
   }
 }
 
@@ -137,34 +240,18 @@ function createAgentGroupSegment(name: string, id: string): AgentGroupSegment {
   }
 }
 
-type NarrationChannel = 'thinking' | 'assistant'
-
 /**
  * Appends narration content to a group, merging into the previous text item.
- * When a thinking run and a text run meet, their contents can glue together
- * without any whitespace at the seam. The merge repairs only that semantic
- * channel transition, and only at an unambiguous sentence boundary — trailing
- * punctuation meeting a fresh alphanumeric start. Same-channel continuations
- * (streamed chunks of one run, resume legs) are concatenated verbatim, so a
- * token split like `v2.` + `1` is never mutated. `lastChannelByGroup` is the
- * caller's per-parse tracker of each group's most recent narration channel.
+ * Streamed chunks and resume legs are concatenated verbatim, so a token split
+ * like `v2.` + `1` is never mutated.
  */
-function appendTextItem(
-  group: AgentGroupSegment,
-  content: string,
-  channel: NarrationChannel,
-  lastChannelByGroup: Map<AgentGroupSegment, NarrationChannel>
-): void {
+function appendTextItem(group: AgentGroupSegment, content: string): void {
   const lastItem = group.items[group.items.length - 1]
   if (lastItem?.type === 'text') {
-    const isChannelSeam = lastChannelByGroup.get(group) !== channel
-    const needsSpace =
-      isChannelSeam && /[.!?;:]$/.test(lastItem.content) && /^[A-Za-z0-9]/.test(content)
-    lastItem.content += (needsSpace ? ' ' : '') + content
+    lastItem.content += content
   } else {
     group.items.push({ type: 'text', content })
   }
-  lastChannelByGroup.set(group, channel)
 }
 
 /**
@@ -178,7 +265,6 @@ function appendTextItem(
 function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
   const segments: MessageSegment[] = []
   const groupsBySpanId = new Map<string, AgentGroupSegment>()
-  const lastNarrationChannel = new Map<AgentGroupSegment, NarrationChannel>()
   // Stable per-run counters for React keys. The Nth top-level text run / Nth
   // mothership group keeps the same key across re-parses (text runs and groups
   // are append-only at the top level), so React never remounts the streaming
@@ -206,12 +292,10 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
     return last?.type === 'agent_group' && last.agentName === 'mothership' ? last : null
   }
 
-  // Top-level (mothership) tool calls render in a collapsible group. Reuse that
-  // group only while it is still the most recent segment so consecutive tools
-  // stay together; once any other segment (main text, a spawned subagent,
-  // thinking, etc.) breaks the run, the next tool opens a fresh group below it
-  // instead of jumping back up into the original one. This keeps the mothership's
-  // tools and prose interleaved in the order they actually happened.
+  /**
+   * Reuse only the latest main activity segment so tools remain interleaved
+   * with prose and subagents in stream order.
+   */
   const ensureMothership = (): AgentGroupSegment => {
     const existing = tailMothershipGroup()
     if (existing) return existing
@@ -274,7 +358,12 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i]
 
-    if (block.type === 'subagent_text' || block.type === 'subagent_thinking') {
+    // Thinking is intentionally absent from the transcript. Ignore both lanes
+    // so rollout-skewed or replayed streams cannot surface reasoning or affect
+    // layout differently from the persisted message, which strips it.
+    if (block.type === 'thinking' || block.type === 'subagent_thinking') continue
+
+    if (block.type === 'subagent_text') {
       if (!block.content || !block.spanId) continue
       let g = groupsBySpanId.get(block.spanId)
       // Out-of-order safety: content can arrive before its subagent-start block
@@ -285,18 +374,9 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
       }
       if (!g) continue
       g.isDelegating = false
-      appendTextItem(
-        g,
-        block.content,
-        block.type === 'subagent_thinking' ? 'thinking' : 'assistant',
-        lastNarrationChannel
-      )
+      appendTextItem(g, block.content)
       continue
     }
-
-    // Main-agent thinking is intentionally not rendered. The reasoning is still
-    // reduced and persisted upstream — this is a display-only omission.
-    if (block.type === 'thinking') continue
 
     if (block.type === 'text') {
       if (!block.content) continue
@@ -306,7 +386,7 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
         if (!g) g = ensureSpanGroup(block.subagent, block.spanId, block.parentSpanId)
         if (g) {
           g.isDelegating = false
-          appendTextItem(g, block.content, 'assistant', lastNarrationChannel)
+          appendTextItem(g, block.content)
           continue
         }
       }
@@ -321,6 +401,7 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
       const dispatchToolName = SUBAGENT_DISPATCH_TOOLS[block.content]
       if (dispatchToolName) absorbDispatchTool(dispatchToolName, block.parentSpanId)
       const g = ensureSpanGroup(block.content, block.spanId, block.parentSpanId)
+      if (block.subagentName) g.agentLabel = block.subagentName
       if (block.endedAt !== undefined) {
         // Persisted backend path: the lane was stamped closed (endedAt) without
         // a separate subagent_end block (the Sim backend stamps endedAt only;
@@ -334,8 +415,8 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
       // Show the working/delegating spinner from span open until the agent
       // emits its first content or tool (or ends). The legacy path derived this
       // from the dispatch tool_call, which the span path absorbs, so we set it
-      // here. It is cleared in the subagent_text/subagent_thinking, scoped text,
-      // tool_call, and subagent_end branches.
+      // here. It is cleared in the subagent_text, scoped text, tool_call, and
+      // subagent_end branches; suppressed thinking leaves it unchanged.
       g.isDelegating = true
       g.isOpen = true
       continue
@@ -418,7 +499,7 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
  * Groups content blocks into agent-scoped segments.
  * Dispatch tool_calls (name matches a subagent key, no calledBy) are absorbed
  * into the agent header. Inner tool_calls are nested underneath their agent.
- * Orphan tool_calls (no calledBy, not a dispatch) group under "Sim".
+ * Main-agent segments retain their tool history for inline activity summaries.
  *
  * New backends stamp every subagent block with deterministic span identity; in
  * that case {@link parseBlocksWithSpanTree} builds a real nested tree. The
@@ -426,17 +507,40 @@ function parseBlocksWithSpanTree(blocks: ContentBlock[]): MessageSegment[] {
  * span identity existed.
  */
 export function parseBlocks(blocks: ContentBlock[]): MessageSegment[] {
-  if (blocks.some((block) => Boolean(block.spanId))) {
-    return parseBlocksWithSpanTree(blocks)
-  }
-  return parseBlocksLegacy(blocks)
+  return blocks.some((block) => Boolean(block.spanId))
+    ? parseBlocksWithSpanTree(blocks)
+    : parseBlocksLegacy(blocks)
+}
+
+function joinRenderableText(parts: string[]): string {
+  return parts.filter(Boolean).join('\n\n')
+}
+
+/** Returns only top-level orchestrator text, excluding agent groups and other UI segments. */
+export function getOrchestratorMessageText(
+  blocks: ContentBlock[],
+  fallbackContent: string
+): string {
+  const parsed = blocks.length > 0 ? parseBlocks(blocks) : []
+  if (parsed.length === 0) return fallbackContent
+
+  return joinRenderableText(
+    parsed.map((segment) => (segment.type === 'text' ? segment.content : ''))
+  )
 }
 
 function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
   const segments: MessageSegment[] = []
   const groupsByKey = new Map<string, AgentGroupSegment>()
-  const lastNarrationChannel = new Map<AgentGroupSegment, NarrationChannel>()
   let activeGroupKey: string | null = null
+  // Run-ordinal keys, mirroring parseBlocksWithSpanTree. A turn starts in this
+  // parser and flips to the span-tree parser when the first spanId-carrying
+  // block arrives; segments that exist in both must keep the SAME React key
+  // across that flip or their subtrees remount mid-stream (group re-expands,
+  // text re-fades). Block-index text keys and position-based mothership ids
+  // diverge from the span-tree scheme; run ordinals match it.
+  let textRun = 0
+  let mothershipRun = 0
 
   const groupKey = (name: string, parentToolCallId: string | undefined) =>
     parentToolCallId ? `${name}:${parentToolCallId}` : `${name}:legacy`
@@ -463,9 +567,14 @@ function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
       type: 'agent_group',
       // Canonical key = the dispatch tool call id, identical to the span-tree
       // parser, so a transcript that gains span ids (or a DB reload) keeps the
-      // same React key and never remounts. Orphans (no dispatch tool) keep the
-      // position-based legacy id.
-      id: parentToolCallId ? `agent-${parentToolCallId}` : `agent-${key}-${segments.length}`,
+      // same React key and never remounts. The mothership group uses the same
+      // run-ordinal id as the span-tree parser for the same reason. Orphans
+      // (no dispatch tool, not mothership) keep the position-based legacy id.
+      id: parentToolCallId
+        ? `agent-${parentToolCallId}`
+        : name === 'mothership'
+          ? `agent-mothership-${mothershipRun++}`
+          : `agent-${key}-${segments.length}`,
       agentName: name,
       agentLabel: resolveAgentLabel(name),
       items: [],
@@ -502,25 +611,16 @@ function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i]
 
-    if (block.type === 'subagent_text' || block.type === 'subagent_thinking') {
+    // See the span-tree parser: thinking is neither visible nor allowed to
+    // influence grouping because it is absent from persisted transcripts.
+    if (block.type === 'thinking' || block.type === 'subagent_thinking') continue
+
+    if (block.type === 'subagent_text') {
       if (!block.content) continue
       const g = findGroupForSubagentChunk(block.parentToolCallId)
       if (!g) continue
       g.isDelegating = false
-      appendTextItem(
-        g,
-        block.content,
-        block.type === 'subagent_thinking' ? 'thinking' : 'assistant',
-        lastNarrationChannel
-      )
-      continue
-    }
-
-    if (block.type === 'thinking') {
-      // Main-agent thinking is not rendered, but it still breaks open subagent
-      // lanes so later chunks don't merge across it (display-only omission).
-      if (!block.content?.trim()) continue
-      flushLanes()
+      appendTextItem(g, block.content)
       continue
     }
 
@@ -530,7 +630,7 @@ function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
         const g = groupsByKey.get(resolveGroupKey(block.subagent, block.parentToolCallId))
         if (g) {
           g.isDelegating = false
-          appendTextItem(g, block.content, 'assistant', lastNarrationChannel)
+          appendTextItem(g, block.content)
           continue
         }
       }
@@ -539,7 +639,7 @@ function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
       if (last?.type === 'text') {
         last.content += block.content
       } else {
-        segments.push({ type: 'text', id: `text-${i}`, content: block.content })
+        segments.push({ type: 'text', id: `text-${textRun++}`, content: block.content })
       }
       continue
     }
@@ -561,6 +661,7 @@ function parseBlocksLegacy(blocks: ContentBlock[]): MessageSegment[] {
       }
       groupsByKey.delete(groupKey('mothership', undefined))
       const { group: g } = ensureGroup(key, block.parentToolCallId)
+      if (block.subagentName) g.agentLabel = block.subagentName
       if (inheritedDelegation) g.isDelegating = true
       g.isOpen = true
       activeGroupKey = resolveGroupKey(key, block.parentToolCallId)
@@ -663,7 +764,37 @@ export function assistantMessageHasRenderableContent(
       : fallbackContent.trim()
         ? [{ type: 'text' as const, id: 'text-fallback', content: fallbackContent }]
         : []
-  return segments.length > 0
+  return segments.some(
+    (segment) => segment.type !== 'agent_group' || segment.items.some(hasAgentGroupItemContent)
+  )
+}
+
+/** The transcript already owns an activity indicator, including gaps between calls. */
+export function assistantMessageHasVisibleActivity(
+  segments: MessageSegment[],
+  isStreaming = false
+): boolean {
+  return segments.some((segment, index) => {
+    if (segment.type !== 'agent_group' || !segment.items.some(hasAgentGroupItemContent)) {
+      return false
+    }
+    const tools = collectGroupTools(segment.items)
+    if (tools.some((tool) => tool.status === 'executing')) return true
+    if (!isStreaming) return false
+    if (segment.agentName !== 'mothership') {
+      const statusTool = getActivityStatusTool(tools)
+      return (
+        (segment.isOpen || segment.isDelegating) && (!statusTool || statusTool.status === 'success')
+      )
+    }
+    const lastItem = segment.items.at(-1)
+    return (
+      index === segments.length - 1 &&
+      lastItem?.type === 'tool' &&
+      lastItem.data.status === 'success' &&
+      lastItem.data.toolName !== RETIRED_BROWSER_REQUEST_TAKEOVER_ID
+    )
+  })
 }
 
 export function shouldSmoothTextSegment({
@@ -678,39 +809,151 @@ export function shouldSmoothTextSegment({
   return isStreaming && segmentIndex === segmentCount - 1
 }
 
+const DISPATCH_TOOL_NAMES = new Set([...SUBAGENT_KEYS, ...Object.values(SUBAGENT_DISPATCH_TOOLS)])
+
+/**
+ * Activity phrase for the turn-level shimmer, derived from the most recent
+ * stream block. The shimmer only shows in quiet gaps (see showShimmer), so the
+ * phrase describes the wait, not the output: a stall after streamed text is
+ * the agent deciding what's next — Thinking — never "Generating" (while text
+ * actually generates the shimmer is hidden). Dispatching covers only the
+ * dispatch call itself (whose tool row the parser absorbs). Empty agent lanes
+ * share this indicator until a visible activity row takes over.
+ */
+export function deriveThinkingLabel(blocks: ContentBlock[]): string {
+  const last = blocks[blocks.length - 1]
+  switch (last?.type) {
+    case 'subagent_end':
+      return 'Returning…'
+    case 'tool_call':
+      return last.toolCall && DISPATCH_TOOL_NAMES.has(last.toolCall.name)
+        ? 'Dispatching…'
+        : 'Thinking…'
+    default:
+      return 'Thinking…'
+  }
+}
+
 interface MessageContentProps {
   blocks: ContentBlock[]
   fallbackContent: string
+  messageId?: string
+  requestMode?: 'agent' | 'assistant'
   isStreaming: boolean
+  /**
+   * True for the last message in the transcript. The last turn keeps a
+   * fixed-height thinking slot at its bottom (see JSX) so the shimmer fades in
+   * place without ever changing height.
+   */
+  isLast?: boolean
+  /** Transcript-derived answers for this message's question card (renders the recap). */
+  questionAnswers?: string[]
+  /** Transcript-derived status payload for this message's credential card. */
+  credentialSubmission?: CredentialSubmissionPayload
+  /** The user moved on without submitting this message's credential card. */
+  credentialAbandoned?: boolean
   onOptionSelect?: (id: string) => void
+  onQuestionDismiss?: () => void
   onPhaseChange?: (phase: MessagePhase) => void
+  /**
+   * The message's actions row (copy/thumbs). Rendered here, in the thinking
+   * slot's position, so at settle the shimmer and the actions trade places in
+   * one render — a single tiny reflow instead of a collapse the buttons ride
+   * or a late mount the chase visibly scrolls to. The caller gates it on
+   * content/question eligibility only; the settle timing is owned here.
+   */
+  actions?: ReactNode
 }
 
 function MessageContentInner({
   blocks,
   fallbackContent,
+  messageId,
+  requestMode,
   isStreaming = false,
+  isLast = false,
+  questionAnswers,
+  credentialSubmission,
+  credentialAbandoned,
   onOptionSelect,
+  onQuestionDismiss,
   onPhaseChange,
+  actions,
 }: MessageContentProps) {
   const { onWorkspaceResourceSelect } = useChatSurface()
-  const parsed = useMemo(() => (blocks.length > 0 ? parseBlocks(blocks) : []), [blocks])
+  const blockOverlayVersion = useCustomBlockOverlayVersion()
+  const cited = useMemo(
+    () => resolveMessageCitations(blocks, fallbackContent, requestMode === 'assistant'),
+    [blocks, fallbackContent, requestMode]
+  )
+  const parsed = useMemo(
+    () => (cited.blocks.length > 0 ? parseBlocks(cited.blocks) : []),
+    [cited.blocks, blockOverlayVersion]
+  )
 
   const [trailingRevealing, setTrailingRevealing] = useState(false)
   const handleTrailingRevealChange = useCallback((revealing: boolean) => {
     setTrailingRevealing(revealing)
   }, [])
+  const [trailingStreamActivity, setTrailingStreamActivity] = useState(false)
+  const handleTrailingStreamActivityChange = useCallback((active: boolean) => {
+    setTrailingStreamActivity(active)
+  }, [])
+  const [trailingPendingTag, setTrailingPendingTag] = useState(false)
+  const handleTrailingPendingTagChange = useCallback((pending: boolean) => {
+    setTrailingPendingTag(pending)
+  }, [])
+  const [isStreamIdle, setIsStreamIdle] = useState(false)
 
-  const segments: MessageSegment[] =
-    parsed.length > 0
-      ? parsed
-      : fallbackContent?.trim()
-        ? [{ type: 'text' as const, id: 'text-fallback', content: fallbackContent }]
-        : []
+  const segments = useMemo<MessageSegment[]>(
+    () =>
+      parsed.length > 0
+        ? parsed
+        : cited.fallbackContent?.trim()
+          ? [{ type: 'text', id: 'text-fallback', content: cited.fallbackContent }]
+          : [],
+    [parsed, cited.fallbackContent]
+  )
+  /**
+   * Collected from the segments that render, not the raw blocks: that is the
+   * same text the inline chips come from, so the footer agrees with them — it
+   * covers the fallback text of a block-less message and leaves out lane text
+   * that `parseBlocks` folds into agent groups.
+   */
+  const sources = useMemo(
+    () =>
+      collectMessageSources(
+        segments.flatMap((segment) => (segment.type === 'text' ? [segment.content] : []))
+      ),
+    [segments]
+  )
+  const visibleStreamActivityKey = getVisibleStreamActivityKey(segments)
+
+  // Every visible stream update restarts the quiet-period clock. A layout
+  // effect clears an already-visible shimmer before paint, so a chunk from any
+  // parallel lane yields the slot to the arriving output without a stale flash.
+  useLayoutEffect(() => {
+    if (!isStreaming) {
+      setIsStreamIdle(false)
+      return
+    }
+
+    setIsStreamIdle(false)
+    const timeout = setTimeout(() => setIsStreamIdle(true), STREAM_IDLE_DELAY_MS)
+    return () => clearTimeout(timeout)
+  }, [visibleStreamActivityKey, isStreaming])
 
   const lastSegment = segments[segments.length - 1]
-  const hasTrailingTextSegment = lastSegment?.type === 'text'
-  const isRevealing = hasTrailingTextSegment && trailingRevealing
+  // The reveal tail is the last TEXT segment — a stopped block appends AFTER
+  // the text that is still visibly draining, and treating the turn as settled
+  // the moment it lands tears down the scroll machinery mid-reveal.
+  const revealTailIndex =
+    lastSegment?.type === 'stopped' && segments[segments.length - 2]?.type === 'text'
+      ? segments.length - 2
+      : lastSegment?.type === 'text'
+        ? segments.length - 1
+        : -1
+  const isRevealing = revealTailIndex >= 0 && trailingRevealing
   const phase = deriveMessagePhase({ isStreaming, isRevealing })
 
   const onPhaseChangeRef = useRef(onPhaseChange)
@@ -719,87 +962,145 @@ function MessageContentInner({
     onPhaseChangeRef.current?.(phase)
   }, [phase])
 
-  if (segments.length === 0) {
-    if (isStreaming) {
-      return (
-        <div className='space-y-[10px]'>
-          <PendingTagIndicator />
-        </div>
-      )
-    }
-    return null
-  }
+  // The slot is the last message's own element, so it grows on send with the
+  // row (no separate mount → no jump). Gated on phase, not isStreaming: the
+  // trailing text keeps visually revealing on a timer after the network stream
+  // closes, and collapsing under a still-growing reveal reads as the blob
+  // winking out early while everything shifts.
+  const thinkingExpanded = phase !== 'settled' && lastSegment?.type !== 'stopped'
 
-  const hasTrailingContent = lastSegment.type === 'text' || lastSegment.type === 'stopped'
+  if (segments.length === 0 && !isLast) return null
 
-  // Deterministic "between steps" signal: the turn is still streaming, nothing
-  // is actively running (a running tool/subagent renders its own spinner), and
-  // no trailing text is being revealed. Derived from explicit node state rather
-  // than guessing from the shape of the last segment.
-  const hasRunningWork = blocks.some(
-    (b) => b.toolCall?.status === 'executing' || (b.type === 'subagent' && b.endedAt === undefined)
+  /** Open activity groups own the shimmer through gaps between tool calls. */
+  // A mid-stream special tag renders nothing until complete, so its bytes are a
+  // wait, not output — the shimmer bridges it without the quiet-period delay.
+  const thinkingLabel = deriveThinkingLabel(blocks)
+  const hasActivityIndicator = assistantMessageHasVisibleActivity(segments, isStreaming)
+  const hasPendingAgents =
+    isStreaming &&
+    segments.some((segment) => segment.type === 'agent_group' && hasPendingAgentGroup(segment))
+  const showShimmer =
+    thinkingExpanded &&
+    (segments.length === 0 ||
+      trailingPendingTag ||
+      (((hasPendingAgents && revealTailIndex < 0) || isStreamIdle) &&
+        !trailingStreamActivity &&
+        !hasActivityIndicator))
+
+  const actionsRow = (
+    <div className='flex items-center gap-0.5'>
+      {actions}
+      {sources.length > 0 && <MessageSources sources={sources} />}
+    </div>
   )
-  const showTrailingThinking = phase === 'streaming' && !hasTrailingContent && !hasRunningWork
 
   return (
-    <div className='space-y-[10px]'>
-      {segments.map((segment, i) => {
-        switch (segment.type) {
-          case 'text':
-            return (
-              <ChatContent
-                key={segment.id}
-                content={segment.content}
-                isStreaming={shouldSmoothTextSegment({
-                  isStreaming,
-                  segmentIndex: i,
-                  segmentCount: segments.length,
-                })}
-                onOptionSelect={onOptionSelect}
-                onWorkspaceResourceSelect={onWorkspaceResourceSelect}
-                onRevealStateChange={
-                  i === segments.length - 1 ? handleTrailingRevealChange : undefined
-                }
-              />
-            )
-          case 'agent_group': {
-            return (
-              <div key={segment.id} className={isStreaming ? 'animate-stream-fade-in' : undefined}>
-                <AgentGroup
+    <div>
+      <div className='space-y-[10px] [&>[data-agent-group]:has(+[data-agent-group])]:mb-4'>
+        {segments.map((segment, i) => {
+          switch (segment.type) {
+            case 'text':
+              return (
+                <ChatContent
                   key={segment.id}
-                  agentName={segment.agentName}
-                  agentLabel={segment.agentLabel}
-                  items={segment.items}
-                  isDelegating={segment.isDelegating}
-                  isStreaming={isStreaming}
-                  isCurrentSection={i === segments.length - 1}
-                  isLaneOpen={segment.isOpen}
+                  content={segment.content}
+                  messageId={messageId}
+                  requestMode={requestMode}
+                  isStreaming={shouldSmoothTextSegment({
+                    isStreaming,
+                    segmentIndex: i,
+                    segmentCount: segments.length,
+                  })}
+                  questionAnswers={questionAnswers}
+                  credentialSubmission={credentialSubmission}
+                  credentialAbandoned={credentialAbandoned}
+                  onOptionSelect={onOptionSelect}
+                  onQuestionDismiss={onQuestionDismiss}
+                  onWorkspaceResourceSelect={onWorkspaceResourceSelect}
+                  onRevealStateChange={
+                    i === revealTailIndex ? handleTrailingRevealChange : undefined
+                  }
+                  onStreamActivityChange={
+                    i === revealTailIndex ? handleTrailingStreamActivityChange : undefined
+                  }
+                  onPendingTagChange={
+                    i === revealTailIndex ? handleTrailingPendingTagChange : undefined
+                  }
                 />
-              </div>
-            )
+              )
+            case 'agent_group': {
+              if (!segment.items.some(hasAgentGroupItemContent)) return null
+              return (
+                <div
+                  key={segment.id}
+                  data-agent-group
+                  className={isStreaming ? 'animate-stream-fade-in' : undefined}
+                >
+                  <AgentGroup
+                    key={segment.id}
+                    agentName={segment.agentName}
+                    agentLabel={segment.agentLabel}
+                    items={segment.items}
+                    isDelegating={segment.isDelegating}
+                    isStreaming={isStreaming}
+                    isLaneOpen={
+                      segment.agentName === 'mothership'
+                        ? i === segments.length - 1
+                        : segment.isOpen
+                    }
+                  />
+                </div>
+              )
+            }
+            case 'options':
+              return (
+                <div
+                  key={`options-${i}`}
+                  className={isStreaming ? 'animate-stream-fade-in' : undefined}
+                >
+                  <Options items={segment.items} onSelect={onOptionSelect} />
+                </div>
+              )
+            // The stopped row renders in the tail region below, in the
+            // shimmer's place — a stop while the shimmer is visible must read
+            // as an in-place replacement, not the shimmer vanishing from the
+            // tail while a row mounts up here.
+            case 'stopped':
+              return null
           }
-          case 'options':
-            return (
-              <div
-                key={`options-${i}`}
-                className={isStreaming ? 'animate-stream-fade-in' : undefined}
-              >
-                <Options items={segment.items} onSelect={onOptionSelect} />
-              </div>
-            )
-          case 'stopped':
-            return (
-              <div key={`stopped-${i}`} className='flex items-center gap-[8px]'>
-                <CircleStop className='size-[16px] flex-shrink-0 text-[var(--text-icon)]' />
-                <span className='text-[14px] text-[var(--text-body)]'>Stopped by user</span>
-              </div>
-            )
-        }
-      })}
-      {showTrailingThinking && (
-        <div className='animate-stream-fade-in-delayed opacity-0'>
-          <PendingTagIndicator />
+        })}
+      </div>
+      {thinkingExpanded && isLast ? (
+        // Fixed-height placeholder for the NEXT piece of output: the shimmer
+        // and arriving output trade places via opacity only, so mid-turn swaps
+        // can't move layout. A sibling of the space-y stack (not a child), so
+        // it carries no stray sibling margin.
+        <div aria-hidden={!showShimmer} className={TAIL_REGION_CLASSES}>
+          <div
+            className={cn(
+              'transition-opacity duration-200 ease-out',
+              showShimmer ? 'opacity-100' : 'opacity-0'
+            )}
+          >
+            <PendingTagIndicator label={thinkingLabel} />
+          </div>
         </div>
+      ) : // The settled tail takes the slot's place in the SAME render and at the
+      // SAME extent (TAIL_REGION_CLASSES), so the swap is height-neutral by
+      // construction — no reflow for the pinned scroller to absorb. A stopped
+      // turn instead stacks compact natural rows (10px gaps, no 36px boxes):
+      // its extra height is glided-in growth either way, so only the
+      // shimmer-swap occupant needs the fixed extent.
+      lastSegment?.type === 'stopped' ? (
+        <>
+          <div className='mt-[10px] flex items-center gap-[8px]'>
+            <CircleStop className='size-[16px] shrink-0 text-[var(--text-icon)]' />
+            <span className='text-[14px] text-[var(--text-body)]'>Stopped by user</span>
+          </div>
+          {actions && <div className='mt-[10px]'>{actionsRow}</div>}
+        </>
+      ) : (
+        actions && <div className={TAIL_REGION_CLASSES}>{actionsRow}</div>
       )}
     </div>
   )

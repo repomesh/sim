@@ -7,6 +7,7 @@ export const gitlabDeleteBranchTool: ToolConfig<
   GitLabDeleteBranchResponse
 > = {
   id: 'gitlab_delete_branch',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Delete Branch',
   description: 'Delete a branch from a GitLab project repository',
   version: '1.0.0',
@@ -28,7 +29,7 @@ export const gitlabDeleteBranchTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     branch: {
       type: 'string',

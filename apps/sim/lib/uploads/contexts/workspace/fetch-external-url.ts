@@ -1,6 +1,7 @@
 import type { Buffer } from 'buffer'
 import path from 'path'
 import { createLogger } from '@sim/logger'
+import { describeError } from '@sim/utils/errors'
 import {
   secureFetchWithPinnedIP,
   validateUrlWithDNS,
@@ -11,7 +12,7 @@ import {
   readResponseToBufferWithLimit,
 } from '@/lib/core/utils/stream-limits'
 import { uploadWorkspaceFile } from '@/lib/uploads/contexts/workspace/workspace-file-manager'
-import { getMimeTypeFromExtension } from '@/lib/uploads/utils/file-utils'
+import { ensureFileNameExtension, getMimeTypeFromExtension } from '@/lib/uploads/utils/file-utils'
 import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 import type { UserFile } from '@/executor/types'
 
@@ -86,15 +87,16 @@ export async function fetchExternalUrlToWorkspace(
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = options
 
-  const urlValidation = await validateUrlWithDNS(url, 'fileUrl')
-  if (!urlValidation.isValid || !urlValidation.resolvedIP) {
-    throw new ExternalUrlValidationError(urlValidation.error || 'Invalid external URL')
+  const urlValidation = await validateUrlWithDNS(url, 'fileUrl', 'contentFetch')
+  if (!urlValidation.isValid) {
+    throw new ExternalUrlValidationError(urlValidation.error)
   }
 
-  const filename = new URL(url).pathname.split('/').pop() || 'download'
-  const extension = path.extname(filename).toLowerCase().substring(1)
+  const pathFilename = new URL(url).pathname.split('/').pop() || 'download'
+  const extension = path.extname(pathFilename).toLowerCase().substring(1)
 
   const response = await secureFetchWithPinnedIP(url, urlValidation.resolvedIP, {
+    profile: 'contentFetch',
     timeout: timeoutMs,
     maxResponseBytes: maxDownloadBytes,
     signal,
@@ -117,6 +119,7 @@ export async function fetchExternalUrlToWorkspace(
   })
 
   const mimeType = response.headers.get('content-type') || getMimeTypeFromExtension(extension)
+  const filename = ensureFileNameExtension(pathFilename, mimeType)
 
   let savedWorkspaceFile: UserFile | undefined
   if (workspaceId && saveToWorkspace) {
@@ -134,7 +137,7 @@ export async function fetchExternalUrlToWorkspace(
         logger.warn('Failed to save fetched URL to workspace storage', {
           workspaceId,
           filename,
-          saveError,
+          cause: describeError(saveError),
         })
       }
     } else if (permission === null) {

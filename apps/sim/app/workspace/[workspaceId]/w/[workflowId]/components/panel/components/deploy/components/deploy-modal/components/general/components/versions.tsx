@@ -5,6 +5,7 @@ import {
   Button,
   cn,
   Input,
+  OverflowText,
   Popover,
   PopoverContent,
   PopoverItem,
@@ -12,16 +13,16 @@ import {
   Skeleton,
   Tooltip,
 } from '@sim/emcn'
+import { FileText, MoreVertical, Pencil, RefreshCw, SendToBack } from '@sim/emcn/icons'
 import { formatDateTime } from '@sim/utils/formatting'
-import { FileText, MoreVertical, Pencil, RotateCcw, SendToBack } from 'lucide-react'
 import type { WorkflowDeploymentVersionResponse } from '@/lib/workflows/persistence/utils'
 import { formatVersionLabel } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/deploy/components/deploy-modal/components/general/format-version-label'
 import { useUpdateDeploymentVersion } from '@/hooks/queries/deployments'
 import { VersionDescriptionModal } from './version-description-modal'
 
-const HEADER_TEXT_CLASS = 'font-medium text-[var(--text-tertiary)] text-caption'
-const ROW_TEXT_CLASS = 'font-medium text-[var(--text-primary)] text-caption'
-const COLUMN_BASE_CLASS = 'flex-shrink-0'
+const HEADER_TEXT_CLASS = 'text-[var(--text-tertiary)] text-caption'
+const ROW_TEXT_CLASS = 'text-[var(--text-primary)] text-caption'
+const COLUMN_BASE_CLASS = 'shrink-0'
 
 const COLUMN_WIDTHS = {
   VERSION: 'w-[180px]',
@@ -207,6 +208,20 @@ export function Versions({
       <div className='bg-[var(--surface-2)]'>
         {versions.map((v) => {
           const isSelected = selectedVersion === v.version
+          const operationStatus =
+            !v.isActive && v.latestOperationStatus !== 'active' ? v.latestOperationStatus : null
+          const isOperationPending =
+            operationStatus === 'preparing' || operationStatus === 'activating'
+          /** Exactly one parenthetical per row; selection already highlights the row. */
+          const rowLabel = v.isActive
+            ? 'live'
+            : isOperationPending
+              ? 'pending'
+              : operationStatus === 'failed'
+                ? 'failed'
+                : isSelected
+                  ? 'selected'
+                  : null
 
           return (
             <div
@@ -233,9 +248,23 @@ export function Versions({
                   <div
                     className={cn(
                       'size-[6px] shrink-0 rounded-xs',
-                      v.isActive ? 'bg-[var(--indicator-active)]' : 'bg-[var(--indicator-inactive)]'
+                      v.isActive
+                        ? 'bg-[var(--indicator-active)]'
+                        : isOperationPending
+                          ? 'bg-amber-400'
+                          : operationStatus === 'failed'
+                            ? 'bg-red-400'
+                            : 'bg-[var(--indicator-inactive)]'
                     )}
-                    title={v.isActive ? 'Live' : 'Inactive'}
+                    title={
+                      v.isActive
+                        ? 'Live'
+                        : isOperationPending
+                          ? 'Pending'
+                          : operationStatus === 'failed'
+                            ? 'Failed'
+                            : 'Inactive'
+                    }
                   />
                   {editingVersion === v.version ? (
                     <Input
@@ -254,7 +283,7 @@ export function Versions({
                       onClick={(e) => e.stopPropagation()}
                       onBlur={() => handleSaveRename(v.version)}
                       className={cn(
-                        'h-auto w-full border-0 bg-transparent p-0 font-medium text-[var(--text-primary)] text-caption leading-5 shadow-none outline-none focus:outline-none focus-visible:ring-0'
+                        'h-auto w-full border-0 bg-transparent p-0 text-[var(--text-primary)] text-caption leading-5 shadow-none outline-hidden focus:outline-hidden focus-visible:ring-0'
                       )}
                       maxLength={100}
                       disabled={renameMutation.isPending}
@@ -268,12 +297,9 @@ export function Versions({
                       <span className='shrink-0 text-[var(--text-tertiary)] tabular-nums'>
                         v{v.version}
                       </span>
-                      {v.name && <span className='truncate'>{v.name}</span>}
-                      {v.isActive && (
-                        <span className='shrink-0 text-[var(--text-tertiary)]'>(live)</span>
-                      )}
-                      {isSelected && (
-                        <span className='shrink-0 text-[var(--text-tertiary)]'>(selected)</span>
+                      {v.name && <OverflowText label={v.name} />}
+                      {rowLabel && (
+                        <span className='shrink-0 text-[var(--text-tertiary)]'>({rowLabel})</span>
                       )}
                     </span>
                   )}
@@ -302,9 +328,10 @@ export function Versions({
                 <Tooltip.Root>
                   <Tooltip.Trigger asChild>
                     <Button
+                      aria-label={v.description ? 'Edit description' : 'Add description'}
                       variant='ghost'
+                      iconPadding='sm'
                       className={cn(
-                        '!p-1',
                         !v.description &&
                           'text-[var(--text-quaternary)] hover-hover:text-[var(--text-tertiary)]'
                       )}
@@ -330,8 +357,9 @@ export function Versions({
                 >
                   <PopoverTrigger asChild>
                     <Button
+                      aria-label='Version actions'
                       variant='ghost'
-                      className='!p-1'
+                      iconPadding='sm'
                       disabled={isPromotingVersion}
                       onClick={(e) => e.stopPropagation()}
                     >
@@ -349,7 +377,7 @@ export function Versions({
                     </PopoverItem>
                     {!v.isActive && (
                       <PopoverItem onClick={() => handlePromote(v.version)}>
-                        <RotateCcw className='size-3' />
+                        <RefreshCw className='size-3' />
                         <span>Promote to live</span>
                       </PopoverItem>
                     )}

@@ -99,12 +99,21 @@ export const useMothershipQueueStore = create<MothershipQueueState>()(
             const next = [...current]
             // Strip `queuedSendHandoff` — references the stream active at
             // original enqueue time; the dispatcher mints a fresh one at send.
-            const { queuedSendHandoff: _stale, ...rest } = next[index]
+            // Strip `resumeUserMessageId` too: it deduplicates against a
+            // server-side copy of the PRE-edit text, which the edited message is
+            // not a duplicate of, so reusing it would suppress this send.
+            const {
+              queuedSendHandoff: _stale,
+              resumeUserMessageId: _staleResume,
+              ...rest
+            } = next[index]
             next[index] = {
               ...rest,
               content: patch.content,
               fileAttachments: patch.fileAttachments,
               contexts: patch.contexts,
+              requestMode: patch.requestMode,
+              assistantSearch: patch.assistantSearch,
             }
             return { queues: setQueueForChat(state.queues, chatKey, next) }
           }),

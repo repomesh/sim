@@ -3,7 +3,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { copilotChatStopBodySchema } from '@/lib/api/contracts/copilot'
+import { toDisplayMessage } from '@/lib/copilot/chat/display-message'
 import type { OrchestratorResult } from '@/lib/copilot/request/types'
+import { resolveMessageCitations } from '@/app/workspace/[workspaceId]/home/components/message-content/resolve-citations'
 import {
   buildPersistedAssistantMessage,
   buildPersistedUserMessage,
@@ -13,6 +16,86 @@ import {
 } from './persisted-message'
 
 describe('persisted-message', () => {
+  it.each(['success', 'cancelled'] as const)(
+    'preserves model-authored activity metadata through persisted %s history and stop validation',
+    (status) => {
+      const result: OrchestratorResult = {
+        success: true,
+        content: '',
+        toolCalls: [],
+        contentBlocks: [
+          {
+            type: 'tool_call',
+            timestamp: 1,
+            toolCall: {
+              id: 'activity-call',
+              name: 'read',
+              status,
+              activityDescription: '  Checking   the project setup  ',
+              displayTitle: 'Checking the project setup',
+              params: { path: 'WORKSPACE.md' },
+            },
+          },
+        ],
+      }
+      const persisted = buildPersistedAssistantMessage(result)
+      const stopped = copilotChatStopBodySchema.parse({
+        chatId: 'chat-1',
+        streamId: 'stream-1',
+        content: '',
+        contentBlocks: persisted.contentBlocks,
+      })
+      expect(stopped.contentBlocks?.[0].toolCall?.activityDescription).toBe(
+        'Checking the project setup'
+      )
+      const display = toDisplayMessage(
+        normalizeMessage(persisted as unknown as Record<string, unknown>)
+      )
+      expect(display.contentBlocks?.[0].toolCall).toMatchObject({
+        status,
+        activityDescription: 'Checking the project setup',
+        params: { path: 'WORKSPACE.md' },
+      })
+    }
+  )
+
+  it('preserves activity metadata on legacy tool blocks without inferring it from old titles', () => {
+    const message = normalizeMessage({
+      id: 'message-1',
+      role: 'assistant',
+      content: '',
+      contentBlocks: [
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'activity-call',
+            name: 'read',
+            state: 'success',
+            activityDescription: 'Checking the project setup',
+            display: { title: 'Checking the project setup' },
+          },
+        },
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'legacy-call',
+            name: 'gmail_read_v2',
+            state: 'success',
+            display: { title: 'Read recent emails' },
+          },
+        },
+      ],
+    })
+    const display = toDisplayMessage(message)
+    expect(display.contentBlocks?.[0].toolCall?.activityDescription).toBe(
+      'Checking the project setup'
+    )
+    expect(display.contentBlocks?.[1].toolCall).toMatchObject({
+      displayTitle: 'Read recent emails',
+    })
+    expect(display.contentBlocks?.[1].toolCall?.activityDescription).toBeUndefined()
+  })
+
   it('round-trips canonical tool blocks through normalizeMessage', () => {
     const blockTimestamp = 1_700_000_000_000
     const result: OrchestratorResult = {
@@ -63,6 +146,51 @@ describe('persisted-message', () => {
     ])
   })
 
+  it('preserves Assistant mode and verified citations through save, compaction, and reload', () => {
+    const result: OrchestratorResult = {
+      success: true,
+      requestId: 'request',
+      toolCalls: [],
+      content: 'Answer <source>{"id":"document:doc"}</source>',
+      contentBlocks: [
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'retrieval',
+            name: 'read_document',
+            status: 'success',
+            result: {
+              success: true,
+              output: {
+                success: true,
+                data: {
+                  citationId: 'document:doc',
+                  citationUrl: 'https://source.test/doc',
+                  documentName: 'Title',
+                  chunks: [{ content: 'large passage' }],
+                },
+              },
+            },
+          },
+        },
+      ],
+    }
+    const persisted = stripToolResultOutput(
+      buildPersistedAssistantMessage(result, undefined, 'assistant')
+    )
+    const normalized = normalizeMessage(persisted as unknown as Record<string, unknown>)
+    const displayed = toDisplayMessage(normalized)
+    expect(displayed.requestMode).toBe('assistant')
+    expect(JSON.stringify(persisted)).not.toContain('large passage')
+    const citations = resolveMessageCitations(
+      displayed.contentBlocks ?? [],
+      displayed.content,
+      true
+    )
+    expect(citations.fallbackContent).toContain('https://source.test/doc')
+    expect(citations.fallbackContent).toContain('Title')
+  })
+
   it('prefers an explicit persisted request ID override', () => {
     const result: OrchestratorResult = {
       success: true,
@@ -90,10 +218,10 @@ describe('persisted-message', () => {
     const persisted = buildPersistedAssistantMessage(result)
 
     expect(persisted.content).not.toContain('sk-sim-secret-123')
-    expect(persisted.content).toContain('"redacted":true')
+    expect(persisted.content).toContain('{"type":"sim_key"}')
     const textBlock = persisted.contentBlocks?.find((b) => b.type === 'text')
     expect(textBlock?.content).not.toContain('sk-sim-secret-123')
-    expect(textBlock?.content).toContain('"redacted":true')
+    expect(textBlock?.content).toContain('{"type":"sim_key"}')
   })
 
   it('redacts sim_key credential tags split across streamed text chunks', () => {
@@ -119,7 +247,7 @@ describe('persisted-message', () => {
     expect(persisted.contentBlocks).toBeDefined()
     const joined = (persisted.contentBlocks ?? []).map((b) => b.content ?? '').join('')
     expect(joined).not.toContain('sk-sim-secret-12345')
-    expect(joined).toContain('"redacted":true')
+    expect(joined).toContain('{"type":"sim_key"}')
   })
 
   it('redacts the api key from a persisted generate_api_key tool result output', () => {
@@ -235,6 +363,101 @@ describe('persisted-message', () => {
     expect(msg.fileAttachments).toBeUndefined()
     expect(msg.contexts).toBeUndefined()
   })
+
+  it('persists the source names a selection chip renders from, but not its payload', () => {
+    const msg = buildPersistedUserMessage({
+      id: 'user-1',
+      content: 'explain this',
+      contexts: [
+        {
+          kind: 'file_selection',
+          label: 'notes.md:12-40',
+          fileId: 'f1',
+          fileName: 'notes.md',
+          // Send-time payload: resolved server-side, never re-read for display.
+          text: 'the exact passage',
+          startLine: 12,
+          endLine: 40,
+        },
+        {
+          kind: 'table_selection',
+          label: 'Sales (2 rows)',
+          tableId: 't1',
+          tableName: 'Sales',
+          rowIds: ['r1', 'r2'],
+        },
+      ],
+    })
+
+    // fileName must survive: the label carries a `:12-40` suffix, so the chip's
+    // icon cannot recover an extension from it after a reload.
+    expect(msg.contexts?.[0]).toEqual({
+      kind: 'file_selection',
+      label: 'notes.md:12-40',
+      fileId: 'f1',
+      fileName: 'notes.md',
+    })
+    expect(msg.contexts?.[1]).toEqual({
+      kind: 'table_selection',
+      label: 'Sales (2 rows)',
+      tableId: 't1',
+      tableName: 'Sales',
+    })
+  })
+
+  it('round-trips browser and terminal selection snapshots', () => {
+    const persisted = buildPersistedUserMessage({
+      id: 'user-selection',
+      content: '@Docs @Terminal',
+      contexts: [
+        {
+          kind: 'browser_tab',
+          label: 'Docs',
+          tabId: 'tab-1',
+          selection: {
+            text: 'Selected browser text',
+            url: 'https://example.com/docs',
+            title: 'Example docs',
+          },
+        },
+        {
+          kind: 'terminal_tab',
+          label: 'Terminal',
+          terminalId: 'terminal-1',
+          selection: {
+            text: 'bun test',
+            startLine: 12,
+            endLine: 13,
+          },
+        },
+      ],
+    })
+
+    const normalized = normalizeMessage(persisted as unknown as Record<string, unknown>)
+
+    expect(normalized.contexts).toEqual([
+      {
+        kind: 'browser_tab',
+        label: 'Docs',
+        tabId: 'tab-1',
+        selection: {
+          text: 'Selected browser text',
+          url: 'https://example.com/docs',
+          title: 'Example docs',
+        },
+      },
+      {
+        kind: 'terminal_tab',
+        label: 'Terminal',
+        terminalId: 'terminal-1',
+        selection: {
+          text: 'bun test',
+          startLine: 12,
+          endLine: 13,
+        },
+      },
+    ])
+  })
 })
 
 describe('stripToolResultOutput', () => {
@@ -296,6 +519,41 @@ describe('stripToolResultOutput', () => {
     expect(stripToolResultOutput(message).contentBlocks?.[0].toolCall?.result).toEqual({
       success: true,
     })
+  })
+
+  it('keeps only the answered browser takeover instruction for its question recap', () => {
+    const message: PersistedMessage = {
+      id: 'msg-takeover',
+      role: 'assistant',
+      content: '',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      contentBlocks: [
+        {
+          type: 'tool',
+          phase: 'call',
+          toolCall: {
+            id: 'takeover-1',
+            name: 'browser_request_takeover',
+            state: 'success',
+            result: {
+              success: true,
+              output: {
+                completed: true,
+                elapsedMs: 5_000,
+                userInstruction: '  Open the second match  ',
+              },
+            },
+          },
+        },
+      ],
+    }
+
+    const stripped = stripToolResultOutput(message)
+    expect(stripped.contentBlocks?.[0].toolCall?.result).toEqual({
+      success: true,
+      output: { userInstruction: 'Open the second match' },
+    })
+    expect(stripToolResultOutput(stripped)).toBe(stripped)
   })
 
   it('returns the same reference when there is nothing to strip', () => {

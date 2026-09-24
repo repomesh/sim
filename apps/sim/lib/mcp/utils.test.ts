@@ -1,14 +1,21 @@
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_EXECUTION_TIMEOUT_MS } from '@/lib/core/execution-limits'
-import { McpConnectionError, McpOauthAuthorizationRequiredError } from '@/lib/mcp/types'
+import {
+  McpConnectionError,
+  McpOauthAuthorizationRequiredError,
+  McpServerCooldownError,
+} from '@/lib/mcp/types'
 import {
   categorizeError,
   createMcpToolId,
+  generateManagedMcpConnectionId,
   generateMcpServerId,
+  isManagedMcpConnectionId,
   MCP_CLIENT_CONSTANTS,
   MCP_CONSTANTS,
   parseMcpToolId,
+  parseMcpToolTarget,
   validateRequiredFields,
   validateStringParam,
 } from './utils'
@@ -319,10 +326,22 @@ describe('categorizeError', () => {
     expect(result.status).toBe(401)
   })
 
-  it.concurrent('returns 503 for McpConnectionError with cooldown message', () => {
-    const error = new McpConnectionError('Server in cooldown — try again shortly.', 'mcp-a')
+  it.concurrent('returns 503 for the typed discovery-cooldown refusal', () => {
+    const error = new McpServerCooldownError('mcp-a')
     const result = categorizeError(error)
     expect(result.status).toBe(503)
+  })
+
+  /**
+   * `McpConnectionError` interpolates the server's display name into its
+   * message, so selecting the cooldown branch by searching that message reports
+   * a server named after the word as a transient 503 when its connection has
+   * genuinely failed.
+   */
+  it.concurrent('does not read a cooldown out of a server display name', () => {
+    const error = new McpConnectionError('connect ECONNREFUSED', 'Cooldown Docs')
+    const result = categorizeError(error)
+    expect(result.status).toBe(502)
   })
 
   it.concurrent('returns 502 for other McpConnectionError', () => {
@@ -413,5 +432,42 @@ describe('parseMcpToolId', () => {
     const result = parseMcpToolId('mcp-abc-tool-with-many-parts')
     expect(result.serverId).toBe('mcp-abc')
     expect(result.toolName).toBe('tool-with-many-parts')
+  })
+})
+
+describe('parseMcpToolTarget', () => {
+  it('preserves a managed connection ID even when its random segment contains hyphens', () => {
+    const credentialId = 'mcp-cg-abcd-efghijklmnopqrst'
+    const result = parseMcpToolTarget(`${credentialId}-fireflies-search-transcripts`)
+
+    expect(result).toEqual({
+      kind: 'managed_connection',
+      credentialId,
+      toolName: 'fireflies-search-transcripts',
+    })
+  })
+
+  it('keeps existing shared MCP tool IDs unchanged', () => {
+    expect(parseMcpToolTarget('mcp-12345678-search-transcripts')).toEqual({
+      kind: 'shared_server',
+      serverId: 'mcp-12345678',
+      toolName: 'search-transcripts',
+    })
+  })
+
+  it('rejects a managed connection ID without a tool name', () => {
+    const credentialId = generateManagedMcpConnectionId()
+    expect(() => parseMcpToolTarget(credentialId)).toThrow('Invalid managed MCP tool ID format')
+  })
+})
+
+describe('isManagedMcpConnectionId', () => {
+  it('accepts only a complete managed connection ID', () => {
+    const credentialId = generateManagedMcpConnectionId()
+
+    expect(isManagedMcpConnectionId(credentialId)).toBe(true)
+    expect(isManagedMcpConnectionId(`${credentialId}-tool`)).toBe(false)
+    expect(isManagedMcpConnectionId('mcp-cg-short')).toBe(false)
+    expect(isManagedMcpConnectionId('mcp-shared')).toBe(false)
   })
 })

@@ -60,9 +60,40 @@ export const SLACK_TRIGGER_OUTPUTS: Record<string, TriggerOutput> = {
         type: 'string',
         description: 'Parent thread timestamp (if message is in a thread)',
       },
+      streaming_message_ts: {
+        type: 'array',
+        description: 'Message timestamps streamed during a stopped agent session',
+        items: { type: 'string', description: 'Streaming message timestamp' },
+      },
+      title: {
+        type: 'string',
+        description: 'Current agent session title',
+      },
+      previous_title: {
+        type: 'string',
+        description: 'Previous agent session title',
+      },
+      tab: {
+        type: 'string',
+        description: 'App Home tab that was opened, including messages for Agent View',
+      },
+      context: {
+        type: 'json',
+        description:
+          'Current Agent View context. Normalized from context on app_context_changed/app_home_opened or app_context on message.im',
+      },
       team_id: {
         type: 'string',
         description: 'Slack workspace/team ID',
+      },
+      user_team_id: {
+        type: 'string',
+        description:
+          'Slack workspace/team ID of the user who triggered the event. Used for Slack Connect response streaming.',
+      },
+      enterprise_id: {
+        type: 'string',
+        description: 'Slack Enterprise Grid organization ID',
       },
       event_id: {
         type: 'string',
@@ -166,8 +197,16 @@ export const SLACK_TRIGGER_OUTPUTS: Record<string, TriggerOutput> = {
  * - `name`: substring match on a created channel's name.
  * - `interaction`: restrict an interactivity event to specific `action_id`s
  *   (block_actions) or `callback_id`s (view_submission).
+ * - `command`: restrict slash-command requests to specific command names.
  */
-export type SlackEventFilter = 'source' | 'channels' | 'threads' | 'emoji' | 'name' | 'interaction'
+export type SlackEventFilter =
+  | 'source'
+  | 'channels'
+  | 'threads'
+  | 'emoji'
+  | 'name'
+  | 'interaction'
+  | 'command'
 
 export interface SlackEventCatalogEntry {
   /** Selected value stored under the `eventType` sub-block. */
@@ -185,7 +224,7 @@ export interface SlackEventCatalogEntry {
  * fires on exactly one `id`. `simSubscribed` gates which events are offered in
  * Sim mode (the official app), while every event is offered in Custom mode
  * (the bring-your-own app generates a manifest that subscribes to it, driven by
- * SLACK_CAPABILITIES). `filters` drives both the trigger UI (which filter
+ * its mandatory Agent View events and optional capabilities). `filters` drives both the trigger UI (which filter
  * sub-blocks show) and the ingest route (which checks apply).
  */
 export const SLACK_EVENT_CATALOG: readonly SlackEventCatalogEntry[] = [
@@ -245,6 +284,24 @@ export const SLACK_EVENT_CATALOG: readonly SlackEventCatalogEntry[] = [
   { id: 'pin_removed', label: 'Pin removed', simSubscribed: false, filters: ['channels'] },
   { id: 'team_join', label: 'Member joined workspace', simSubscribed: false, filters: [] },
   { id: 'app_home_opened', label: 'App home opened', simSubscribed: false, filters: [] },
+  {
+    id: 'agent_session_stopped',
+    label: 'Agent session stopped',
+    simSubscribed: false,
+    filters: [],
+  },
+  {
+    id: 'agent_session_title_changed',
+    label: 'Agent session title changed',
+    simSubscribed: false,
+    filters: [],
+  },
+  {
+    id: 'app_context_changed',
+    label: 'Agent context changed',
+    simSubscribed: false,
+    filters: [],
+  },
   { id: 'assistant_thread_started', label: 'Assistant opened', simSubscribed: true, filters: [] },
   {
     id: 'assistant_thread_context_changed',
@@ -264,6 +321,12 @@ export const SLACK_EVENT_CATALOG: readonly SlackEventCatalogEntry[] = [
     simSubscribed: true,
     filters: ['interaction'],
   },
+  {
+    id: 'slash_command',
+    label: 'Slash command',
+    simSubscribed: false,
+    filters: ['command'],
+  },
 ] as const
 
 /** Catalog entry lookup by `eventType` id. */
@@ -271,17 +334,16 @@ export const slackEventById = new Map<string, SlackEventCatalogEntry>(
   SLACK_EVENT_CATALOG.map((entry) => [entry.id, entry])
 )
 
-/** Event ids the official shared Sim app subscribes to (Sim-mode gating SOT). */
+/**
+ * Event ids the official shared Sim app subscribes to. Single source of truth
+ * for the deploy-time gate that rejects a native Sim-app trigger configured with
+ * an event the shared app can't deliver.
+ */
 export const SIM_SUBSCRIBED_EVENTS: readonly string[] = SLACK_EVENT_CATALOG.filter(
   (entry) => entry.simSubscribed
 ).map((entry) => entry.id)
 
-/** Dropdown options for Sim mode — only officially-subscribed events. */
-export const SLACK_SIM_EVENT_OPTIONS = SLACK_EVENT_CATALOG.filter(
-  (entry) => entry.simSubscribed
-).map((entry) => ({ label: entry.label, id: entry.id }))
-
-/** Dropdown options for Custom mode — every event (manifest generated on demand). */
+/** Dropdown options for the event picker — every selectable event. */
 export const SLACK_ALL_EVENT_OPTIONS = SLACK_EVENT_CATALOG.map((entry) => ({
   label: entry.label,
   id: entry.id,

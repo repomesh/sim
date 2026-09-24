@@ -1,3 +1,4 @@
+import { omit } from '@sim/utils/object'
 import { DropboxIcon } from '@/components/icons'
 import { getScopesForService } from '@/lib/oauth/utils'
 import type { BlockConfig, BlockMeta } from '@/blocks/types'
@@ -5,9 +6,18 @@ import { AuthMode, IntegrationType } from '@/blocks/types'
 import { normalizeFileInput } from '@/blocks/utils'
 import type { DropboxResponse } from '@/tools/dropbox/types'
 
-export const DropboxBlock: BlockConfig<DropboxResponse> = {
+/*
+ * Canonical basic/advanced pair for the upload source, shared by the card
+ * sentence below. Listing both members is what keeps the sentence working for
+ * an advanced-mode user, who has only the file reference filled.
+ */
+const UPLOAD_FILE_FIELD = ['uploadFile', 'fileRef'] as const
+
+export const DropboxBlock = {
   type: 'dropbox',
-  name: 'Dropbox',
+  name: 'Dropbox (Legacy)',
+  hideFromToolbar: true,
+  sunset: { status: 'legacy', replacedBy: 'dropbox_v2' },
   description: 'Upload, download, share, and manage files in Dropbox',
   authMode: AuthMode.OAuth,
   longDescription:
@@ -18,6 +28,52 @@ export const DropboxBlock: BlockConfig<DropboxResponse> = {
   icon: DropboxIcon,
   bgColor: '#0061FF',
   iconColor: '#0061FF',
+  canvasPresentation: {
+    defaultTitle: 'Dropbox',
+    sentences: {
+      byOperation: {
+        dropbox_upload: [
+          { text: 'Upload', field: UPLOAD_FILE_FIELD, core: true },
+          { text: 'to', field: 'path', core: true },
+        ],
+        dropbox_download: [{ text: 'Download', field: 'path', core: true }],
+        dropbox_list_folder: [
+          { text: 'List the contents of folder', field: 'path', core: true },
+          { text: ', up to', field: 'limit', after: 'entries' },
+        ],
+        dropbox_create_folder: [{ text: 'Create folder', field: 'path', core: true }],
+        dropbox_delete: [{ text: 'Move', field: 'path', core: true, after: 'to the trash' }],
+        dropbox_copy: [
+          { text: 'Copy', field: 'fromPath', core: true },
+          { text: 'to', field: 'toPath' },
+        ],
+        dropbox_move: [
+          { text: 'Move', field: 'fromPath', core: true },
+          { text: 'to', field: 'toPath' },
+        ],
+        dropbox_get_metadata: [{ text: 'Read metadata of', field: 'path', core: true }],
+        dropbox_create_shared_link: [
+          { text: 'Create a shared link to', field: 'path', core: true },
+          { text: ', visible to', field: 'requestedVisibility' },
+          { text: ', expiring', field: 'expires' },
+        ],
+        dropbox_list_shared_links: ['List shared links', { text: 'under', field: 'path' }],
+        dropbox_search: [
+          { text: 'Search for', field: 'query', core: true },
+          { text: 'under', field: 'path' },
+          { text: ', limited to', field: 'fileExtensions' },
+        ],
+        dropbox_list_revisions: [
+          { text: 'List revisions of', field: 'path', core: true },
+          { text: ', up to', field: 'limit', after: 'revisions' },
+        ],
+        dropbox_restore: [
+          { text: 'Restore', field: 'path', core: true },
+          { text: 'to revision', field: 'rev' },
+        ],
+      },
+    },
+  },
   subBlocks: [
     {
       id: 'operation',
@@ -491,6 +547,28 @@ Return ONLY the timestamp string - no explanations, no quotes, no extra text.`,
     // List revisions output
     isDeleted: { type: 'boolean', description: 'Whether the latest revision is deleted or moved' },
   },
+} satisfies BlockConfig<DropboxResponse>
+
+export const DropboxV2Block: BlockConfig = {
+  ...DropboxBlock,
+  type: 'dropbox_v2',
+  name: 'Dropbox',
+  hideFromToolbar: false,
+  sunset: undefined,
+  tools: {
+    ...DropboxBlock.tools,
+    access: DropboxBlock.tools.access.map((toolId) =>
+      toolId === 'dropbox_download' ? 'dropbox_download_v2' : toolId
+    ),
+    config: {
+      ...DropboxBlock.tools.config,
+      tool: (params) => {
+        const toolId = DropboxBlock.tools.config.tool(params)
+        return toolId === 'dropbox_download' ? 'dropbox_download_v2' : toolId
+      },
+    },
+  },
+  outputs: omit(DropboxBlock.outputs, ['content']),
 }
 
 export const DropboxBlockMeta = {

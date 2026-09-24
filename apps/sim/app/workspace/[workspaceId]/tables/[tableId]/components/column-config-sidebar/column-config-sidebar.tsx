@@ -1,17 +1,51 @@
 'use client'
 
 import { useState } from 'react'
-import { Button, ChipCombobox, ChipInput, cn, FieldDivider, Label, Switch, toast } from '@sim/emcn'
+import {
+  Button,
+  ChipCombobox,
+  ChipInput,
+  cn,
+  FieldDivider,
+  Label,
+  Switch,
+  Tooltip,
+  toast,
+} from '@sim/emcn'
 import { X } from '@sim/emcn/icons'
 import { toError } from '@sim/utils/errors'
 import { findValidationIssue, isValidationError } from '@/lib/api/client/errors'
-import type { ColumnDefinition } from '@/lib/table'
+import type { ColumnDefinition, SelectOption } from '@/lib/table'
+import {
+  DEFAULT_CURRENCY_CODE,
+  getCurrencyOptions,
+  resolveCurrencyCode,
+} from '@/lib/table/currency'
 import {
   FieldError,
   RequiredLabel,
 } from '@/app/workspace/[workspaceId]/tables/[tableId]/components/sidebar-fields'
 import { useAddTableColumn, useUpdateColumn } from '@/hooks/queries/tables'
-import { PLAIN_COLUMN_TYPE_OPTIONS } from './column-types'
+import { SelectOptionsEditor } from '../select-field'
+import { columnTypeOptionsForTable } from './column-types'
+
+/** Whether a column type carries an option set. */
+function isSelectType(type: ColumnDefinition['type']): boolean {
+  return type === 'select'
+}
+
+/**
+ * Picker entries, built once at module load: the option list is derived from the
+ * runtime's currency data and never varies per column.
+ */
+const CURRENCY_COMBOBOX_OPTIONS = getCurrencyOptions().map((c) => ({
+  value: c.code,
+  label: `${c.code} · ${c.name}`,
+}))
+
+function optionsEqual(a: SelectOption[], b: SelectOption[]): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
 
 /**
  * Discriminates the two flows the column-config sidebar handles. Workflow
@@ -28,11 +62,22 @@ interface ColumnConfigSidebarProps {
   onClose: () => void
   /** Existing column record for `mode: 'edit'`; ignored otherwise. */
   existingColumn: ColumnDefinition | null
+  allColumns: readonly ColumnDefinition[]
+  tableRowTtlEnabled: boolean
   workspaceId: string
   tableId: string
   /** Notify parent of a rename so it can rewrite local `columnOrder` /
    *  `columnWidths` keys that reference the old name. */
   onColumnRename?: (oldName: string, newName: string) => void
+  /**
+   * Opens the panel for reading only — every field is inert and Save is
+   * disabled behind {@link readOnlyReason}. The header click that opens this
+   * sidebar is a primary affordance, so a schema-locked (or read-only) table
+   * shows the column's settings rather than swallowing the click.
+   */
+  readOnly?: boolean
+  /** Why saving is unavailable; surfaced on the disabled Save button. */
+  readOnlyReason?: string
 }
 
 /**
@@ -78,9 +123,13 @@ function ColumnConfigBody({
   config,
   onClose,
   existingColumn,
+  allColumns,
+  tableRowTtlEnabled,
   workspaceId,
   tableId,
   onColumnRename,
+  readOnly,
+  readOnlyReason,
 }: ColumnConfigBodyProps) {
   const updateColumn = useUpdateColumn({ workspaceId, tableId })
   const addColumn = useAddTableColumn({ workspaceId, tableId })
@@ -94,15 +143,48 @@ function ColumnConfigBody({
   const [uniqueInput, setUniqueInput] = useState<boolean>(() =>
     config.mode === 'edit' ? !!existingColumn?.unique : false
   )
+  const [optionsInput, setOptionsInput] = useState<SelectOption[]>(() =>
+    config.mode === 'edit' ? (existingColumn?.options ?? []) : []
+  )
+  const [multipleInput, setMultipleInput] = useState<boolean>(() =>
+    config.mode === 'edit' ? !!existingColumn?.multiple : false
+  )
+  const [currencyInput, setCurrencyInput] = useState<string>(() =>
+    config.mode === 'edit'
+      ? resolveCurrencyCode(existingColumn?.currencyCode)
+      : DEFAULT_CURRENCY_CODE
+  )
   const [showValidation, setShowValidation] = useState(false)
   const [nameError, setNameError] = useState<string | null>(null)
+  const [optionsError, setOptionsError] = useState<string | null>(null)
 
   const saveDisabled = updateColumn.isPending || addColumn.isPending
   const trimmedName = nameInput.trim()
+  const wantsOptions = isSelectType(typeInput)
+  const wantsCurrency = typeInput === 'currency'
+  const trimmedOptions = optionsInput.map((o) => ({ ...o, name: o.name.trim() }))
+
+  /** Client-side option validation mirroring the server rules; returns an error message or null. */
+  function validateOptions(): string | null {
+    if (!wantsOptions) return null
+    if (trimmedOptions.length === 0) return 'Add at least one option'
+    if (trimmedOptions.some((o) => !o.name)) return 'Option names cannot be empty'
+    const names = trimmedOptions.map((o) => o.name.toLowerCase())
+    if (new Set(names).size !== names.length) return 'Option names must be unique'
+    return null
+  }
 
   async function handleSave() {
+    // Belt and braces: the button is disabled, and the server refuses too.
+    if (readOnly) return
     if (!trimmedName) {
       setShowValidation(true)
+      return
+    }
+
+    const optionsIssue = validateOptions()
+    if (optionsIssue) {
+      setOptionsError(optionsIssue)
       return
     }
 
@@ -111,7 +193,11 @@ function ColumnConfigBody({
         await addColumn.mutateAsync({
           name: trimmedName,
           type: typeInput,
-          ...(uniqueInput ? { unique: true } : {}),
+          // Select columns don't expose a unique constraint.
+          ...(!wantsOptions && uniqueInput ? { unique: true } : {}),
+          ...(wantsOptions ? { options: trimmedOptions } : {}),
+          ...(wantsOptions && multipleInput ? { multiple: true } : {}),
+          ...(wantsCurrency ? { currencyCode: currencyInput } : {}),
         })
         toast.success(`Added "${trimmedName}"`)
         onClose()
@@ -122,12 +208,34 @@ function ColumnConfigBody({
       // name to detect an actual rename.
       const renamed = trimmedName !== (existingColumn?.name ?? config.columnName)
       const typeChanged = !!existingColumn && existingColumn.type !== typeInput
-      const uniqueChanged = !!existingColumn && !!existingColumn.unique !== uniqueInput
+      const uniqueChanged =
+        !wantsOptions && !!existingColumn && !!existingColumn.unique !== uniqueInput
+      // Select columns don't offer a Unique control, so converting a unique
+      // column to select would strand the constraint with no way to clear it.
+      const uniqueCleared = wantsOptions && !!existingColumn?.unique
+      const optionsChanged =
+        wantsOptions && !optionsEqual(existingColumn?.options ?? [], trimmedOptions)
+      const multipleChanged = wantsOptions && !!existingColumn?.multiple !== multipleInput
+      const currencyChanged =
+        wantsCurrency && resolveCurrencyCode(existingColumn?.currencyCode) !== currencyInput
 
-      const updates: { name?: string; type?: ColumnDefinition['type']; unique?: boolean } = {
+      const updates: {
+        name?: string
+        type?: ColumnDefinition['type']
+        unique?: boolean
+        options?: SelectOption[]
+        multiple?: boolean
+        currencyCode?: string
+      } = {
         ...(renamed ? { name: trimmedName } : {}),
         ...(typeChanged ? { type: typeInput } : {}),
         ...(uniqueChanged ? { unique: uniqueInput } : {}),
+        ...(uniqueCleared ? { unique: false } : {}),
+        ...(wantsOptions && (typeChanged || optionsChanged) ? { options: trimmedOptions } : {}),
+        ...(wantsOptions && (typeChanged || multipleChanged) ? { multiple: multipleInput } : {}),
+        ...(wantsCurrency && (typeChanged || currencyChanged)
+          ? { currencyCode: currencyInput }
+          : {}),
       }
       if (Object.keys(updates).length === 0) {
         onClose()
@@ -156,12 +264,13 @@ function ColumnConfigBody({
   return (
     <div className='flex h-full flex-col'>
       <div className='flex min-h-[48px] items-center justify-between border-[var(--border)] border-b px-3 py-[8.5px]'>
-        <h2 className='font-medium text-[var(--text-primary)] text-small'>Configure column</h2>
+        <h2 className='text-[var(--text-primary)] text-small'>Configure column</h2>
         <Button
           variant='ghost'
           size='sm'
           onClick={onClose}
-          className='!p-1 size-7'
+          iconPadding='sm'
+          className='size-7'
           aria-label='Close'
         >
           <X className='size-[14px]' />
@@ -169,64 +278,136 @@ function ColumnConfigBody({
       </div>
 
       <div className='flex-1 overflow-y-auto overflow-x-hidden px-2 pt-3 pb-2 [overflow-anchor:none]'>
-        <div className='flex flex-col gap-[9.5px]'>
-          <RequiredLabel htmlFor='column-sidebar-name'>Column name</RequiredLabel>
-          <ChipInput
-            id='column-sidebar-name'
-            value={nameInput}
-            onChange={(e) => {
-              setNameInput(e.target.value)
-              if (nameError) setNameError(null)
-            }}
-            spellCheck={false}
-            autoComplete='off'
-            error={Boolean((showValidation && !trimmedName) || nameError)}
-            aria-invalid={(showValidation && !trimmedName) || nameError ? true : undefined}
-          />
-          {showValidation && !trimmedName && <FieldError message='Column name is required' />}
-          {nameError && !(showValidation && !trimmedName) && <FieldError message={nameError} />}
-        </div>
-
-        {config.mode === 'edit' && (
-          <>
-            <FieldDivider />
-            <div className='flex flex-col gap-[9.5px]'>
-              <RequiredLabel>Type</RequiredLabel>
-              <ChipCombobox
-                options={PLAIN_COLUMN_TYPE_OPTIONS.map((o) => ({
-                  label: o.label,
-                  value: o.type,
-                  icon: o.icon,
-                }))}
-                value={typeInput}
-                onChange={(v) => setTypeInput(v as ColumnDefinition['type'])}
-                placeholder='Select type'
-                maxHeight={260}
-              />
-            </div>
-          </>
-        )}
-
-        <FieldDivider />
-        <div className='flex flex-col gap-[9.5px]'>
-          <div className='flex items-center justify-between pl-0.5'>
-            <Label htmlFor='column-sidebar-unique'>Unique</Label>
-            <Switch
-              id='column-sidebar-unique'
-              checked={uniqueInput}
-              onCheckedChange={(v) => setUniqueInput(!!v)}
+        {/* `disabled` on the fieldset reaches every native control inside,
+            including the comboboxes' trigger buttons; `contents` keeps the
+            existing layout. Values stay readable and selectable. */}
+        <fieldset disabled={readOnly} className='contents'>
+          <div className='flex flex-col gap-[9.5px]'>
+            <RequiredLabel htmlFor='column-sidebar-name'>Column name</RequiredLabel>
+            <ChipInput
+              id='column-sidebar-name'
+              value={nameInput}
+              onChange={(e) => {
+                setNameInput(e.target.value)
+                if (nameError) setNameError(null)
+              }}
+              spellCheck={false}
+              autoComplete='off'
+              error={Boolean((showValidation && !trimmedName) || nameError)}
+              aria-invalid={(showValidation && !trimmedName) || nameError ? true : undefined}
             />
+            {showValidation && !trimmedName && <FieldError message='Column name is required' />}
+            {nameError && !(showValidation && !trimmedName) && <FieldError message={nameError} />}
           </div>
-        </div>
+
+          {config.mode === 'edit' && (
+            <>
+              <FieldDivider />
+              <div className='flex flex-col gap-[9.5px]'>
+                <RequiredLabel>Type</RequiredLabel>
+                <ChipCombobox
+                  options={columnTypeOptionsForTable(allColumns, existingColumn, {
+                    tableRowTtlEnabled,
+                  })
+                    .filter((option) => option.type !== 'workflow')
+                    .map((option) => ({
+                      label: option.label,
+                      value: option.type,
+                      icon: option.icon,
+                      disabled: option.disabledReason !== undefined,
+                    }))}
+                  value={typeInput}
+                  onChange={(v) => setTypeInput(v as ColumnDefinition['type'])}
+                  placeholder='Select type'
+                  maxHeight={300}
+                />
+              </div>
+            </>
+          )}
+
+          {wantsCurrency && (
+            <>
+              <FieldDivider />
+              <div className='flex flex-col gap-[9.5px]'>
+                <RequiredLabel>Currency</RequiredLabel>
+                <ChipCombobox
+                  options={CURRENCY_COMBOBOX_OPTIONS}
+                  value={currencyInput}
+                  onChange={setCurrencyInput}
+                  placeholder='Select currency'
+                  searchable
+                  searchPlaceholder='Search currencies'
+                  maxHeight={260}
+                />
+              </div>
+            </>
+          )}
+
+          {wantsOptions && (
+            <>
+              <FieldDivider />
+              <div className='flex flex-col gap-[9.5px]'>
+                <RequiredLabel>Options</RequiredLabel>
+                <SelectOptionsEditor
+                  options={optionsInput}
+                  onChange={(next) => {
+                    setOptionsInput(next)
+                    if (optionsError) setOptionsError(null)
+                  }}
+                />
+                {optionsError && <FieldError message={optionsError} />}
+              </div>
+              <FieldDivider />
+              <div className='flex items-center justify-between pl-0.5'>
+                <Label htmlFor='column-sidebar-multiple'>Multiselect</Label>
+                <Switch
+                  id='column-sidebar-multiple'
+                  checked={multipleInput}
+                  onCheckedChange={(v) => setMultipleInput(!!v)}
+                />
+              </div>
+            </>
+          )}
+
+          {/* Select columns don't expose a unique constraint. */}
+          {!wantsOptions && (
+            <>
+              <FieldDivider />
+              <div className='flex flex-col gap-[9.5px]'>
+                <div className='flex items-center justify-between pl-0.5'>
+                  <Label htmlFor='column-sidebar-unique'>Unique</Label>
+                  <Switch
+                    id='column-sidebar-unique'
+                    checked={uniqueInput}
+                    onCheckedChange={(v) => setUniqueInput(!!v)}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+        </fieldset>
       </div>
 
       <div className='flex items-center justify-end gap-2 border-[var(--border)] border-t px-2 py-3'>
         <Button variant='default' size='sm' onClick={onClose}>
-          Cancel
+          {readOnly ? 'Close' : 'Cancel'}
         </Button>
-        <Button variant='primary' size='sm' onClick={handleSave} disabled={saveDisabled}>
-          {saveDisabled ? 'Saving…' : 'Save'}
-        </Button>
+        {readOnly ? (
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <span className='inline-flex'>
+                <Button variant='primary' size='sm' disabled>
+                  Save
+                </Button>
+              </span>
+            </Tooltip.Trigger>
+            {readOnlyReason && <Tooltip.Content>{readOnlyReason}</Tooltip.Content>}
+          </Tooltip.Root>
+        ) : (
+          <Button variant='primary' size='sm' onClick={handleSave} disabled={saveDisabled}>
+            {saveDisabled ? 'Saving…' : 'Save'}
+          </Button>
+        )}
       </div>
     </div>
   )

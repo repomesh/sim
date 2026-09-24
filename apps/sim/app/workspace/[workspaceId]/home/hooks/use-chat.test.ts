@@ -11,7 +11,11 @@ import type { StreamBatchEvent } from '@/lib/copilot/request/session/types'
 import {
   getReplayCompletedWorkflowToolCallIds,
   reconcileLiveAssistantTurn,
+  selectDeletedWorkflowResources,
   selectReconnectReplayState,
+  shouldActivateResourceEvent,
+  shouldQueueOutgoingMessage,
+  waitForDetachedChatResolution,
 } from '@/app/workspace/[workspaceId]/home/hooks/use-chat'
 import type { ContentBlock } from '@/app/workspace/[workspaceId]/home/types'
 
@@ -23,6 +27,76 @@ vi.mock('next/navigation', () => ({
     refresh: vi.fn(),
   }),
 }))
+
+describe('selectDeletedWorkflowResources', () => {
+  const resource = (id: string) => ({ type: 'workflow' as const, id, title: id })
+  const cached = (id: string) => ({
+    id,
+    name: id,
+    lastModified: new Date(0),
+    createdAt: new Date(0),
+    sortOrder: 0,
+  })
+
+  it('selects a hydrated workflow the server no longer has', () => {
+    expect(selectDeletedWorkflowResources([resource('wf-gone')], new Set(), [])).toEqual([
+      resource('wf-gone'),
+    ])
+  })
+
+  it('keeps a workflow present in the fetched list', () => {
+    expect(selectDeletedWorkflowResources([resource('wf-1')], new Set(['wf-1']), [])).toEqual([])
+  })
+
+  it('keeps a workflow the stream inserted into the cache after the list snapshot', () => {
+    expect(
+      selectDeletedWorkflowResources([resource('wf-new')], new Set(), [cached('wf-new')])
+    ).toEqual([])
+  })
+})
+
+describe('shouldActivateResourceEvent', () => {
+  it('requests activation for browser work', () => {
+    expect(shouldActivateResourceEvent('file-1', 'browser-session')).toBe(true)
+  })
+
+  it('requests activation for every other resource the agent touches', () => {
+    expect(shouldActivateResourceEvent('file-1', 'workflow-1')).toBe(true)
+    expect(shouldActivateResourceEvent('browser-session', 'terminal-session')).toBe(true)
+    expect(shouldActivateResourceEvent(null, 'browser-session')).toBe(true)
+  })
+
+  it('honors an explicit request to activate', () => {
+    expect(shouldActivateResourceEvent('file-1', 'browser-session', { activate: true })).toBe(true)
+  })
+
+  it('lets an event opt out of stealing focus', () => {
+    expect(shouldActivateResourceEvent('file-1', 'browser-session', { activate: false })).toBe(
+      false
+    )
+  })
+})
+
+describe('shouldQueueOutgoingMessage', () => {
+  it('queues while a send is in flight', () => {
+    expect(shouldQueueOutgoingMessage(true, false, 0)).toBe(true)
+  })
+
+  it('queues while a stop is still settling', () => {
+    expect(shouldQueueOutgoingMessage(false, true, 0)).toBe(true)
+  })
+
+  it('queues behind messages still waiting after the turn ended', () => {
+    // The regression: a message queued mid-stream must dispatch before one
+    // typed in the idle gap after the turn stopped — a direct send here would
+    // jump the queue and swap the user's message order.
+    expect(shouldQueueOutgoingMessage(false, false, 1)).toBe(true)
+  })
+
+  it('sends directly on an idle chat with an empty queue', () => {
+    expect(shouldQueueOutgoingMessage(false, false, 0)).toBe(false)
+  })
+})
 
 function userMessage(id: string): PersistedMessage {
   return {
@@ -65,6 +139,39 @@ function toolBatchEvent(
     },
   } as StreamBatchEvent
 }
+
+describe('waitForDetachedChatResolution', () => {
+  it('returns a durable chat owner without retrying', async () => {
+    const resolve = vi.fn(async () => ({ chatId: 'chat-1', terminal: false }))
+
+    await expect(
+      waitForDetachedChatResolution(resolve, new AbortController().signal)
+    ).resolves.toEqual({ chatId: 'chat-1', terminal: false })
+    expect(resolve).toHaveBeenCalledOnce()
+  })
+
+  it('returns a terminal result without retrying', async () => {
+    const resolve = vi.fn(async () => ({ terminal: true }))
+
+    await expect(
+      waitForDetachedChatResolution(resolve, new AbortController().signal)
+    ).resolves.toEqual({ terminal: true })
+    expect(resolve).toHaveBeenCalledOnce()
+  })
+
+  it('does not continue resolution after cancellation', async () => {
+    const controller = new AbortController()
+    const resolve = vi.fn(async () => {
+      controller.abort('test cancellation')
+      return { terminal: false }
+    })
+
+    await expect(waitForDetachedChatResolution(resolve, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(resolve).toHaveBeenCalledOnce()
+  })
+})
 
 describe('reconcileLiveAssistantTurn', () => {
   it('replaces the live assistant for the active stream owner', () => {
@@ -142,79 +249,61 @@ describe('reconcileLiveAssistantTurn', () => {
 })
 
 describe('selectReconnectReplayState', () => {
-  it('hydrates nonzero cursor replay from a cached live assistant that is ahead', () => {
-    const cachedBlock: ContentBlock = { type: 'text', content: 'Hello world' }
+  it('continues from a nonzero cursor when live streaming state exists in memory', () => {
+    const currentBlock: ContentBlock = { type: 'text', content: 'Hello world' }
 
     const result = selectReconnectReplayState({
       afterCursor: '4',
-      cachedLiveAssistant: {
-        content: 'Hello world',
-        contentBlocks: [cachedBlock],
-      },
-      currentContent: 'Hello',
-      currentBlocks: [],
+      currentContent: 'Hello world',
+      currentBlocks: [currentBlock],
     })
 
     expect(result).toEqual({
       afterCursor: '4',
-      content: 'Hello world',
-      contentBlocks: [cachedBlock],
       preserveExistingState: true,
-      source: 'cache',
+      source: 'live',
     })
   })
 
-  it('resets to replay from the beginning when a nonzero cursor has no usable live cache', () => {
+  it('continues when only blocks carry live state (e.g. tool-only turn)', () => {
     const result = selectReconnectReplayState({
       afterCursor: '4',
-      cachedLiveAssistant: null,
+      currentContent: '',
+      currentBlocks: [{ type: 'tool_call', toolCall: { id: 't1', name: 'grep' } } as ContentBlock],
+    })
+
+    expect(result).toEqual({
+      afterCursor: '4',
+      preserveExistingState: true,
+      source: 'live',
+    })
+  })
+
+  it('replays the buffer from seq 0 when a nonzero cursor has no live in-memory state', () => {
+    const result = selectReconnectReplayState({
+      afterCursor: '4',
       currentContent: '',
       currentBlocks: [],
     })
 
     expect(result).toEqual({
       afterCursor: '0',
-      content: '',
-      contentBlocks: [],
       preserveExistingState: false,
       source: 'reset',
     })
   })
 
-  it('resets when cached live content diverges from the local prefix', () => {
-    const result = selectReconnectReplayState({
-      afterCursor: '4',
-      cachedLiveAssistant: {
-        content: 'Goodbye world',
-        contentBlocks: [{ type: 'text', content: 'Goodbye world' }],
-      },
-      currentContent: 'Hello',
-      currentBlocks: [{ type: 'text', content: 'Hello' }],
-    })
-
-    expect(result).toEqual({
-      afterCursor: '0',
-      content: '',
-      contentBlocks: [],
-      preserveExistingState: false,
-      source: 'reset',
-    })
-  })
-
-  it('resets current state for cursor zero replay', () => {
+  it('resets for cursor zero replay even when local state exists', () => {
     const currentBlock: ContentBlock = { type: 'text', content: 'Hello' }
 
     const result = selectReconnectReplayState({
       afterCursor: '0',
-      cachedLiveAssistant: null,
       currentContent: 'Hello',
       currentBlocks: [currentBlock],
     })
 
     expect(result).toEqual({
       afterCursor: '0',
-      content: '',
-      contentBlocks: [],
       preserveExistingState: false,
       source: 'reset',
     })

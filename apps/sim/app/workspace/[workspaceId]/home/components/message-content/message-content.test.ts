@@ -1,9 +1,36 @@
 /**
  * @vitest-environment node
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+/**
+ * `@/lib/auth/auth-client` builds a Better Auth client at module scope, which
+ * throws when NEXT_PUBLIC_APP_URL is absent from the environment (and under
+ * `isolate: false` an earlier file may have imported the graph in a polluted
+ * env). These tests only exercise pure parsing/model helpers, so stub the
+ * client module out entirely.
+ */
+vi.mock('@/lib/auth/auth-client', () => ({
+  useSession: vi.fn(() => ({ data: null, isPending: false })),
+}))
+
+import { TOOL_CATALOG, type ToolCatalogEntry } from '@/lib/copilot/generated/tool-catalog-v1'
+import type { PersistedStreamEventEnvelope } from '@/lib/copilot/request/session/contract'
+import { getHiddenToolNames } from '@/lib/copilot/tools/client/hidden-tools'
+import { getToolDisplayTitle, getToolStatusDisplayTitle } from '@/lib/copilot/tools/tool-display'
+import {
+  createTurnModel,
+  reduceEvent,
+} from '@/app/workspace/[workspaceId]/home/hooks/stream/turn-model'
+import { modelToContentBlocks } from '@/app/workspace/[workspaceId]/home/hooks/stream/turn-model-serialize'
 import type { ContentBlock } from '../../types'
-import { parseBlocks, shouldSmoothTextSegment } from './message-content'
+import {
+  assistantMessageHasVisibleActivity,
+  deriveThinkingLabel,
+  getOrchestratorMessageText,
+  parseBlocks,
+  shouldSmoothTextSegment,
+} from './message-content'
 
 function subagentStart(name: string, spanId: string, parentSpanId: string): ContentBlock {
   return { type: 'subagent', content: name, spanId, parentSpanId, timestamp: 1 }
@@ -31,13 +58,172 @@ function mainToolCall(id: string, name: string): ContentBlock {
   return { type: 'tool_call', toolCall: { id, name, status: 'success' }, timestamp: 1 }
 }
 
+function representativeToolArgs(entry: ToolCatalogEntry): Record<string, unknown> {
+  const args: Record<string, unknown> = {}
+  if (!entry.parameters || typeof entry.parameters !== 'object') return args
+  const properties = (entry.parameters as { properties?: unknown }).properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return args
+
+  for (const [key, rawSchema] of Object.entries(properties)) {
+    if (!rawSchema || typeof rawSchema !== 'object' || Array.isArray(rawSchema)) continue
+    const schema = rawSchema as { default?: unknown; enum?: unknown; type?: unknown }
+    if (schema.default !== undefined) {
+      args[key] = schema.default
+    } else if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+      args[key] = schema.enum[0]
+    } else if (schema.type === 'boolean') {
+      args[key] = true
+    } else if (schema.type === 'object') {
+      args[key] = {}
+    }
+  }
+  return args
+}
+
+function toolEnvelope(
+  seq: number,
+  payload: Record<string, unknown>,
+  agentId = 'deploy'
+): PersistedStreamEventEnvelope {
+  return {
+    v: 1,
+    seq,
+    ts: new Date(seq).toISOString(),
+    stream: { streamId: 'stream-1', cursor: String(seq) },
+    type: 'tool',
+    payload,
+    scope: {
+      lane: 'subagent',
+      spanId: `${agentId}-span`,
+      parentSpanId: 'main',
+      agentId,
+    },
+  } as PersistedStreamEventEnvelope
+}
+
+describe('getOrchestratorMessageText', () => {
+  it('copies only orchestrator text from span-based messages', () => {
+    const blocks: ContentBlock[] = [
+      subagentStart('research', 'span-visible', 'main'),
+      {
+        type: 'subagent_text',
+        content: 'Visible research. ',
+        spanId: 'span-visible',
+        timestamp: 2,
+      },
+      {
+        type: 'subagent_text',
+        content: 'Hidden orphan. ',
+        spanId: 'span-orphan',
+        timestamp: 3,
+      },
+      mainText('Main answer.'),
+    ]
+
+    expect(getOrchestratorMessageText(blocks, 'Fallback.')).toBe('Main answer.')
+  })
+
+  it('copies only orchestrator text from legacy messages', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'subagent_text', content: 'Hidden orphan. ', timestamp: 1 },
+      {
+        type: 'subagent',
+        content: 'research',
+        parentToolCallId: 'dispatch-visible',
+        timestamp: 2,
+      },
+      {
+        type: 'subagent_text',
+        content: 'Visible research. ',
+        parentToolCallId: 'dispatch-visible',
+        timestamp: 3,
+      },
+      mainText('Main answer.'),
+    ]
+
+    expect(getOrchestratorMessageText(blocks, 'Fallback.')).toBe('Main answer.')
+  })
+
+  it('separates orchestrator text blocks around excluded subagent output', () => {
+    const blocks: ContentBlock[] = [
+      mainText('Starting answer.'),
+      subagentStart('research', 'span-visible', 'main'),
+      {
+        type: 'subagent_text',
+        content: 'Visible research.',
+        spanId: 'span-visible',
+        timestamp: 2,
+      },
+      mainText('Main answer.'),
+    ]
+
+    expect(getOrchestratorMessageText(blocks, 'Fallback.')).toBe('Starting answer.\n\nMain answer.')
+  })
+})
+
 describe('parseBlocks span-identity tree', () => {
+  it.each(['read', 'respond', 'prepare_file_edit'])(
+    'prefers invocation intent over %s fallback titles',
+    (name) => {
+      const segments = parseBlocks([
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'described-tool',
+            name,
+            status: 'success',
+            displayTitle: 'Fallback title',
+            activityDescription: '  Checking\nlaunch updates ',
+            params: { path: 'workspace/files/brief.md' },
+          },
+          timestamp: 1,
+        },
+      ])
+      const group = segments[0]
+      if (group.type !== 'agent_group') throw new Error('expected mothership group')
+      const tool = group.items[0]
+      if (tool?.type !== 'tool') throw new Error('expected tool activity')
+      expect(tool.data.displayTitle).toBe('Checked launch updates')
+      expect(tool.data.activityDescription).toBe('Checking launch updates')
+      expect(tool.data.params).toEqual({ path: 'workspace/files/brief.md' })
+    }
+  )
+
+  it('refines a completed credential rename with its previous and new names', () => {
+    const segments = parseBlocks([
+      {
+        type: 'tool_call',
+        toolCall: {
+          id: 'rename-credential',
+          name: 'manage_credential',
+          status: 'success',
+          params: { operation: 'rename', displayName: 'Production Stripe' },
+          result: {
+            success: true,
+            output: {
+              previousDisplayName: 'Stripe',
+              displayName: 'Production Stripe',
+            },
+          },
+        },
+        timestamp: 1,
+      },
+    ])
+
+    expect(segments).toHaveLength(1)
+    const group = segments[0]
+    if (group.type !== 'agent_group') throw new Error('expected mothership group')
+    const tool = group.items[0]
+    if (tool?.type !== 'tool') throw new Error('expected credential tool')
+    expect(tool.data.displayTitle).toBe('Renamed Stripe to Production Stripe')
+  })
+
   it('nests a deploy subagent inside the workflow subagent that spawned it', () => {
     const blocks: ContentBlock[] = [
       subagentStart('workflow', 'S1', 'main'),
       subagentToolCall('t1', 'create_workflow', 'S1', 'workflow'),
       subagentStart('deploy', 'S2', 'S1'),
-      subagentToolCall('t2', 'check_deployment_status', 'S2', 'deploy'),
+      subagentToolCall('t2', 'get_deployment_status', 'S2', 'deploy'),
     ]
 
     const segments = parseBlocks(blocks)
@@ -87,9 +273,9 @@ describe('parseBlocks span-identity tree', () => {
   it('creates distinct groups for repeated deploy invocations (no collision)', () => {
     const blocks: ContentBlock[] = [
       subagentStart('deploy', 'S2', 'main'),
-      subagentToolCall('t1', 'deploy_api', 'S2', 'deploy'),
+      subagentToolCall('t1', 'deploy_as_api', 'S2', 'deploy'),
       subagentStart('deploy', 'S4', 'main'),
-      subagentToolCall('t2', 'deploy_api', 'S4', 'deploy'),
+      subagentToolCall('t2', 'deploy_as_api', 'S4', 'deploy'),
     ]
 
     const segments = parseBlocks(blocks)
@@ -176,7 +362,7 @@ describe('parseBlocks span-identity tree', () => {
     expect(segments[0].items.some((item) => item.type === 'tool')).toBe(true)
   })
 
-  it('interleaves mothership tools with main text instead of clustering them at the top', () => {
+  it('retains main activity around prose and subagents in stream order', () => {
     const blocks: ContentBlock[] = [
       mainText('Let me search.'),
       mainToolCall('t1', 'grep'),
@@ -189,31 +375,26 @@ describe('parseBlocks span-identity tree', () => {
 
     const segments = parseBlocks(blocks)
 
-    // Order is preserved chronologically: the second mothership tool stays below
-    // the research subagent and the trailing text rather than jumping back up
-    // into the first group.
     const shape = segments.map((s) => (s.type === 'agent_group' ? s.agentName : s.type))
     expect(shape).toEqual(['text', 'mothership', 'research', 'text', 'mothership'])
 
-    // The two mothership tools land in two distinct groups, one each.
     const mothershipGroups = segments.filter(
       (s) => s.type === 'agent_group' && s.agentName === 'mothership'
     )
     expect(mothershipGroups).toHaveLength(2)
-    const [first, second] = mothershipGroups
-    if (first.type !== 'agent_group' || second.type !== 'agent_group') {
-      throw new Error('expected mothership groups')
-    }
-    expect(first.items).toHaveLength(1)
-    expect(second.items).toHaveLength(1)
-    expect(first.items[0].type === 'tool' && first.items[0].data.toolName).toBe('grep')
-    expect(second.items[0].type === 'tool' && second.items[0].data.toolName).toBe('glob')
+    expect(
+      mothershipGroups.flatMap((group) =>
+        group.type === 'agent_group'
+          ? group.items.flatMap((item) => (item.type === 'tool' ? [item.data.id] : []))
+          : []
+      )
+    ).toEqual(['t1', 't2'])
   })
 
   it('absorbs the dispatch tool of a nested file subagent from its parent span group', () => {
     const blocks: ContentBlock[] = [
       subagentStart('workflow', 'S1', 'main'),
-      subagentToolCall('t1', 'workspace_file', 'S1', 'workflow'),
+      subagentToolCall('t1', 'prepare_file_edit', 'S1', 'workflow'),
       { type: 'subagent', content: 'file', spanId: 'S2', parentSpanId: 'S1', timestamp: 2 },
       { type: 'subagent_text', content: 'writing', spanId: 'S2', timestamp: 3 },
     ]
@@ -223,12 +404,71 @@ describe('parseBlocks span-identity tree', () => {
     const workflow = segments[0]
     if (workflow.type !== 'agent_group') throw new Error('expected workflow group')
 
-    // The workspace_file dispatch tool is absorbed (not shown as a sibling tool);
+    // The prepare_file_edit dispatch tool is absorbed (not shown as a sibling tool);
     // only the nested file subagent remains under workflow.
     expect(workflow.items.some((item) => item.type === 'tool')).toBe(false)
     const nested = workflow.items.find((item) => item.type === 'agent_group')
     if (!nested || nested.type !== 'agent_group') throw new Error('expected nested file group')
     expect(nested.group.agentName).toBe('file')
+  })
+
+  it('suppresses subagent thinking while keeping the delegating spinner', () => {
+    const blocks: ContentBlock[] = [
+      subagentStart('workflow', 'S1', 'main'),
+      {
+        type: 'subagent_thinking',
+        content: 'reasoning about the fix',
+        spanId: 'S1',
+        subagent: 'workflow',
+        timestamp: 2,
+      },
+    ]
+
+    const segments = parseBlocks(blocks)
+    expect(segments).toHaveLength(1)
+    if (segments[0].type !== 'agent_group') throw new Error('expected workflow group')
+    expect(segments[0].items).toEqual([])
+    // Suppressed reasoning does not count as visible output or clear activity.
+    expect(segments[0].isDelegating).toBe(true)
+  })
+
+  it('does not create visible output when thinking arrives before its subagent start', () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: 'subagent_thinking',
+        content: 'early reasoning',
+        spanId: 'S1',
+        parentSpanId: 'main',
+        subagent: 'workflow',
+        timestamp: 1,
+      },
+      subagentStart('workflow', 'S1', 'main'),
+    ]
+
+    const segments = parseBlocks(blocks)
+    const group = segments.find((s) => s.type === 'agent_group')
+    if (!group || group.type !== 'agent_group') throw new Error('expected workflow group')
+    expect(group.agentName).toBe('workflow')
+    expect(group.items).toEqual([])
+  })
+
+  it('renders only assistant text after suppressed subagent thinking', () => {
+    const blocks: ContentBlock[] = [
+      subagentStart('workflow', 'S1', 'main'),
+      {
+        type: 'subagent_thinking',
+        content: 'planning',
+        spanId: 'S1',
+        subagent: 'workflow',
+        timestamp: 2,
+      },
+      { type: 'subagent_text', content: 'done', spanId: 'S1', subagent: 'workflow', timestamp: 3 },
+    ]
+
+    const segments = parseBlocks(blocks)
+    if (segments[0].type !== 'agent_group') throw new Error('expected workflow group')
+    expect(segments[0].items).toEqual([{ type: 'text', content: 'done' }])
+    expect(segments[0].isDelegating).toBe(false)
   })
 
   it('falls back to legacy flat grouping when blocks have no span identity', () => {
@@ -295,39 +535,154 @@ describe('completed tool titles', () => {
     )
   })
 
-  it('keeps present tense while executing and on error', () => {
+  it('renders an accepted async workflow launch in past tense', () => {
+    expect(
+      firstToolTitle([
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'async-workflow',
+            name: 'run_workflow',
+            status: 'success',
+            params: { async: true },
+          },
+          timestamp: 1,
+        },
+      ])
+    ).toBe('Ran workflow')
+  })
+
+  it('renders the completed deployment action and deployment type', () => {
+    expect(
+      firstToolTitle([
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'undeploy-api',
+            name: 'deploy_as_api',
+            status: 'success',
+            params: { action: 'undeploy' },
+          },
+          timestamp: 1,
+        },
+      ])
+    ).toBe('Undeployed as API')
+
+    expect(firstToolTitle([mainToolCall('deploy-mcp', 'deploy_as_mcp')])).toBe(
+      'Deployed as MCP tool'
+    )
+  })
+
+  it('renders Compared after the full diff_workflows wire lifecycle succeeds', () => {
+    const model = createTurnModel()
+    reduceEvent(
+      model,
+      toolEnvelope(1, {
+        phase: 'call',
+        toolCallId: 'diff-1',
+        toolName: 'diff_workflows',
+        arguments: { ref1: 'live', ref2: 'draft' },
+      })
+    )
+    reduceEvent(
+      model,
+      toolEnvelope(2, {
+        phase: 'result',
+        toolCallId: 'diff-1',
+        toolName: 'diff_workflows',
+        success: true,
+        status: 'success',
+        output: { differences: [] },
+      })
+    )
+
+    expect(firstToolTitle(modelToContentBlocks(model))).toBe('Compared workflows')
+  })
+
+  it('humanizes an internal read target through the full wire lifecycle', () => {
+    const model = createTurnModel()
+    reduceEvent(
+      model,
+      toolEnvelope(
+        1,
+        {
+          phase: 'call',
+          toolCallId: 'read-oauth-integrations',
+          toolName: 'read',
+          arguments: { path: 'environment/oauth-integrations.json' },
+        },
+        'auth'
+      )
+    )
+    reduceEvent(
+      model,
+      toolEnvelope(
+        2,
+        {
+          phase: 'result',
+          toolCallId: 'read-oauth-integrations',
+          toolName: 'read',
+          success: true,
+          status: 'success',
+          output: {},
+        },
+        'auth'
+      )
+    )
+
+    expect(firstToolTitle(modelToContentBlocks(model))).toBe('Read OAuth integrations')
+  })
+
+  it('renders the completed title through the full wire lifecycle for every visible tool', () => {
+    const hiddenToolNames = getHiddenToolNames()
+    const failures: string[] = []
+
+    for (const [toolName, entry] of Object.entries(TOOL_CATALOG)) {
+      // Internal subagent dispatches become agent groups, and hidden plumbing
+      // is intentionally suppressed; neither produces a visible tool row.
+      if (entry.internal || hiddenToolNames.has(toolName)) continue
+
+      const args = representativeToolArgs(entry)
+      const model = createTurnModel()
+      reduceEvent(
+        model,
+        toolEnvelope(1, {
+          phase: 'call',
+          toolCallId: `${toolName}-1`,
+          toolName,
+          arguments: args,
+        })
+      )
+      reduceEvent(
+        model,
+        toolEnvelope(2, {
+          phase: 'result',
+          toolCallId: `${toolName}-1`,
+          toolName,
+          success: true,
+          status: 'success',
+          output: {},
+        })
+      )
+
+      const presentTitle = getToolDisplayTitle(toolName, args)
+      const expectedTitle = getToolStatusDisplayTitle(presentTitle, 'success', toolName)
+      const actualTitle = firstToolTitle(modelToContentBlocks(model))
+      if (actualTitle !== expectedTitle) {
+        failures.push(`${toolName}: expected ${expectedTitle}, received ${actualTitle}`)
+      }
+    }
+
+    expect(failures).toEqual([])
+  })
+
+  it('keeps the action description for executing and unsuccessful rows', () => {
     expect(firstToolTitle([queryLogsCall('executing')])).toBe('Querying logs')
     expect(firstToolTitle([queryLogsCall('error')])).toBe('Querying logs')
   })
 })
 
 describe('narration text seams', () => {
-  it('inserts a space between glued consecutive blocks', () => {
-    const blocks: ContentBlock[] = [
-      subagentStart('research', 'S1', 'main'),
-      {
-        type: 'subagent_thinking',
-        content: 'that triggered it.',
-        spanId: 'S1',
-        subagent: 'research',
-        timestamp: 2,
-      },
-      {
-        type: 'subagent_text',
-        content: 'The failing block is X.',
-        spanId: 'S1',
-        subagent: 'research',
-        timestamp: 3,
-      },
-    ]
-    const segments = parseBlocks(blocks)
-    const group = segments.find((s) => s.type === 'agent_group')
-    if (!group || group.type !== 'agent_group') throw new Error('expected group')
-    const text = group.items.find((i) => i.type === 'text')
-    if (!text || text.type !== 'text') throw new Error('expected text')
-    expect(text.content).toBe('that triggered it. The failing block is X.')
-  })
-
   it('never inserts a space into a segment split mid-word or mid-URL', () => {
     const seam = (first: string, second: string): string => {
       const blocks: ContentBlock[] = [
@@ -384,5 +739,248 @@ describe('narration text seams', () => {
     const text = group.items.find((i) => i.type === 'text')
     if (!text || text.type !== 'text') throw new Error('expected text')
     expect(text.content).toBe('first sentence. second sentence.')
+  })
+})
+
+describe('parseBlocks legacy — thinking between top-level tools', () => {
+  it('retains every main tool across intervening thinking', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'thinking', content: 'planning the search', timestamp: 1 },
+      mainToolCall('t1', 'grep'),
+      { type: 'thinking', content: 'now read the workflow', timestamp: 1 },
+      mainToolCall('t2', 'read'),
+      mainToolCall('t3', 'read'),
+    ]
+    const segments = parseBlocks(blocks)
+    const groups = segments.filter((s) => s.type === 'agent_group')
+    expect(groups).toHaveLength(1)
+    if (groups[0].type !== 'agent_group') throw new Error('expected group')
+    expect(groups[0].agentName).toBe('mothership')
+    expect(groups[0].items.map((item) => item.type === 'tool' && item.data.id)).toEqual([
+      't1',
+      't2',
+      't3',
+    ])
+  })
+
+  it('keeps separate activity groups around assistant prose', () => {
+    const blocks: ContentBlock[] = [
+      mainToolCall('t1', 'grep'),
+      mainText('Here is what I found so far.'),
+      mainToolCall('t2', 'read'),
+    ]
+    const segments = parseBlocks(blocks)
+    const groups = segments.filter((s) => s.type === 'agent_group')
+    expect(groups).toHaveLength(2)
+    expect(segments.map((segment) => segment.type)).toEqual(['agent_group', 'text', 'agent_group'])
+  })
+
+  it('does not let main thinking affect subagent lane grouping', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'subagent', content: 'workflow', parentToolCallId: 'd1', timestamp: 1 },
+      { type: 'subagent_text', content: 'working', parentToolCallId: 'd1', timestamp: 1 },
+      { type: 'thinking', content: 'main reasoning', timestamp: 1 },
+      { type: 'subagent_text', content: 'later chunk with no lane tag', timestamp: 1 },
+    ]
+    const segments = parseBlocks(blocks)
+    const groups = segments.filter((s) => s.type === 'agent_group')
+    expect(groups).toHaveLength(1)
+    if (groups[0].type !== 'agent_group') throw new Error('expected group')
+    // Thinking is absent from persistence, so it cannot split the live lane.
+    expect(groups[0].items).toHaveLength(1)
+    expect(groups[0].items[0]).toEqual({
+      type: 'text',
+      content: 'workinglater chunk with no lane tag',
+    })
+  })
+
+  it('suppresses subagent thinking inside the legacy lane', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'subagent', content: 'workflow', parentToolCallId: 'd1', timestamp: 1 },
+      {
+        type: 'subagent_thinking',
+        content: 'legacy reasoning',
+        parentToolCallId: 'd1',
+        timestamp: 2,
+      },
+      { type: 'subagent_text', content: 'output', parentToolCallId: 'd1', timestamp: 3 },
+    ]
+    const segments = parseBlocks(blocks)
+    const groups = segments.filter((s) => s.type === 'agent_group')
+    expect(groups).toHaveLength(1)
+    if (groups[0].type !== 'agent_group') throw new Error('expected group')
+    expect(groups[0].items).toEqual([{ type: 'text', content: 'output' }])
+  })
+})
+
+describe('assistantMessageHasVisibleActivity', () => {
+  it('keeps the main tail active between calls but closes it when narration follows', () => {
+    const blocks = [mainToolCall('finished', 'read')]
+    expect(assistantMessageHasVisibleActivity(parseBlocks(blocks), true)).toBe(true)
+    expect(assistantMessageHasVisibleActivity(parseBlocks(blocks), false)).toBe(false)
+    expect(
+      assistantMessageHasVisibleActivity(parseBlocks([...blocks, mainText('Done.')]), true)
+    ).toBe(false)
+  })
+
+  it('leaves an empty open subagent to the turn indicator', () => {
+    const segments = parseBlocks([subagentStart('workflow', 'S1', 'main')])
+    expect(assistantMessageHasVisibleActivity(segments, true)).toBe(false)
+    expect(assistantMessageHasVisibleActivity(segments, false)).toBe(false)
+  })
+
+  it.each([undefined, 'main'])('retains an earlier running tool with spanId=%s', (spanId) => {
+    const blocks: ContentBlock[] = [
+      {
+        type: 'tool_call',
+        toolCall: { id: 'older', name: 'grep', status: 'executing' },
+        spanId,
+        timestamp: 1,
+      },
+      mainText('Reading the result.'),
+      mainToolCall('latest', 'read'),
+    ]
+    const segments = parseBlocks(blocks)
+    expect(segments.map((segment) => segment.type)).toEqual(['agent_group', 'text', 'agent_group'])
+    expect(assistantMessageHasVisibleActivity(segments)).toBe(true)
+  })
+
+  it('does not treat an open subagent lane as an executing tool row', () => {
+    expect(
+      assistantMessageHasVisibleActivity(parseBlocks([subagentStart('workflow', 'S1', 'main')]))
+    ).toBe(false)
+  })
+
+  it('keeps a visible executing tool as active work', () => {
+    const blocks: ContentBlock[] = [
+      subagentStart('workflow', 'S1', 'main'),
+      {
+        type: 'tool_call',
+        toolCall: { id: 't1', name: 'grep', status: 'executing', calledBy: 'workflow' },
+        spanId: 'S1',
+        timestamp: 3,
+      },
+    ]
+    expect(assistantMessageHasVisibleActivity(parseBlocks(blocks))).toBe(true)
+  })
+
+  it('does not let open parallel lanes suppress the single turn-level indicator', () => {
+    const blocks: ContentBlock[] = [
+      subagentStart('workflow', 'S1', 'main'),
+      subagentStart('search', 'S2', 'main'),
+    ]
+    expect(assistantMessageHasVisibleActivity(parseBlocks(blocks))).toBe(false)
+  })
+
+  it('ignores the executing dispatch tool represented by its subagent lane', () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: 'tool_call',
+        toolCall: { id: 'dispatch-1', name: 'prepare_file_edit', status: 'executing' },
+        timestamp: 1,
+      },
+      {
+        ...subagentStart('file', 'S1', 'main'),
+        parentToolCallId: 'dispatch-1',
+      },
+    ]
+    expect(assistantMessageHasVisibleActivity(parseBlocks(blocks))).toBe(false)
+  })
+})
+
+describe('parseBlocks main activity controls', () => {
+  it.each([undefined, 'main'])(
+    'retains interaction controls and answers across prose and completion with spanId=%s',
+    (spanId) => {
+      const blocks: ContentBlock[] = [
+        {
+          type: 'tool_call',
+          toolCall: { id: 'permission', name: 'read', status: 'awaiting_approval' },
+          spanId,
+          timestamp: 1,
+        },
+        mainText('A permission decision is pending.'),
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'handoff',
+            name: 'terminal',
+            status: 'executing',
+            params: { operation: 'handoff' },
+          },
+          timestamp: 2,
+        },
+        {
+          type: 'tool_call',
+          toolCall: {
+            id: 'answered-takeover',
+            name: 'browser_request_takeover',
+            status: 'success',
+            params: { reason: 'Choose a result.' },
+            result: { success: true, output: { userInstruction: 'Open the second result.' } },
+          },
+          timestamp: 2,
+        },
+        mainToolCall('older', 'grep'),
+        mainText('Checking another source.'),
+        {
+          type: 'tool_call',
+          toolCall: { id: 'latest', name: 'read', status: 'executing' },
+          timestamp: 3,
+        },
+      ]
+
+      const visibleTools = (content: ContentBlock[]) =>
+        parseBlocks(content).flatMap((segment) =>
+          segment.type === 'agent_group'
+            ? segment.items.flatMap((item) => (item.type === 'tool' ? [item.data] : []))
+            : []
+        )
+
+      expect(visibleTools(blocks).map((tool) => tool.id)).toEqual([
+        'permission',
+        'handoff',
+        'answered-takeover',
+        'older',
+        'latest',
+      ])
+      const completed = blocks.map((block) =>
+        block.toolCall?.id === 'latest'
+          ? { ...block, toolCall: { ...block.toolCall, status: 'success' as const } }
+          : block
+      )
+      expect(visibleTools(completed).map((tool) => tool.id)).toEqual([
+        'permission',
+        'handoff',
+        'answered-takeover',
+        'older',
+        'latest',
+      ])
+      expect(visibleTools(completed).at(-1)?.status).toBe('success')
+    }
+  )
+})
+
+describe('deriveThinkingLabel', () => {
+  it('maps the most recent block to an activity phrase', () => {
+    expect(deriveThinkingLabel([])).toBe('Thinking…')
+    expect(deriveThinkingLabel([{ type: 'thinking', content: 'hm', timestamp: 1 }])).toBe(
+      'Thinking…'
+    )
+    // A stall after streamed text is the agent deciding what's next, not generating.
+    expect(deriveThinkingLabel([mainText('hi')])).toBe('Thinking…')
+    expect(deriveThinkingLabel([{ type: 'subagent_text', content: 'x', timestamp: 1 }])).toBe(
+      'Thinking…'
+    )
+    expect(deriveThinkingLabel([{ type: 'subagent_end', spanId: 'S1', timestamp: 1 }])).toBe(
+      'Returning…'
+    )
+  })
+
+  it('shows Dispatching for the dispatch call, then yields to the opened lane', () => {
+    expect(deriveThinkingLabel([mainToolCall('t1', 'workflow')])).toBe('Dispatching…')
+    expect(deriveThinkingLabel([mainToolCall('t1', 'prepare_file_edit')])).toBe('Dispatching…')
+    expect(deriveThinkingLabel([mainToolCall('t1', 'grep')])).toBe('Thinking…')
+    expect(deriveThinkingLabel([subagentStart('workflow', 'S1', 'main')])).toBe('Thinking…')
   })
 })

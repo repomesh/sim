@@ -1,4 +1,5 @@
 import { createLogger } from '@sim/logger'
+import { normalizeWorkflowEdgeSourceHandle } from '@sim/workflow-types/workflow'
 import { CONTROL_BACK_EDGE_HANDLES, EDGE, SUBFLOW_CONTROL_EDGE_HANDLES } from '@/executor/constants'
 import type { DAG, DAGNode } from '@/executor/dag/builder'
 import type { DAGEdge } from '@/executor/dag/types'
@@ -71,10 +72,20 @@ export class EdgeManager {
 
     const isDeadEnd = activatedTargets.length === 0
     const isRoutedDeadEnd = isDeadEnd && !!(output.selectedOption || output.selectedRoute)
+    const isSubflowExit =
+      output.selectedRoute === EDGE.LOOP_EXIT || output.selectedRoute === EDGE.PARALLEL_EXIT
 
     for (const targetId of cascadeTargets) {
       if (!readyNodes.includes(targetId) && !activatedTargets.includes(targetId)) {
-        if (!isDeadEnd || !this.isTargetReady(targetId)) continue
+        if (!this.isTargetReady(targetId)) continue
+
+        /** A previously activated join can become ready several edges into a skipped branch. */
+        if (!isSubflowExit && this.nodesWithActivatedEdge.has(targetId)) {
+          readyNodes.push(targetId)
+          continue
+        }
+
+        if (!isDeadEnd) continue
 
         if (isRoutedDeadEnd) {
           // A condition/router deliberately selected a dead-end path.
@@ -91,7 +102,7 @@ export class EdgeManager {
       }
     }
 
-    if (output.selectedRoute !== EDGE.LOOP_EXIT && output.selectedRoute !== EDGE.PARALLEL_EXIT) {
+    if (!isSubflowExit) {
       for (const { target } of edgesToDeactivate) {
         if (
           !readyNodes.includes(target) &&
@@ -250,7 +261,11 @@ export class EdgeManager {
   }
 
   private shouldActivateEdge(edge: DAGEdge, output: NormalizedBlockOutput): boolean {
-    const handle = edge.sourceHandle
+    /*
+     * Normalized so a deployment snapshot taken while side-anchored handle ids
+     * existed (`source-right`) still routes as the canonical `source` output.
+     */
+    const handle = normalizeWorkflowEdgeSourceHandle(edge.sourceHandle) ?? undefined
 
     if (output.selectedRoute === EDGE.LOOP_EXIT) {
       return handle === EDGE.LOOP_EXIT
@@ -303,7 +318,8 @@ export class EdgeManager {
     targetId: string,
     sourceHandle?: string,
     cascadeTargets?: Set<string>,
-    isCascade = false
+    isCascade = false,
+    cascadeSourceId = sourceId
   ): void {
     const edgeKey = this.createEdgeKey(sourceId, targetId, sourceHandle)
     if (this.deactivatedEdges.has(edgeKey)) {
@@ -315,8 +331,21 @@ export class EdgeManager {
     const targetNode = this.dag.nodes.get(targetId)
     if (!targetNode) return
 
-    if (isCascade && this.isTerminalControlNode(targetId)) {
+    if (
+      isCascade &&
+      (this.isTerminalControlNode(targetId) || this.nodesWithActivatedEdge.has(targetId))
+    ) {
       cascadeTargets?.add(targetId)
+    }
+
+    /** The enclosing subflow must resolve its own exit before downstream joins become ready. */
+    const cascadeSourceNode = this.dag.nodes.get(cascadeSourceId)
+    if (
+      targetNode.metadata.sentinelType === 'end' &&
+      cascadeSourceNode &&
+      this.isEnclosingSentinel(cascadeSourceNode, targetId)
+    ) {
+      return
     }
 
     // Don't cascade if node has active incoming edges OR has received an activated edge
@@ -334,7 +363,8 @@ export class EdgeManager {
           outgoingEdge.target,
           outgoingEdge.sourceHandle,
           cascadeTargets,
-          true
+          true,
+          cascadeSourceId
         )
       }
     }

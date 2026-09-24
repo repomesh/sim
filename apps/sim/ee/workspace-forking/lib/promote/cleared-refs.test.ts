@@ -8,7 +8,6 @@ import type { SubBlockConfig } from '@/blocks/types'
 // remap module never pulls the full registry (these cases use top-level selectors / dependents).
 vi.mock('@/tools/params', () => ({
   getToolIdForOperation: () => undefined,
-  getToolParametersConfig: () => null,
   getSubBlocksForToolInput: (
     _toolId: string,
     _type: string,
@@ -25,7 +24,7 @@ const { mockFilterExisting, mockLoadCopyableLabels } = vi.hoisted(() => ({
   mockFilterExisting: vi.fn(),
   mockLoadCopyableLabels: vi.fn(),
 }))
-vi.mock('@/ee/workspace-forking/lib/mapping/resources', () => ({
+vi.mock('@/lib/workflows/references/resources', () => ({
   filterExistingForkTargets: mockFilterExisting,
   loadForkCopyableResourceLabels: mockLoadCopyableLabels,
   getWorkspaceEnvKeys: vi.fn(),
@@ -37,6 +36,7 @@ vi.mock('@/ee/workspace-forking/lib/mapping/resources', () => ({
 }))
 
 import type { DbOrTx } from '@/lib/db/types'
+import type { ForkReferenceResolver } from '@/lib/workflows/references/remap-references'
 import { getBlock } from '@/blocks/registry'
 import type { BlockConfig } from '@/blocks/types'
 import {
@@ -50,7 +50,6 @@ import {
   deriveForkBlockId,
   EMPTY_FORK_BLOCK_MAP,
 } from '@/ee/workspace-forking/lib/remap/block-identity'
-import type { ForkReferenceResolver } from '@/ee/workspace-forking/lib/remap/remap-references'
 import type { WorkflowState } from '@/stores/workflows/workflow/types'
 
 const blockWith = (subBlocks: SubBlockConfig[]): BlockConfig =>
@@ -957,7 +956,7 @@ describe('collectForkSyncBlockers', () => {
     mockLoadCopyableLabels.mockResolvedValue(
       new Map([['table:tbl-src', { label: 'Orders', parentId: null, parentLabel: null }]])
     )
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         sourceStates: new Map([
           [
@@ -987,7 +986,7 @@ describe('collectForkSyncBlockers', () => {
       blockWith([{ id: 'tbl', title: 'Table', type: 'table-selector' }])
     )
     const { executor, select } = makeExecutor()
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1014,7 +1013,7 @@ describe('collectForkSyncBlockers', () => {
     )
     mockFilterExisting.mockResolvedValue({ 'mcp-server': new Set(['srv-1']) })
     const { executor } = makeExecutor([[{ id: 'srv-1', name: 'Internal Tools' }]])
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1037,6 +1036,58 @@ describe('collectForkSyncBlockers', () => {
     ])
   })
 
+  /**
+   * The drop hatch. `sourceDeleted` is re-derived here from the source workspace inside the
+   * promote transaction, so the acknowledgment is only ever honoured against a reference that is
+   * genuinely gone - a crafted payload can never drop a working one.
+   */
+  it('honours a drop acknowledgment for a source-deleted reference', async () => {
+    vi.mocked(getBlock).mockReturnValue(
+      blockWith([{ id: 'kb', title: 'Knowledge Base', type: 'knowledge-base-selector' }])
+    )
+    mockFilterExisting.mockResolvedValue({ 'knowledge-base': new Set() })
+    const { blockers, appliedDrops } = await collectForkSyncBlockers(
+      baseParams({
+        sourceStates: new Map([
+          [
+            'wf-src',
+            stateWith('knowledge', 'KB Block', {
+              kb: { type: 'knowledge-base-selector', value: 'kb-gone' },
+            }),
+          ],
+        ]),
+        droppedReferences: [{ kind: 'knowledge-base', sourceId: 'kb-gone' }],
+      })
+    )
+    expect(blockers).toEqual([])
+    expect(appliedDrops).toEqual([{ kind: 'knowledge-base', sourceId: 'kb-gone' }])
+  })
+
+  it('ignores a drop acknowledgment for a reference whose source is still live', async () => {
+    vi.mocked(getBlock).mockReturnValue(
+      blockWith([{ id: 'kb', title: 'Knowledge Base', type: 'knowledge-base-selector' }])
+    )
+    // The source row still exists, so the reference is an unmapped-copyable, not source-deleted.
+    mockFilterExisting.mockResolvedValue({ 'knowledge-base': new Set(['kb-live']) })
+    const { blockers, appliedDrops } = await collectForkSyncBlockers(
+      baseParams({
+        sourceStates: new Map([
+          [
+            'wf-src',
+            stateWith('knowledge', 'KB Block', {
+              kb: { type: 'knowledge-base-selector', value: 'kb-live' },
+            }),
+          ],
+        ]),
+        droppedReferences: [{ kind: 'knowledge-base', sourceId: 'kb-live' }],
+      })
+    )
+    expect(blockers).toEqual([
+      expect.objectContaining({ sourceId: 'kb-live', reason: 'unmapped-copyable' }),
+    ])
+    expect(appliedDrops).toEqual([])
+  })
+
   it('blocks a source-deleted reference (source-deleted) - no exemption, resolvable by mapping', async () => {
     vi.mocked(getBlock).mockReturnValue(
       blockWith([{ id: 'kb', title: 'Knowledge Base', type: 'knowledge-base-selector' }])
@@ -1044,7 +1095,7 @@ describe('collectForkSyncBlockers', () => {
     // The liveness check reports the source row gone; the copy loader (live rows only) misses,
     // so the label falls back to the id.
     mockFilterExisting.mockResolvedValue({ 'knowledge-base': new Set() })
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         sourceStates: new Map([
           [
@@ -1066,7 +1117,7 @@ describe('collectForkSyncBlockers', () => {
     ])
     // Mapping the dead id to a live target resolves it (the resolver never checks source
     // liveness - a mapping row whose source row is gone still resolves).
-    const resolved = await collectForkSyncBlockers(
+    const { blockers: resolved } = await collectForkSyncBlockers(
       baseParams({
         sourceStates: new Map([
           [
@@ -1095,7 +1146,7 @@ describe('collectForkSyncBlockers', () => {
       targetActiveIds: new Set(['wf-child-tgt']),
       items: [{ sourceWorkflowId: 'wf-src', targetWorkflowId: 'wf-tgt' }],
     })
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1132,7 +1183,7 @@ describe('collectForkSyncBlockers', () => {
       targetActiveIds: new Set(['wf-child-tgt']),
       items: [{ sourceWorkflowId: 'wf-src', targetWorkflowId: 'wf-tgt' }],
     })
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1167,8 +1218,8 @@ describe('collectForkSyncBlockers', () => {
       ],
     ])
 
-    const freshScan = await collectForkSyncBlockers(baseParams({ sourceStates }))
-    const reusedPlan = await collectForkSyncBlockers(
+    const { blockers: freshScan } = await collectForkSyncBlockers(baseParams({ sourceStates }))
+    const { blockers: reusedPlan } = await collectForkSyncBlockers(
       baseParams({
         sourceStates,
         planUnmapped: [{ kind: 'table', sourceId: 'tbl-src' }],
@@ -1179,7 +1230,7 @@ describe('collectForkSyncBlockers', () => {
     // unchanged either way.
     const overlayResolver: ForkReferenceResolver = (kind, id) =>
       kind === 'custom-tool' && id === 'ct-unreferenced' ? 'ct-copy' : null
-    const withIrrelevantCopy = await collectForkSyncBlockers(
+    const { blockers: withIrrelevantCopy } = await collectForkSyncBlockers(
       baseParams({
         sourceStates,
         resolver: overlayResolver,
@@ -1206,7 +1257,7 @@ describe('collectForkSyncBlockers', () => {
       blockWith([{ id: 'tbl', title: 'Table', type: 'table-selector' }])
     )
     const { executor, select } = makeExecutor()
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1230,7 +1281,7 @@ describe('collectForkSyncBlockers', () => {
       blockWith([{ id: 'tbl', title: 'Table', type: 'table-selector' }])
     )
     const { executor, select } = makeExecutor()
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1259,7 +1310,7 @@ describe('collectForkSyncBlockers', () => {
       blockWith([{ id: 'target', title: 'Workflow', type: 'workflow-selector' }])
     )
     const { executor } = makeExecutor([[{ id: 'wf-child', name: 'Child Flow' }]])
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1289,7 +1340,7 @@ describe('collectForkSyncBlockers', () => {
       blockWith([{ id: 'workflowIds', title: 'Workflows', type: 'dropdown', multiSelect: true }])
     )
     const { executor } = makeExecutor([[{ id: 'wf-watched', name: 'Watched Workflow' }]])
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([
@@ -1351,7 +1402,7 @@ describe('collectForkSyncBlockers', () => {
       parallels: {},
       variables: {},
     } as unknown as WorkflowState
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         sourceStates: new Map([['wf-src', state]]),
@@ -1376,7 +1427,7 @@ describe('collectForkSyncBlockers', () => {
       ])
     )
     const { executor, select } = makeExecutor()
-    const blockers = await collectForkSyncBlockers(
+    const { blockers } = await collectForkSyncBlockers(
       baseParams({
         executor,
         items: [{ ...replaceItem, mode: 'create' as const }],

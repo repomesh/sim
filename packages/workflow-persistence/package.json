@@ -6,7 +6,7 @@
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
-    "bun": ">=1.2.13",
+    "bun": ">=1.4.1",
     "node": ">=20.0.0"
   },
   "exports": {
@@ -40,19 +40,22 @@
     "lint": "biome check --write --unsafe .",
     "lint:check": "biome check .",
     "format": "biome format --write .",
-    "format:check": "biome format ."
+    "format:check": "biome format .",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@sim/db": "workspace:*",
     "@sim/logger": "workspace:*",
     "@sim/utils": "workspace:*",
     "@sim/workflow-types": "workspace:*",
-    "drizzle-orm": "^0.45.2",
-    "reactflow": "^11.11.4"
+    "@xyflow/react": "12.11.3",
+    "drizzle-orm": "^0.45.2"
   },
   "devDependencies": {
     "@sim/tsconfig": "workspace:*",
     "@types/node": "24.2.1",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.0"
   }
 }

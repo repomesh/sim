@@ -1,43 +1,25 @@
 /**
  * @vitest-environment node
  */
-import { copilotHttpMock, copilotHttpMockFns } from '@sim/testing'
+import { copilotHttpMock, copilotHttpMockFns, dbChainMockFns, resetDbChainMock } from '@sim/testing'
 import { NextRequest } from 'next/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockUpdate, mockSet, mockWhere, mockParseRequest } = vi.hoisted(() => ({
-  mockUpdate: vi.fn(),
-  mockSet: vi.fn(),
-  mockWhere: vi.fn(),
+const { mockParseRequest, mockGetAccessibleChat } = vi.hoisted(() => ({
   mockParseRequest: vi.fn(),
-}))
-
-vi.mock('@sim/db', () => ({
-  db: { update: mockUpdate },
-}))
-
-vi.mock('@sim/db/schema', () => ({
-  copilotChats: {
-    id: 'copilotChats.id',
-    userId: 'copilotChats.userId',
-    updatedAt: 'copilotChats.updatedAt',
-    lastSeenAt: 'copilotChats.lastSeenAt',
-  },
-}))
-
-vi.mock('drizzle-orm', () => ({
-  and: vi.fn((...conditions: unknown[]) => ({ type: 'and', conditions })),
-  eq: vi.fn((field: unknown, value: unknown) => ({ type: 'eq', field, value })),
-  or: vi.fn((...conditions: unknown[]) => ({ type: 'or', conditions })),
-  isNull: vi.fn((field: unknown) => ({ type: 'isNull', field })),
-  lt: vi.fn((field: unknown, value: unknown) => ({ type: 'lt', field, value })),
-  sql: vi.fn(() => ({ type: 'sql' })),
+  mockGetAccessibleChat: vi.fn(),
 }))
 
 vi.mock('@/lib/copilot/request/http', () => copilotHttpMock)
 vi.mock('@/lib/api/server', () => ({ parseRequest: mockParseRequest }))
 vi.mock('@/lib/api/contracts/mothership-chats', () => ({ markMothershipChatReadContract: {} }))
+vi.mock('@/lib/copilot/chat/lifecycle', () => ({
+  getAccessibleCopilotChatAuth: mockGetAccessibleChat,
+}))
 
+vi.mock('@/lib/copilot/chat-status', () => ({ publishChatStatusChanged: vi.fn() }))
+
+import { publishChatStatusChanged } from '@/lib/copilot/chat-status'
 import { POST } from '@/app/api/mothership/chats/read/route'
 
 function createRequest() {
@@ -50,22 +32,29 @@ function createRequest() {
 describe('POST /api/mothership/chats/read', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetDbChainMock()
     copilotHttpMockFns.mockAuthenticateCopilotRequestSessionOnly.mockResolvedValue({
       userId: 'user-1',
       isAuthenticated: true,
+      principal: { kind: 'session', userId: 'user-1', sessionId: 'session-1' },
     })
+    mockGetAccessibleChat.mockResolvedValue({ id: 'chat-1', userId: 'user-1' })
     mockParseRequest.mockResolvedValue({ success: true, data: { body: { chatId: 'chat-1' } } })
-    mockWhere.mockResolvedValue(undefined)
-    mockSet.mockReturnValue({ where: mockWhere })
-    mockUpdate.mockReturnValue({ set: mockSet })
+  })
+
+  afterAll(() => {
+    resetDbChainMock()
   })
 
   it('guards the lastSeenAt write with the unread predicate (only writes when unread)', async () => {
     const res = await POST(createRequest())
     expect(res.status).toBe(200)
+    expect(mockGetAccessibleChat).toHaveBeenCalledWith('chat-1', 'user-1', {
+      principal: { kind: 'session', userId: 'user-1', sessionId: 'session-1' },
+    })
 
-    expect(mockUpdate).toHaveBeenCalledTimes(1)
-    const whereArg = mockWhere.mock.calls[0][0] as {
+    expect(dbChainMockFns.update).toHaveBeenCalledTimes(1)
+    const whereArg = dbChainMockFns.where.mock.calls[0][0] as {
       type: string
       conditions: Array<{ type: string; conditions?: unknown[] }>
     }
@@ -75,10 +64,33 @@ describe('POST /api/mothership/chats/read', () => {
     expect(orClause).toBeDefined()
     expect(orClause?.conditions).toEqual(
       expect.arrayContaining([
-        { type: 'isNull', field: 'copilotChats.lastSeenAt' },
-        { type: 'lt', field: 'copilotChats.lastSeenAt', value: 'copilotChats.updatedAt' },
+        { type: 'isNull', column: 'copilotChats.lastSeenAt' },
+        { type: 'lt', left: 'copilotChats.lastSeenAt', right: 'copilotChats.updatedAt' },
       ])
     )
+  })
+
+  it('broadcasts only a changed read marker, avoiding read/refetch loops', async () => {
+    mockGetAccessibleChat.mockResolvedValue({
+      id: 'chat-1',
+      type: 'mothership',
+      organizationId: 'org-1',
+      userId: 'user-1',
+    })
+    dbChainMockFns.returning.mockResolvedValueOnce([{ id: 'chat-1' }]).mockResolvedValueOnce([])
+    await POST(createRequest())
+    await POST(createRequest())
+    expect(publishChatStatusChanged).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ organizationId: 'org-1', userId: 'user-1' }),
+      { chatId: 'chat-1', type: 'updated' }
+    )
+  })
+
+  it('does not update a chat the caller can no longer access', async () => {
+    mockGetAccessibleChat.mockResolvedValueOnce(null)
+    const res = await POST(createRequest())
+    expect(res.status).toBe(200)
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
   })
 
   it('does not touch the database when unauthenticated', async () => {
@@ -88,6 +100,6 @@ describe('POST /api/mothership/chats/read', () => {
     })
     const res = await POST(createRequest())
     expect(res.status).toBe(401)
-    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(dbChainMockFns.update).not.toHaveBeenCalled()
   })
 })

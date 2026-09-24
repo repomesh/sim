@@ -197,20 +197,30 @@ export interface PostHogEventMap {
     skill_id: string
     skill_name: string
     workspace_id: string
-    source?: 'settings' | 'tool_input'
+    source?: 'settings' | 'tool_input' | 'api'
   }
 
   skill_updated: {
     skill_id: string
     skill_name: string
     workspace_id: string
-    source?: 'settings' | 'tool_input'
+    source?: 'settings' | 'tool_input' | 'api'
   }
 
   skill_deleted: {
     skill_id: string
     workspace_id: string
-    source?: 'settings' | 'tool_input'
+    source?: 'settings' | 'tool_input' | 'api'
+  }
+
+  skill_shared: {
+    skill_id: string
+    workspace_id: string
+  }
+
+  skill_unshared: {
+    skill_id: string
+    workspace_id: string
   }
 
   workspace_deleted: {
@@ -234,6 +244,12 @@ export interface PostHogEventMap {
     workflow_id: string
   }
 
+  deprecated_block_fix_clicked: {
+    block_type: string
+    workflow_id: string
+    kind: 'block' | 'model'
+  }
+
   knowledge_base_created: {
     knowledge_base_id: string
     workspace_id: string
@@ -249,7 +265,8 @@ export interface PostHogEventMap {
 
   knowledge_base_connector_added: {
     knowledge_base_id: string
-    workspace_id: string
+    workspace_id?: string
+    organization_id?: string
     connector_type: string
     sync_interval_minutes: number
   }
@@ -263,7 +280,8 @@ export interface PostHogEventMap {
 
   knowledge_base_connector_synced: {
     knowledge_base_id: string
-    workspace_id: string
+    workspace_id?: string
+    organization_id?: string
     connector_type: string
   }
 
@@ -318,25 +336,49 @@ export interface PostHogEventMap {
   }
 
   credential_connected: {
-    credential_type: 'oauth' | 'env_workspace' | 'env_personal' | 'service_account'
+    credential_type:
+      | 'oauth'
+      | 'managed_oauth'
+      | 'env_workspace'
+      | 'env_personal'
+      | 'service_account'
+      | 'personal_token'
     provider_id: string
     workspace_id: string
   }
 
   credential_deleted: {
-    credential_type: 'oauth' | 'env_workspace' | 'env_personal' | 'service_account'
+    credential_type:
+      | 'oauth'
+      | 'managed_oauth'
+      | 'env_workspace'
+      | 'env_personal'
+      | 'service_account'
+      | 'personal_token'
     provider_id: string
     workspace_id: string
   }
 
   credential_shared: {
-    credential_type: 'oauth' | 'env_workspace' | 'env_personal' | 'service_account'
+    credential_type:
+      | 'oauth'
+      | 'managed_oauth'
+      | 'env_workspace'
+      | 'env_personal'
+      | 'service_account'
+      | 'personal_token'
     role: 'admin' | 'member'
     workspace_id: string
   }
 
   credential_unshared: {
-    credential_type: 'oauth' | 'env_workspace' | 'env_personal' | 'service_account'
+    credential_type:
+      | 'oauth'
+      | 'managed_oauth'
+      | 'env_workspace'
+      | 'env_personal'
+      | 'service_account'
+      | 'personal_token'
     workspace_id: string
   }
 
@@ -374,7 +416,7 @@ export interface PostHogEventMap {
   }
 
   settings_tab_viewed: {
-    plane: 'account' | 'organization' | 'workspace'
+    plane: 'account' | 'organization' | 'selfhost' | 'workspace'
     section: string
   }
 
@@ -476,6 +518,16 @@ export interface PostHogEventMap {
     provider_id: string
   }
 
+  organization_byok_key_added: {
+    organization_id: string
+    provider_id: string
+  }
+
+  organization_byok_key_removed: {
+    organization_id: string
+    provider_id: string
+  }
+
   notification_channel_created: {
     workspace_id: string
     notification_type: 'webhook' | 'email' | 'slack'
@@ -491,6 +543,10 @@ export interface PostHogEventMap {
   }
 
   task_deleted: {
+    workspace_id: string
+  }
+
+  task_restored: {
     workspace_id: string
   }
 
@@ -537,6 +593,10 @@ export interface PostHogEventMap {
     block_type?: string
   }
 
+  slack_community_opened: {
+    source: 'help_menu'
+  }
+
   search_result_selected: {
     result_type:
       | 'block'
@@ -551,10 +611,8 @@ export interface PostHogEventMap {
       | 'table'
       | 'file'
       | 'knowledge_base'
+      | 'log'
       | 'page'
-      | 'docs'
-      | 'connected_account'
-      | 'integration'
       | 'action'
     query_length: number
     workspace_id: string
@@ -562,18 +620,16 @@ export interface PostHogEventMap {
     action_id?: string
   }
 
-  /** A home-page suggested action was clicked. `action_id` is the candidate id (e.g. `gmail-0`). */
+  /**
+   * A home-page suggested action was clicked. `action_id` is the candidate id
+   * (e.g. `integrate-gmail`).
+   */
   suggested_action_clicked: {
     workspace_id: string
     kind: 'prompt' | 'integration'
     action_id: string
     label: string
     position: number
-    connected_provider_count: number
-  }
-
-  suggested_actions_shuffled: {
-    workspace_id: string
     connected_provider_count: number
   }
 
@@ -608,10 +664,12 @@ export interface PostHogEventMap {
 
   folder_created: {
     workspace_id: string
+    resource_type?: string
   }
 
   folder_deleted: {
     workspace_id: string
+    resource_type?: string
   }
 
   folder_renamed: {
@@ -633,6 +691,7 @@ export interface PostHogEventMap {
   folder_restored: {
     folder_id: string
     workspace_id: string
+    resource_type?: string
   }
 
   logs_filter_applied: {
@@ -642,14 +701,6 @@ export interface PostHogEventMap {
 
   knowledge_base_document_deleted: {
     knowledge_base_id: string
-    workspace_id: string
-  }
-
-  scheduled_task_created: {
-    workspace_id: string
-  }
-
-  scheduled_task_deleted: {
     workspace_id: string
   }
 
@@ -675,6 +726,12 @@ export interface PostHogEventMap {
     is_self_removal: boolean
   }
 
+  /** A member the organization's identity provider created rather than a person. */
+  scim_user_provisioned: {
+    organization_id: string
+    created_account: boolean
+  }
+
   org_member_role_changed: {
     organization_id: string
     new_role: string
@@ -695,6 +752,20 @@ export interface PostHogEventMap {
     locked: boolean
   }
 
+  /** A workflow's fork-sync exclusion ("Exclude from sync") was toggled on or off. */
+  workflow_fork_sync_exclusion_toggled: {
+    workflow_id: string
+    workspace_id?: string
+    fork_sync_excluded: boolean
+  }
+
+  /** A batch of workflows was marked or unmarked "Exclude from sync" from the Forks settings. */
+  fork_excluded_workflows_updated: {
+    workspace_id: string
+    workflow_count: number
+    fork_sync_excluded: boolean
+  }
+
   workflow_schedule_created: {
     workflow_id: string
     workspace_id: string
@@ -705,9 +776,43 @@ export interface PostHogEventMap {
     workspace_id: string
   }
 
+  /**
+   * The workflow editor's error boundary caught a render or effect error and
+   * replaced the canvas with its fallback. `error_name` is what distinguishes
+   * the failure classes (`ChunkLoadError`, `TypeError`, a thrown config error),
+   * so it is the property to break down on.
+   */
+  workflow_canvas_crashed: {
+    error_name: string
+    error_message: string
+    component_stack?: string
+  }
+
+  /**
+   * The realtime socket has failed to connect enough times in a row to count as
+   * an outage rather than a hiccup. Emitted at most once per socket instance.
+   *
+   * A socket that cannot connect throws nothing, so exception capture never sees
+   * it. `socket_origin` separates the two causes that look identical to the
+   * user: the realtime service being unreachable, and this client resolving the
+   * wrong host — the latter shows up as an origin equal to the app's own.
+   */
+  realtime_connection_failing: {
+    socket_origin: string
+    expected_socket_origin_configured: boolean
+    attempts: number
+    reason: string
+  }
+
   /** A stored credential's plaintext secret was deliberately retrieved via the token API. */
   credential_used: {
-    credential_type: 'oauth' | 'env_workspace' | 'env_personal' | 'service_account'
+    credential_type:
+      | 'oauth'
+      | 'managed_oauth'
+      | 'env_workspace'
+      | 'env_personal'
+      | 'service_account'
+      | 'personal_token'
     provider_id: string
     workspace_id?: string
   }
@@ -762,7 +867,8 @@ export interface PostHogEventMap {
   enterprise_subscription_created: {
     reference_id: string
     seats: number
-    monthly_price: number
+    invoice_amount: number
+    billing_interval: 'month' | 'year'
     currency: string
   }
 

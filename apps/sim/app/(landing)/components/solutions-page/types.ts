@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import type { CodeWindowCommands } from '@/app/(landing)/components/shared/code-window-graphic/code-window-graphic'
 
 /**
  * Solutions-page configuration - the entire content contract a route passes to
@@ -89,6 +90,11 @@ export interface SolutionsCardRowConfig {
   title: string
   /** Supporting subtitle beneath the title, in the body color, naming "Sim". */
   subtitle: string
+  /**
+   * Optional second subtitle paragraph - a self-contained follow-on point that
+   * would overload {@link subtitle} if merged into it (e.g. self-hosting).
+   */
+  note?: string
   /** The row's single pill CTA. */
   cta: SolutionsPillCta
   /** The cards in this row - 3 or 4. The grid derives its columns from this length. */
@@ -128,4 +134,29 @@ export interface SolutionsPageConfig {
   hero: SolutionsHeroConfig
   /** Card rows rendered in order beneath the logos row. */
   rows: SolutionsCardRowConfig[]
+}
+
+/** A product demonstration with a short, visible caption. */
+export interface SolutionsProductFeatureConfig {
+  id: string
+  label: string
+  title: string
+  description: string
+  visual: ReactNode
+  visualSize?: 'default' | 'compact'
+  cta?: SolutionsPillCta
+}
+
+/** Product pages lead with an interactive demo and two supporting visual cards. */
+export interface SolutionsProductPageConfig extends Omit<SolutionsPageConfig, 'rows'> {
+  features: readonly SolutionsProductFeatureConfig[]
+  codeExample?: SolutionsProductCodeExampleConfig
+}
+
+/** A real CLI example accompanying the interactive product demonstrations. */
+export interface SolutionsProductCodeExampleConfig {
+  title: string
+  description: string
+  filename: string
+  commands: CodeWindowCommands
 }

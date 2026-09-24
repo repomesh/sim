@@ -5,6 +5,7 @@ import type { ToolConfig } from '@/tools/types'
 export const gitlabGetPipelineTool: ToolConfig<GitLabGetPipelineParams, GitLabGetPipelineResponse> =
   {
     id: 'gitlab_get_pipeline',
+    personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
     name: 'GitLab Get Pipeline',
     description: 'Get details of a specific GitLab pipeline',
     version: '1.0.0',
@@ -26,7 +27,7 @@ export const gitlabGetPipelineTool: ToolConfig<GitLabGetPipelineParams, GitLabGe
         type: 'string',
         required: true,
         visibility: 'user-or-llm',
-        description: 'Project ID or URL-encoded path',
+        description: 'Project ID or path (e.g. mygroup/myproject)',
       },
       pipelineId: {
         type: 'number',

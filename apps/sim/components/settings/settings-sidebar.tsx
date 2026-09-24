@@ -1,11 +1,45 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
-import { ChipConfirmModal, chipVariants, cn, Tooltip } from '@sim/emcn'
-import { ChevronDown } from '@sim/emcn/icons'
+import { type ComponentType, useRef } from 'react'
+import {
+  Chip,
+  ChipConfirmModal,
+  ChipTag,
+  chipContentIconClass,
+  chipVariants,
+  cn,
+  OverflowText,
+  SimWordmark,
+  scrollFadeAttributes,
+  scrollFadeClass,
+  useScrollEdges,
+} from '@sim/emcn'
+import { ArrowUpRight, ChevronLeft } from '@sim/emcn/icons'
 import { useRouter } from 'next/navigation'
-import type { SettingsNavigationItem, SettingsSection } from '@/components/settings/navigation'
+import {
+  SETTINGS_PLANE_CHROME,
+  type SettingsNavigationItem,
+  type SettingsSection,
+  type StandaloneSettingsPlane,
+} from '@/components/settings/navigation'
+import { SettingsIntentLink } from '@/components/settings/settings-intent-link'
+import { APP_ENTRY_PATH } from '@/lib/navigation/paths'
+import { SidebarSection } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/sidebar-section'
+import { SidebarTooltip } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/sidebar-tooltip'
+import {
+  SIDEBAR_DIVIDER_PAD_ABOVE_CLASS,
+  SIDEBAR_DIVIDER_PAD_BELOW_CLASS,
+  SIDEBAR_ITEM_GAP_CLASS,
+  SIDEBAR_RAIL_CHIP_CLASS,
+  SIDEBAR_SECTION_GAP_CLASS,
+} from '@/app/workspace/[workspaceId]/w/components/sidebar/constants'
 import { useSettingsDirtyStore } from '@/stores/settings/dirty/store'
+
+/**
+ * The marketing landing page. `?home` is required: the proxy bounces a
+ * signed-in user off `/` to the app entry unless the param is present.
+ */
+const LANDING_HREF = '/?home'
 
 interface SettingsNavigationGroup {
   key: string
@@ -17,42 +51,42 @@ interface SidebarSettingsItem<Section extends SettingsSection>
   locked?: boolean
 }
 
-interface SettingsSidebarProps<Section extends SettingsSection> {
-  activeSection: string
-  backHref: string
-  groups: readonly SettingsNavigationGroup[]
-  hrefForSection: (section: Section) => string
-  items: readonly SidebarSettingsItem<Section>[]
-  isCollapsed?: boolean
-  showCollapsedTooltips?: boolean
+/**
+ * A row that leads out of these settings rather than to a section of them —
+ * drawn like the workspace sidebar's Organization row, with the up-right arrow.
+ * Rendered after its group's sections.
+ */
+export interface SettingsSidebarOutboundLink {
+  id: string
+  group: string
+  label: string
+  icon: ComponentType<{ className?: string }>
 }
 
-function SidebarTooltip({
-  children,
-  label,
-  enabled,
-}: {
-  children: React.ReactElement
-  label: string
-  enabled: boolean
-}) {
-  if (!enabled) return children
-  return (
-    <Tooltip.Root>
-      <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
-      <Tooltip.Content side='right'>{label}</Tooltip.Content>
-    </Tooltip.Root>
-  )
+interface SettingsSidebarProps<Section extends SettingsSection> {
+  activeSection: string
+  plane: StandaloneSettingsPlane
+  groups: readonly SettingsNavigationGroup[]
+  hrefForSection: (section: Section) => string
+  onSectionIntent?: (section: Section) => void
+  items: readonly SidebarSettingsItem<Section>[]
+  outboundLinks?: readonly SettingsSidebarOutboundLink[]
+  isCollapsed?: boolean
+  showCollapsedTooltips?: boolean
+  backHref?: string
 }
 
 export function SettingsSidebar<Section extends SettingsSection>({
   activeSection,
-  backHref,
+  plane,
   groups,
   hrefForSection,
+  onSectionIntent,
   items,
+  outboundLinks = [],
   isCollapsed = false,
   showCollapsedTooltips = false,
+  backHref = APP_ENTRY_PATH,
 }: SettingsSidebarProps<Section>) {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const scrollContentRef = useRef<HTMLDivElement>(null)
@@ -62,97 +96,153 @@ export function SettingsSidebar<Section extends SettingsSection>({
   const confirmLeave = useSettingsDirtyStore((state) => state.confirmLeave)
   const cancelLeave = useSettingsDirtyStore((state) => state.cancelLeave)
   const pendingLeave = useSettingsDirtyStore((state) => state.pendingLeave)
-  const [hasOverflowTop, setHasOverflowTop] = useState(false)
-
-  useEffect(() => {
-    const container = scrollContainerRef.current
-    if (!container) return
-    const updateScrollState = () => setHasOverflowTop(container.scrollTop > 1)
-    updateScrollState()
-    container.addEventListener('scroll', updateScrollState, { passive: true })
-    const observer = new ResizeObserver(updateScrollState)
-    observer.observe(container)
-    if (scrollContentRef.current) observer.observe(scrollContentRef.current)
-    return () => {
-      container.removeEventListener('scroll', updateScrollState)
-      observer.disconnect()
-    }
-  }, [isCollapsed])
+  const scrollEdges = useScrollEdges(scrollContainerRef, {
+    contentRef: scrollContentRef,
+    enabled: !isCollapsed,
+  })
 
   return (
     <>
-      <div className='flex flex-shrink-0 flex-col gap-0.5 px-2 pb-1.5'>
-        <SidebarTooltip label='Back' enabled={showCollapsedTooltips}>
+      {/* The divider is the pinned block's bottom rule, not the scroll region's top one:
+          the region's edge fade masks its own first pixels, which would erase a rule
+          drawn there exactly when it should show. Same construction as the footer. */}
+      <div
+        className={cn(
+          plane === 'organization' && SIDEBAR_SECTION_GAP_CLASS,
+          SIDEBAR_ITEM_GAP_CLASS,
+          SIDEBAR_DIVIDER_PAD_ABOVE_CLASS,
+          'flex shrink-0 flex-col border-b px-2 transition-colors duration-150',
+          !scrollEdges.top && 'border-transparent'
+        )}
+      >
+        {/* Both stay buttons, not Links: leaving settings must run the unsaved-changes guard. */}
+        {SETTINGS_PLANE_CHROME[plane].showWordmark ? (
           <button
             type='button'
-            onClick={() => requestLeave(() => router.push(backHref))}
-            className={chipVariants({ fullWidth: true })}
+            aria-label='Sim home'
+            onClick={() => requestLeave(() => router.push(LANDING_HREF))}
+            className='flex h-[30px] shrink-0 items-center px-2 transition-opacity hover:opacity-70'
           >
-            <div className='flex size-[16px] flex-shrink-0 items-center justify-center text-[var(--text-icon)]'>
-              <ChevronDown className='size-[10px] rotate-90' />
-            </div>
-            <span className='sidebar-collapse-hide truncate text-[var(--text-body)]'>Back</span>
+            <SimWordmark />
           </button>
-        </SidebarTooltip>
+        ) : (
+          <SidebarTooltip label='Back' enabled={showCollapsedTooltips}>
+            <Chip
+              fullWidth
+              leftIcon={ChevronLeft}
+              className={SIDEBAR_RAIL_CHIP_CLASS}
+              onClick={() => requestLeave(() => router.push(backHref))}
+            >
+              <span className='sidebar-collapse-hide'>Back</span>
+            </Chip>
+          </SidebarTooltip>
+        )}
       </div>
 
       <div
         ref={isCollapsed ? undefined : scrollContainerRef}
         className={cn(
-          'flex flex-1 flex-col overflow-y-auto overflow-x-hidden border-t pt-1.5 transition-colors duration-150',
-          !hasOverflowTop && 'border-transparent'
+          SIDEBAR_DIVIDER_PAD_BELOW_CLASS,
+          SIDEBAR_DIVIDER_PAD_ABOVE_CLASS,
+          scrollFadeClass,
+          'flex flex-1 flex-col overflow-y-auto overflow-x-hidden'
         )}
+        {...scrollFadeAttributes(scrollEdges)}
       >
         <div ref={scrollContentRef} className='flex flex-col'>
           {groups
             .map((group) => ({
               ...group,
               items: items.filter((item) => item.group === group.key),
+              links: outboundLinks.filter((link) => link.group === group.key),
             }))
-            .filter((group) => group.items.length > 0)
+            .filter((group) => group.items.length > 0 || group.links.length > 0)
             .map((group, index) => (
-              <div
+              <SidebarSection
                 key={group.key}
-                className={cn(index > 0 && 'mt-6', 'flex flex-shrink-0 flex-col')}
+                title={group.title}
+                railCollapsed={isCollapsed}
+                className={cn(index > 0 && SIDEBAR_SECTION_GAP_CLASS, 'shrink-0')}
               >
-                <div className='px-4 pb-2'>
-                  <div className='text-[var(--text-muted)] text-small'>{group.title}</div>
-                </div>
-                <div className='flex flex-col gap-0.5 px-2'>
+                <div className={cn(SIDEBAR_ITEM_GAP_CLASS, 'flex flex-col px-2')}>
                   {group.items.map((item) => {
                     const Icon = item.icon
                     const active = activeSection === item.id
+                    const href = hrefForSection(item.id)
                     return (
                       <SidebarTooltip
                         key={item.id}
                         label={item.label}
                         enabled={showCollapsedTooltips}
                       >
-                        <button
-                          type='button'
-                          className={chipVariants({ active, fullWidth: true })}
-                          onClick={() => {
-                            if (active) return
-                            requestLeave(() => {
-                              router.replace(hrefForSection(item.id), { scroll: false })
-                            })
+                        <SettingsIntentLink
+                          href={href}
+                          replace
+                          scroll={false}
+                          aria-current={active ? 'page' : undefined}
+                          onIntent={() => {
+                            if (!active) onSectionIntent?.(item.id)
+                          }}
+                          className={cn(
+                            chipVariants({ active, fullWidth: true }),
+                            SIDEBAR_RAIL_CHIP_CLASS
+                          )}
+                          onNavigate={(event) => {
+                            if (active) {
+                              event.preventDefault()
+                              return
+                            }
+                            const { isDirty, navigationBlocked } = useSettingsDirtyStore.getState()
+                            if (!isDirty && !navigationBlocked) return
+                            event.preventDefault()
+                            requestLeave(() => router.replace(href, { scroll: false }))
                           }}
                         >
-                          <Icon className='size-[16px] flex-shrink-0 text-[var(--text-icon)]' />
-                          <span className='sidebar-collapse-hide min-w-0 truncate text-[var(--text-body)]'>
-                            {item.label}
-                          </span>
+                          <Icon className={chipContentIconClass} />
+                          <OverflowText
+                            label={item.label}
+                            className='sidebar-collapse-hide text-[var(--text-body)]'
+                            tooltipEnabled={!showCollapsedTooltips}
+                          />
                           {item.locked && (
-                            <span className='sidebar-collapse-hide ml-auto shrink-0 rounded-[3px] bg-[var(--surface-5)] px-1 py-[1px] font-medium text-[var(--text-icon)] text-micro uppercase tracking-wide'>
+                            <ChipTag
+                              variant='mono'
+                              className='sidebar-collapse-hide ml-auto shrink-0'
+                            >
                               Plan
-                            </span>
+                            </ChipTag>
                           )}
+                        </SettingsIntentLink>
+                      </SidebarTooltip>
+                    )
+                  })}
+                  {group.links.map((link) => {
+                    const Icon = link.icon
+                    return (
+                      <SidebarTooltip
+                        key={link.id}
+                        label={link.label}
+                        enabled={showCollapsedTooltips}
+                      >
+                        <button
+                          type='button'
+                          className={cn(chipVariants({ fullWidth: true }), SIDEBAR_RAIL_CHIP_CLASS)}
+                        >
+                          <Icon className={chipContentIconClass} />
+                          <OverflowText
+                            label={link.label}
+                            className='sidebar-collapse-hide text-[var(--text-body)]'
+                            tooltipEnabled={!showCollapsedTooltips}
+                          />
+                          <ArrowUpRight
+                            className={cn('sidebar-collapse-hide ml-auto', chipContentIconClass)}
+                          />
                         </button>
                       </SidebarTooltip>
                     )
                   })}
                 </div>
-              </div>
+              </SidebarSection>
             ))}
         </div>
       </div>

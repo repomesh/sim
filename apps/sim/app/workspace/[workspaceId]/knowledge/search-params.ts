@@ -1,5 +1,6 @@
 import { parseAsArrayOf, parseAsString } from 'nuqs/server'
 import { createSortParams } from '@/lib/url-state'
+import type { ResourceListPreferenceConfig } from '@/stores/resource-list-preferences'
 
 /** Sortable knowledge base columns, matching the `Resource.Options` sort menu. */
 export const KNOWLEDGE_SORT_COLUMNS = [
@@ -27,8 +28,8 @@ export const knowledgeSortParams = createSortParams(KNOWLEDGE_SORT_COLUMNS, {
  *
  * - `search` is the knowledge base name/description filter. The input is
  *   controlled directly by the instant nuqs value; only its URL write is
- *   debounced via `limitUrlUpdates` (`debounce`) on the setter — never written
- *   on every keystroke.
+ *   debounced via `useDebouncedSearchSetter` — never written on every
+ *   keystroke.
  * - `connector` filters by connector presence; `content` filters by document
  *   presence; `owner` filters by creator id. All are multi-select arrays.
  *
@@ -42,6 +43,16 @@ export const knowledgeParsers = {
   content: parseAsArrayOf(parseAsString).withDefault([]),
   owner: parseAsArrayOf(parseAsString).withDefault([]),
 } as const
+
+export const knowledgeListPreferenceConfig = {
+  module: 'knowledge',
+  sortColumns: KNOWLEDGE_SORT_COLUMNS,
+  filterKeys: ['connector', 'content', 'owner'],
+  defaultPreference: {
+    sort: knowledgeSortParams.default,
+    filters: { connector: [], content: [], owner: [] },
+  },
+} as const satisfies ResourceListPreferenceConfig
 
 /** Filter/search/sort view-state: clean URLs, no back-stack churn. */
 export const knowledgeUrlKeys = {

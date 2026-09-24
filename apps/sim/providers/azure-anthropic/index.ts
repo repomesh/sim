@@ -32,7 +32,11 @@ export const azureAnthropicProvider: ProviderConfig = {
     let pinnedFetch: typeof fetch | undefined
     let pinnedIP: string | undefined
     if (userProvidedEndpoint) {
-      const validation = await validateUrlWithDNS(userProvidedEndpoint, 'azureEndpoint')
+      const validation = await validateUrlWithDNS(
+        userProvidedEndpoint,
+        'azureEndpoint',
+        'configuredEndpoint'
+      )
       if (!validation.isValid) {
         logger.warn('Blocked SSRF attempt via azureEndpoint', {
           endpoint: userProvidedEndpoint,
@@ -40,11 +44,8 @@ export const azureAnthropicProvider: ProviderConfig = {
         })
         throw new Error(`Invalid Azure Anthropic endpoint: ${validation.error}`)
       }
-      if (!validation.resolvedIP) {
-        throw new Error('Invalid Azure Anthropic endpoint: could not resolve a pinnable IP address')
-      }
       pinnedIP = validation.resolvedIP
-      pinnedFetch = createPinnedFetch(pinnedIP)
+      pinnedFetch = createPinnedFetch(pinnedIP, { profile: 'configuredEndpoint' })
     }
 
     const apiKey = request.apiKey
@@ -52,53 +53,40 @@ export const azureAnthropicProvider: ProviderConfig = {
       throw new Error('API key is required for Azure Anthropic.')
     }
 
-    // Strip the azure-anthropic/ prefix from the model name if present
-    const modelName = request.model.replace(/^azure-anthropic\//, '')
-
-    // Azure AI Foundry hosts Anthropic models at {endpoint}/anthropic
-    // The SDK appends /v1/messages automatically
-    const baseURL = `${azureEndpoint.replace(/\/$/, '')}/anthropic`
+    const normalizedEndpoint = azureEndpoint.replace(/\/$/, '')
+    const baseURL = normalizedEndpoint.endsWith('/anthropic')
+      ? normalizedEndpoint
+      : `${normalizedEndpoint}/anthropic`
 
     const anthropicVersion =
       request.azureApiVersion || env.AZURE_ANTHROPIC_API_VERSION || '2023-06-01'
 
-    return executeAnthropicProviderRequest(
-      {
-        ...request,
-        model: modelName,
-        apiKey,
+    return executeAnthropicProviderRequest(request, {
+      providerId: 'azure-anthropic',
+      providerLabel: 'Azure Anthropic',
+      resolveWireModel: ({ model }) => model.replace(/^azure-anthropic\//i, ''),
+      createClient: (apiKey) => {
+        const cacheKey = [
+          'azure-anthropic',
+          apiKey,
+          baseURL,
+          anthropicVersion,
+          pinnedIP ?? 'no-pin',
+        ].join('::')
+        return getCachedProviderClient(
+          cacheKey,
+          () =>
+            new Anthropic({
+              baseURL,
+              apiKey,
+              ...(pinnedFetch ? { fetch: pinnedFetch } : {}),
+              defaultHeaders: {
+                'anthropic-version': anthropicVersion,
+              },
+            })
+        )
       },
-      {
-        providerId: 'azure-anthropic',
-        providerLabel: 'Azure Anthropic',
-        createClient: (apiKey, useNativeStructuredOutputs) => {
-          const cacheKey = [
-            'azure-anthropic',
-            apiKey,
-            baseURL,
-            anthropicVersion,
-            pinnedIP ?? 'no-pin',
-            useNativeStructuredOutputs ? 'beta' : 'default',
-          ].join('::')
-          return getCachedProviderClient(
-            cacheKey,
-            () =>
-              new Anthropic({
-                baseURL,
-                apiKey,
-                ...(pinnedFetch ? { fetch: pinnedFetch } : {}),
-                defaultHeaders: {
-                  'api-key': apiKey,
-                  'anthropic-version': anthropicVersion,
-                  ...(useNativeStructuredOutputs
-                    ? { 'anthropic-beta': 'structured-outputs-2025-11-13' }
-                    : {}),
-                },
-              })
-          )
-        },
-        logger,
-      }
-    )
+      logger,
+    })
   },
 }

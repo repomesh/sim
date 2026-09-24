@@ -15,8 +15,7 @@ import {
   Label,
   languages,
 } from '@sim/emcn'
-import { Trash } from '@sim/emcn/icons'
-import { Plus, X } from 'lucide-react'
+import { Plus, Trash, X } from '@sim/emcn/icons'
 import Editor from 'react-simple-code-editor'
 import { useShallow } from 'zustand/react/shallow'
 import { validateName } from '@/lib/core/utils/validation'
@@ -119,7 +118,7 @@ function VariableHeader({
       aria-controls={`variable-content-${variable.id}`}
     >
       <div className='flex min-w-0 flex-1 items-center gap-2'>
-        <span className='block truncate font-medium text-[var(--text-tertiary)] text-sm'>
+        <span className='block truncate text-[var(--text-tertiary)] text-sm'>
           {variable.name || `Variable ${index + 1}`}
         </span>
         {variable.name && (
@@ -171,7 +170,7 @@ function VariableValueInput({ variable, onUpdate, readOnly }: VariableValueInput
           {Array.from({ length: lineCount }, (_, i) => (
             <div
               key={i}
-              className='font-medium font-mono text-[var(--text-muted)] text-xs'
+              className='font-mono text-[var(--text-muted)] text-xs'
               style={{ height: `${LINE_HEIGHT}px`, lineHeight: `${LINE_HEIGHT}px` }}
             >
               {i + 1}
@@ -450,18 +449,17 @@ export function Variables({ readOnly = false }: VariablesProps) {
       {/* Header (drag handle) */}
       <div
         role='presentation'
-        className='flex h-[32px] flex-shrink-0 cursor-grab items-center justify-between bg-[var(--surface-1)] p-0 active:cursor-grabbing'
+        className='flex h-[32px] shrink-0 cursor-grab items-center justify-between bg-[var(--surface-1)] p-0 active:cursor-grabbing'
         onMouseDown={handleMouseDown}
       >
         <div className='flex items-center'>
-          <span className='flex-shrink-0 font-medium text-[var(--text-primary)] text-sm'>
-            Variables
-          </span>
+          <span className='shrink-0 text-[var(--text-primary)] text-sm'>Variables</span>
         </div>
         <div className='flex items-center gap-2'>
           <Button
             variant='ghost'
-            className='!p-1.5 -m-1.5'
+            iconPadding='md'
+            className='-m-1.5'
             onClick={(e) => {
               e.stopPropagation()
               handleAddVariable()
@@ -473,7 +471,8 @@ export function Variables({ readOnly = false }: VariablesProps) {
           </Button>
           <Button
             variant='ghost'
-            className='!p-1.5 -m-1.5'
+            iconPadding='md'
+            className='-m-1.5'
             onClick={handleClose}
             aria-label='Close variables panel'
           >

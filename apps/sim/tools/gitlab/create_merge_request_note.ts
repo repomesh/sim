@@ -10,6 +10,7 @@ export const gitlabCreateMergeRequestNoteTool: ToolConfig<
   GitLabCreateNoteResponse
 > = {
   id: 'gitlab_create_merge_request_note',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Create Merge Request Comment',
   description: 'Add a comment to a GitLab merge request',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabCreateMergeRequestNoteTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     mergeRequestIid: {
       type: 'number',
@@ -45,6 +46,12 @@ export const gitlabCreateMergeRequestNoteTool: ToolConfig<
       visibility: 'user-or-llm',
       description: 'Comment body (Markdown supported)',
     },
+    internal: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Create the comment as an internal note visible only to project members',
+    },
   },
 
   request: {
@@ -57,9 +64,11 @@ export const gitlabCreateMergeRequestNoteTool: ToolConfig<
       'Content-Type': 'application/json',
       'PRIVATE-TOKEN': params.accessToken,
     }),
-    body: (params) => ({
-      body: params.body,
-    }),
+    body: (params) => {
+      const body: Record<string, unknown> = { body: params.body }
+      if (params.internal !== undefined) body.internal = params.internal
+      return body
+    },
   },
 
   transformResponse: async (response) => {

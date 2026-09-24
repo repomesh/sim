@@ -1,9 +1,11 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import { AzureOpenAI } from 'openai'
 import type {
   ChatCompletion,
   ChatCompletionContentPart,
+  ChatCompletionCreateParams,
   ChatCompletionCreateParamsBase,
   ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
@@ -25,9 +27,25 @@ import {
   isChatCompletionsEndpoint,
   isResponsesEndpoint,
 } from '@/providers/azure-openai/utils'
+import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
+import {
+  getNativeConversationMessage,
+  retainConversationMessageSource,
+} from '@/providers/conversation-metadata'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
 import { executeResponsesProviderRequest } from '@/providers/openai/core'
+import { getChatCompletionConversationUsage } from '@/providers/openai-compat/conversation-usage'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
 import type {
@@ -40,11 +58,14 @@ import type {
 import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
+
+/** `verbosity` narrowed from `string` to a literal union in openai v5. */
+type ChatCompletionVerbosity = NonNullable<ChatCompletionCreateParams['verbosity']>
 
 const logger = createLogger('AzureOpenAIProvider')
 
@@ -97,6 +118,16 @@ async function executeChatCompletionsRequest(
 
   if (request.messages) {
     for (const message of request.messages) {
+      const nativeMessage = getNativeConversationMessage(message, 'chat-completions')
+      if (nativeMessage && typeof nativeMessage === 'object' && !Array.isArray(nativeMessage)) {
+        allMessages.push(
+          retainConversationMessageSource(message, {
+            ...message,
+            ...nativeMessage,
+          } as ChatCompletionMessageParam)
+        )
+        continue
+      }
       if (!message.files?.length || message.role !== 'user') {
         allMessages.push(message as ChatCompletionMessageParam)
         continue
@@ -116,7 +147,12 @@ async function executeChatCompletionsRequest(
         parts.push({ type: 'image_url', image_url: { url: a.remoteUrl ?? a.dataUrl ?? '' } })
       }
       const { files: _files, ...rest } = message
-      allMessages.push({ ...rest, content: parts } as ChatCompletionMessageParam)
+      allMessages.push(
+        retainConversationMessageSource(message, {
+          ...rest,
+          content: parts,
+        } as ChatCompletionMessageParam)
+      )
     }
   }
 
@@ -135,7 +171,7 @@ async function executeChatCompletionsRequest(
   if (request.reasoningEffort !== undefined && request.reasoningEffort !== 'auto')
     payload.reasoning_effort = request.reasoningEffort as ReasoningEffort
   if (request.verbosity !== undefined && request.verbosity !== 'auto')
-    payload.verbosity = request.verbosity
+    payload.verbosity = request.verbosity as ChatCompletionVerbosity
 
   if (request.responseFormat) {
     payload.response_format = {
@@ -190,7 +226,7 @@ async function executeChatCompletionsRequest(
         stream_options: { include_usage: true },
       }
       const streamResponse = await azureOpenAI.chat.completions.create(
-        streamingParams,
+        await prepareConversationGeneration(request, 'chat-completions', streamingParams),
         request.abortSignal ? { signal: request.abortSignal } : undefined
       )
 
@@ -201,28 +237,33 @@ async function executeChatCompletionsRequest(
         timing: { kind: 'simple', segmentName: request.model },
         initialTokens: { input: 0, output: 0, total: 0 },
         initialCost: { input: 0, output: 0, total: 0 },
+        streamFormat: 'agent-events-v1',
         createStream: ({ output, finalizeTiming }) =>
-          createReadableStreamFromAzureOpenAIStream(streamResponse, (content, usage) => {
-            output.content = content
-            output.tokens = {
-              input: usage.prompt_tokens,
-              output: usage.completion_tokens,
-              total: usage.total_tokens,
-            }
+          createReadableStreamFromAzureOpenAIStream(
+            streamResponse,
+            (content, usage) => {
+              output.content = content
+              output.tokens = {
+                input: usage.prompt_tokens,
+                output: usage.completion_tokens,
+                total: usage.total_tokens,
+              }
 
-            const costResult = calculateCost(
-              request.model,
-              usage.prompt_tokens,
-              usage.completion_tokens
-            )
-            output.cost = {
-              input: costResult.input,
-              output: costResult.output,
-              total: costResult.total,
-            }
+              const costResult = calculateCost(
+                request.model,
+                usage.prompt_tokens,
+                usage.completion_tokens
+              )
+              output.cost = {
+                input: costResult.input,
+                output: costResult.output,
+                total: costResult.total,
+              }
 
-            finalizeTiming()
-          }),
+              finalizeTiming()
+            },
+            request
+          ),
       })
 
       return streamingResult
@@ -234,9 +275,17 @@ async function executeChatCompletionsRequest(
     let usedForcedTools: string[] = []
 
     let currentResponse = (await azureOpenAI.chat.completions.create(
-      payload,
+      await prepareConversationGeneration(request, 'chat-completions', payload),
       request.abortSignal ? { signal: request.abortSignal } : undefined
     )) as ChatCompletion
+    if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+      await captureProviderConversationStep(
+        request,
+        'chat-completions',
+        currentResponse.choices[0]?.message,
+        getChatCompletionConversationUsage(currentResponse.usage)
+      )
+    }
     const firstResponseTime = Date.now() - initialCallTime
 
     let content = currentResponse.choices[0]?.message?.content || ''
@@ -266,7 +315,7 @@ async function executeChatCompletionsRequest(
     enrichLastModelSegmentFromChatCompletions(
       timeSegments,
       currentResponse,
-      currentResponse.choices[0]?.message?.tool_calls,
+      currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
       { model: request.model, provider: 'azure_openai' }
     )
 
@@ -285,7 +334,8 @@ async function executeChatCompletionsRequest(
         content = currentResponse.choices[0].message.content
       }
 
-      const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+      const toolCallsInResponse =
+        currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
       if (!toolCallsInResponse || toolCallsInResponse.length === 0) {
         break
       }
@@ -296,32 +346,78 @@ async function executeChatCompletionsRequest(
 
       const toolsStartTime = Date.now()
 
+      await captureProviderConversationStep(
+        request,
+        'chat-completions',
+        currentResponse.choices[0]?.message,
+        getChatCompletionConversationUsage(currentResponse.usage)
+      )
       const toolExecutionPromises = toolCallsInResponse.map(async (toolCall) => {
         const toolCallStartTime = Date.now()
         const toolName = toolCall.function.name
 
         try {
-          const toolArgs = JSON.parse(toolCall.function.arguments)
+          const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
           const tool = request.tools?.find((t) => t.id === toolName)
 
-          if (!tool) return null
+          if (!tool) {
+            await recordProviderConversationToolError(
+              request,
+              toolCall.id,
+              toolName,
+              `Tool "${toolName}" is not available`
+            )
+            const toolCallEndTime = Date.now()
+            return {
+              toolCall,
+              toolName,
+              toolParams: {},
+              result: {
+                success: false,
+                output: undefined,
+                error: `Tool "${toolName}" is not available`,
+              },
+              startTime: toolCallStartTime,
+              endTime: toolCallEndTime,
+              duration: toolCallEndTime - toolCallStartTime,
+            }
+          }
 
-          const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-          const result = await executeTool(toolName, executionParams, {
-            signal: request.abortSignal,
-          })
+          const { toolParams, executionParams } = prepareToolExecution(
+            tool,
+            toolArgs,
+            request,
+            toolCall.id
+          )
+          const { rawResponse, modelResponse } = await executeProviderTool(
+            toolName,
+            executionParams,
+            {
+              signal: request.abortSignal,
+            }
+          )
           const toolCallEndTime = Date.now()
 
           return {
             toolCall,
             toolName,
             toolParams,
-            result,
+            result: rawResponse,
+            modelResult: modelResponse,
             startTime: toolCallStartTime,
             endTime: toolCallEndTime,
             duration: toolCallEndTime - toolCallStartTime,
           }
         } catch (error) {
+          if (isAbortError(error) || request.abortSignal?.aborted) {
+            throw error
+          }
+          await recordProviderConversationToolError(
+            request,
+            toolCall.id,
+            toolName,
+            getErrorMessage(error, 'Tool execution failed')
+          )
           const toolCallEndTime = Date.now()
           logger.error('Error processing tool call:', { error, toolName })
 
@@ -341,7 +437,7 @@ async function executeChatCompletionsRequest(
         }
       })
 
-      const executionResults = await Promise.allSettled(toolExecutionPromises)
+      const executionResults = await Promise.all(toolExecutionPromises)
 
       currentMessages.push({
         role: 'assistant',
@@ -356,11 +452,11 @@ async function executeChatCompletionsRequest(
         })),
       })
 
-      for (const settledResult of executionResults) {
-        if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+      for (const executionResult of executionResults) {
         const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-          settledResult.value
+          executionResult
+        const modelResult =
+          'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
         timeSegments.push({
           type: 'tool',
@@ -370,10 +466,12 @@ async function executeChatCompletionsRequest(
           duration: duration,
         })
 
-        let resultContent: Record<string, unknown>
+        let resultContent: unknown
         if (result.success) {
-          toolResults.push(result.output as Record<string, unknown>)
-          resultContent = result.output as Record<string, unknown>
+          if (isRecordLike(result.output)) {
+            toolResults.push(result.output)
+          }
+          resultContent = result.output ?? null
         } else {
           resultContent = {
             error: true,
@@ -381,6 +479,13 @@ async function executeChatCompletionsRequest(
             tool: toolName,
           }
         }
+        const modelResultContent = modelResult.success
+          ? (modelResult.output ?? null)
+          : {
+              error: true,
+              message: modelResult.error || 'Tool execution failed',
+              tool: toolName,
+            }
 
         toolCalls.push({
           name: toolName,
@@ -395,7 +500,7 @@ async function executeChatCompletionsRequest(
         currentMessages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify(resultContent),
+          content: JSON.stringify(modelResultContent),
         })
       }
 
@@ -424,9 +529,17 @@ async function executeChatCompletionsRequest(
 
       const nextModelStartTime = Date.now()
       currentResponse = (await azureOpenAI.chat.completions.create(
-        nextPayload,
+        await prepareConversationGeneration(request, 'chat-completions', nextPayload),
         request.abortSignal ? { signal: request.abortSignal } : undefined
       )) as ChatCompletion
+      if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
+      }
 
       const nextCheckResult = checkForForcedToolUsage(
         currentResponse,
@@ -452,7 +565,7 @@ async function executeChatCompletionsRequest(
       enrichLastModelSegmentFromChatCompletions(
         timeSegments,
         currentResponse,
-        currentResponse.choices[0]?.message?.tool_calls,
+        currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
         { model: request.model, provider: 'azure_openai' }
       )
 
@@ -471,24 +584,64 @@ async function executeChatCompletionsRequest(
       iterationCount++
     }
 
+    if (
+      iterationCount === MAX_TOOL_ITERATIONS &&
+      currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)?.length
+    ) {
+      /**
+       * The capped turn still requests tools, so make one tool-disabled call to
+       * synthesize an answer from the tool results already gathered.
+       */
+      const { tools: _tools, tool_choice: _toolChoice, ...synthesisPayload } = payload
+      const synthesisStartTime = Date.now()
+      const synthesisResponse = (await azureOpenAI.chat.completions.create(
+        await prepareConversationGeneration(request, 'chat-completions', {
+          ...synthesisPayload,
+          messages: currentMessages,
+        }),
+        request.abortSignal ? { signal: request.abortSignal } : undefined
+      )) as ChatCompletion
+      if (!synthesisResponse.choices[0]?.message?.tool_calls?.length) {
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          synthesisResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(synthesisResponse.usage)
+        )
+      }
+      const synthesisEndTime = Date.now()
+
+      timeSegments.push({
+        type: 'model',
+        name: 'Final answer after tool limit',
+        startTime: synthesisStartTime,
+        endTime: synthesisEndTime,
+        duration: synthesisEndTime - synthesisStartTime,
+      })
+      modelTime += synthesisEndTime - synthesisStartTime
+
+      content = synthesisResponse.choices[0]?.message?.content || content
+      if (synthesisResponse.usage) {
+        tokens.input += synthesisResponse.usage.prompt_tokens || 0
+        tokens.output += synthesisResponse.usage.completion_tokens || 0
+        tokens.total += synthesisResponse.usage.total_tokens || 0
+      }
+
+      enrichLastModelSegmentFromChatCompletions(
+        timeSegments,
+        synthesisResponse,
+        synthesisResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+        { model: request.model, provider: 'azure_openai' }
+      )
+    }
+
     if (request.stream) {
-      logger.info('Using streaming for final response after tool processing')
+      logger.info('Projecting settled response after tool processing')
 
       const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+      const toolCost = sumToolCosts(toolResults)
 
-      const streamingParams: ChatCompletionCreateParamsStreaming = {
-        ...payload,
-        messages: currentMessages,
-        tool_choice: 'auto',
-        stream: true,
-        stream_options: { include_usage: true },
-      }
-      const streamResponse = await azureOpenAI.chat.completions.create(
-        streamingParams,
-        request.abortSignal ? { signal: request.abortSignal } : undefined
-      )
-
-      const streamingResult = createStreamingExecution({
+      return createStreamingExecution({
         model: request.model,
         providerStartTime,
         providerStartTimeISO,
@@ -497,7 +650,7 @@ async function executeChatCompletionsRequest(
           modelTime,
           toolsTime,
           firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments,
         },
         initialTokens: {
@@ -508,7 +661,8 @@ async function executeChatCompletionsRequest(
         initialCost: {
           input: accumulatedCost.input,
           output: accumulatedCost.output,
-          total: accumulatedCost.total,
+          toolCost: toolCost || undefined,
+          total: accumulatedCost.total + toolCost,
         },
         toolCalls:
           toolCalls.length > 0
@@ -517,33 +671,13 @@ async function executeChatCompletionsRequest(
                 count: toolCalls.length,
               }
             : undefined,
-        createStream: ({ output, finalizeTiming }) =>
-          createReadableStreamFromAzureOpenAIStream(streamResponse, (content, usage) => {
-            output.content = content
-            output.tokens = {
-              input: tokens.input + usage.prompt_tokens,
-              output: tokens.output + usage.completion_tokens,
-              total: tokens.total + usage.total_tokens,
-            }
-
-            const streamCost = calculateCost(
-              request.model,
-              usage.prompt_tokens,
-              usage.completion_tokens
-            )
-            const tc = sumToolCosts(toolResults)
-            output.cost = {
-              input: accumulatedCost.input + streamCost.input,
-              output: accumulatedCost.output + streamCost.output,
-              toolCost: tc || undefined,
-              total: accumulatedCost.total + streamCost.total + tc,
-            }
-
-            finalizeTiming()
-          }),
+        streamFormat: 'agent-events-v1',
+        createStream: ({ output, finalizeTiming }) => {
+          output.content = content
+          finalizeTiming()
+          return createSettledAgentEventStream(content)
+        },
       })
-
-      return streamingResult
     }
 
     const providerEndTime = Date.now()
@@ -563,7 +697,7 @@ async function executeChatCompletionsRequest(
         modelTime: modelTime,
         toolsTime: toolsTime,
         firstResponseTime: firstResponseTime,
-        iterations: iterationCount + 1,
+        iterations: timeSegments.filter((segment) => segment.type === 'model').length,
         timeSegments: timeSegments,
       },
     }
@@ -576,6 +710,10 @@ async function executeChatCompletionsRequest(
       error,
       duration: totalDuration,
     })
+
+    if (isAbortError(error) || request.abortSignal?.aborted || isConversationContextError(error)) {
+      throw error
+    }
 
     throw new ProviderError(toError(error).message, {
       startTime: providerStartTimeISO,
@@ -610,7 +748,11 @@ export const azureOpenAIProvider: ProviderConfig = {
 
     let pinnedFetch: typeof fetch | undefined
     if (userProvidedEndpoint) {
-      const validation = await validateUrlWithDNS(userProvidedEndpoint, 'azureEndpoint')
+      const validation = await validateUrlWithDNS(
+        userProvidedEndpoint,
+        'azureEndpoint',
+        'configuredEndpoint'
+      )
       if (!validation.isValid) {
         logger.warn('Blocked SSRF attempt via azureEndpoint', {
           endpoint: userProvidedEndpoint,
@@ -618,10 +760,7 @@ export const azureOpenAIProvider: ProviderConfig = {
         })
         throw new Error(`Invalid Azure OpenAI endpoint: ${validation.error}`)
       }
-      if (!validation.resolvedIP) {
-        throw new Error('Invalid Azure OpenAI endpoint: could not resolve a pinnable IP address')
-      }
-      pinnedFetch = createPinnedFetch(validation.resolvedIP)
+      pinnedFetch = createPinnedFetch(validation.resolvedIP, { profile: 'configuredEndpoint' })
     }
 
     const apiKey = request.apiKey
@@ -638,7 +777,7 @@ export const azureOpenAIProvider: ProviderConfig = {
 
       // Try to extract deployment from URL, fall back to model name
       const urlDeployment = extractDeploymentFromUrl(azureEndpoint)
-      const deploymentName = urlDeployment || request.model.replace('azure/', '')
+      const deploymentName = urlDeployment || request.model.replace(/^azure\//i, '')
 
       // Try to extract api-version from URL, fall back to request param or env or default
       const urlApiVersion = extractApiVersionFromUrl(azureEndpoint)
@@ -656,7 +795,7 @@ export const azureOpenAIProvider: ProviderConfig = {
       })
 
       return executeChatCompletionsRequest(
-        { ...request, apiKey },
+        request,
         baseUrl,
         azureApiVersion,
         deploymentName,
@@ -668,41 +807,14 @@ export const azureOpenAIProvider: ProviderConfig = {
     if (isResponsesEndpoint(azureEndpoint)) {
       logger.info('Detected full responses endpoint URL, using it directly')
 
-      const deploymentName = request.model.replace('azure/', '')
+      const deploymentName = request.model.replace(/^azure\//i, '')
 
       // Use the URL as-is since it's already complete
-      return executeResponsesProviderRequest(
-        { ...request, apiKey },
-        {
-          providerId: 'azure-openai',
-          providerLabel: 'Azure OpenAI',
-          modelName: deploymentName,
-          endpoint: azureEndpoint,
-          headers: {
-            'Content-Type': 'application/json',
-            'OpenAI-Beta': 'responses=v1',
-            'api-key': apiKey,
-          },
-          logger,
-          fetch: pinnedFetch,
-        }
-      )
-    }
-
-    // Default: base URL provided, construct the responses API URL
-    logger.info('Using base endpoint, constructing Responses API URL')
-    const azureApiVersion =
-      request.azureApiVersion || env.AZURE_OPENAI_API_VERSION || '2024-07-01-preview'
-    const deploymentName = request.model.replace('azure/', '')
-    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses?api-version=${azureApiVersion}`
-
-    return executeResponsesProviderRequest(
-      { ...request, apiKey },
-      {
+      return executeResponsesProviderRequest(request, {
         providerId: 'azure-openai',
         providerLabel: 'Azure OpenAI',
         modelName: deploymentName,
-        endpoint: apiUrl,
+        endpoint: azureEndpoint,
         headers: {
           'Content-Type': 'application/json',
           'OpenAI-Beta': 'responses=v1',
@@ -710,7 +822,28 @@ export const azureOpenAIProvider: ProviderConfig = {
         },
         logger,
         fetch: pinnedFetch,
-      }
-    )
+      })
+    }
+
+    // Default: base URL provided, construct the responses API URL
+    logger.info('Using base endpoint, constructing Responses API URL')
+    const azureApiVersion =
+      request.azureApiVersion || env.AZURE_OPENAI_API_VERSION || '2024-07-01-preview'
+    const deploymentName = request.model.replace(/^azure\//i, '')
+    const apiUrl = `${azureEndpoint.replace(/\/$/, '')}/openai/v1/responses?api-version=${azureApiVersion}`
+
+    return executeResponsesProviderRequest(request, {
+      providerId: 'azure-openai',
+      providerLabel: 'Azure OpenAI',
+      modelName: deploymentName,
+      endpoint: apiUrl,
+      headers: {
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'responses=v1',
+        'api-key': apiKey,
+      },
+      logger,
+      fetch: pinnedFetch,
+    })
   },
 }

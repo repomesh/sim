@@ -10,6 +10,7 @@ export const gitlabMergeMergeRequestTool: ToolConfig<
   GitLabMergeMergeRequestResponse
 > = {
   id: 'gitlab_merge_merge_request',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Merge Merge Request',
   description: 'Merge a merge request in a GitLab project',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabMergeMergeRequestTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     mergeRequestIid: {
       type: 'number',
@@ -89,8 +90,13 @@ export const gitlabMergeMergeRequestTool: ToolConfig<
       if (params.squash !== undefined) body.squash = params.squash
       if (params.shouldRemoveSourceBranch !== undefined)
         body.should_remove_source_branch = params.shouldRemoveSourceBranch
-      if (params.mergeWhenPipelineSucceeds !== undefined)
+      if (params.mergeWhenPipelineSucceeds !== undefined) {
+        // `merge_when_pipeline_succeeds` was deprecated in GitLab 17.11 in
+        // favor of `auto_merge`; send both so older self-managed instances
+        // (which ignore unknown params) keep working.
+        body.auto_merge = params.mergeWhenPipelineSucceeds
         body.merge_when_pipeline_succeeds = params.mergeWhenPipelineSucceeds
+      }
 
       return body
     },

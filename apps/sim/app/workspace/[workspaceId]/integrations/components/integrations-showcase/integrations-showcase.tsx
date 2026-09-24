@@ -1,5 +1,9 @@
 import type { ComponentType } from 'react'
 import { cn } from '@sim/emcn'
+import {
+  RESOURCE_TILE_BASE,
+  RESOURCE_TILE_PLAIN,
+} from '@/app/workspace/[workspaceId]/components/resource-tile'
 import { getBlock } from '@/blocks'
 import { getTileIconColorClass } from '@/blocks/icon-color'
 
@@ -69,19 +73,17 @@ export function IntegrationTile({ blockType, icon: Icon, framed = false }: Integ
 
   if (!framed) {
     return (
-      <div className='size-9 flex-shrink-0'>
-        <div
-          className='flex size-full items-center justify-center rounded-xl border border-[var(--border-1)] bg-[var(--bg)]'
-          style={brandBg ? { background: brandBg } : undefined}
-        >
-          <Icon className={cn('size-5', getTileIconColorClass(brandBg))} />
-        </div>
+      <div
+        className={cn(RESOURCE_TILE_BASE, RESOURCE_TILE_PLAIN)}
+        style={brandBg ? { background: brandBg } : undefined}
+      >
+        <Icon className={getTileIconColorClass(brandBg)} />
       </div>
     )
   }
 
   return (
-    <div className='size-11 flex-shrink-0 rounded-xl border border-[var(--border-muted)] bg-[var(--surface-4)] p-[3px] shadow-sm dark:bg-[var(--surface-5)]'>
+    <div className='size-11 shrink-0 rounded-xl border border-[var(--border-muted)] bg-[var(--surface-4)] p-[3px] shadow-xs dark:bg-[var(--surface-5)]'>
       <div
         className='flex size-full items-center justify-center rounded-[9px] border border-[var(--border-1)] bg-[var(--bg)]'
         style={brandBg ? { background: brandBg } : undefined}
@@ -99,10 +101,7 @@ export function IntegrationTile({ blockType, icon: Icon, framed = false }: Integ
  */
 export function IntegrationsShowcase() {
   return (
-    <div
-      aria-hidden
-      className='relative h-[144px] w-full overflow-hidden rounded-xl shadow-[var(--shadow-overlay)]'
-    >
+    <div aria-hidden className='relative h-[144px] w-full overflow-hidden rounded-xl'>
       <div
         className='absolute inset-0 bg-[var(--surface-4)] dark:bg-[var(--surface-5)]'
         style={{

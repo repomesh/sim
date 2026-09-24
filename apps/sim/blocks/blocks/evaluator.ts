@@ -1,13 +1,13 @@
 import { createLogger } from '@sim/logger'
 import { ChartBarIcon } from '@/components/icons'
+import { getModelFallbackSubBlock, MODEL_FALLBACK_INPUTS } from '@/blocks/model-fallbacks'
 import type { BlockConfig, ParamType } from '@/blocks/types'
 import {
   getModelOptions,
   getProviderCredentialSubBlocks,
+  getSerializedModelProviderId,
   PROVIDER_CREDENTIAL_INPUTS,
 } from '@/blocks/utils'
-import { getBaseModelProviders } from '@/providers/models'
-import type { ProviderId } from '@/providers/types'
 import type { ToolResponse } from '@/tools/types'
 
 const logger = createLogger('EvaluatorBlock')
@@ -157,6 +157,15 @@ export const EvaluatorBlock: BlockConfig<EvaluatorResponse> = {
   category: 'blocks',
   bgColor: '#4D5FFF',
   icon: ChartBarIcon,
+  canvasPresentation: {
+    defaultTitle: 'Evaluator',
+    sentences: {
+      default: [
+        { text: 'Score', field: 'content', core: true },
+        { text: 'against', field: 'metrics' },
+      ],
+    },
+  },
   subBlocks: [
     {
       id: 'metrics',
@@ -181,6 +190,7 @@ export const EvaluatorBlock: BlockConfig<EvaluatorResponse> = {
       options: getModelOptions,
     },
     ...getProviderCredentialSubBlocks(),
+    getModelFallbackSubBlock(),
     {
       id: 'temperature',
       title: 'Temperature',
@@ -244,17 +254,7 @@ export const EvaluatorBlock: BlockConfig<EvaluatorResponse> = {
       'deepseek_reasoner',
     ],
     config: {
-      tool: (params: Record<string, any>) => {
-        const model = params.model || 'gpt-4o'
-        if (!model) {
-          throw new Error('No model selected')
-        }
-        const tool = getBaseModelProviders()[model as ProviderId]
-        if (!tool) {
-          throw new Error(`Invalid model selected: ${model}`)
-        }
-        return tool
-      },
+      tool: (params: Record<string, any>) => getSerializedModelProviderId(params.model),
     },
   },
   inputs: {
@@ -296,6 +296,7 @@ export const EvaluatorBlock: BlockConfig<EvaluatorResponse> = {
     },
     model: { type: 'string' as ParamType, description: 'AI model to use' },
     ...PROVIDER_CREDENTIAL_INPUTS,
+    ...MODEL_FALLBACK_INPUTS,
     temperature: {
       type: 'number' as ParamType,
       description: 'Response randomness level (low for consistent evaluation)',

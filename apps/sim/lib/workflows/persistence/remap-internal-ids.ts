@@ -1,5 +1,7 @@
 import { createLogger } from '@sim/logger'
+import { isRecordLike } from '@sim/utils/object'
 import { remapConditionBlockIds } from '@/lib/workflows/condition-ids'
+import { isDynamicHandleSubblock } from '@/lib/workflows/dynamic-handle-topology'
 import {
   type CanonicalModeOverrides,
   resolveCanonicalMode,
@@ -24,10 +26,6 @@ type VariableAssignment = Record<string, unknown> & { variableId?: unknown }
 const DUPLICATE_STRIPPED_SYSTEM_SUBBLOCK_IDS = new Set(
   SYSTEM_SUBBLOCK_IDS.filter((id) => id !== 'triggerCredentials')
 )
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
-}
 
 /** Coerce a subblock value that holds a JSON array (stored as an array or a JSON string). */
 export function coerceObjectArray(value: unknown): { array: unknown[] | null; wasString: boolean } {
@@ -61,7 +59,7 @@ function remapVariableAssignment(value: unknown, varIdMap: Map<string, string>):
   if (Array.isArray(value)) {
     return value.map((item) => remapVariableAssignment(item, varIdMap))
   }
-  if (!isRecord(value)) {
+  if (!isRecordLike(value)) {
     return value
   }
   const assignment = value as VariableAssignment
@@ -151,12 +149,19 @@ export function remapVariableIdsInSubBlocks(
 export function remapWorkflowReferencesInSubBlocks(
   subBlocks: SubBlockRecord,
   workflowIdMap: Map<string, string> | undefined,
-  options?: { clearUnmapped?: boolean; canonicalModes?: CanonicalModeOverrides }
+  options?: {
+    clearUnmapped?: boolean
+    preserveToolIndices?: boolean
+    canonicalModes?: CanonicalModeOverrides
+    resolve?: (sourceId: string, path: Array<string | number>) => string | null | undefined
+  }
 ): SubBlockRecord {
-  if (!workflowIdMap?.size) return subBlocks
+  if (!workflowIdMap?.size && !options?.resolve) return subBlocks
+  const resolve = (id: string, path: Array<string | number>) =>
+    options?.resolve ? options.resolve(id, path) : workflowIdMap?.get(id)
   const clearUnmapped = options?.clearUnmapped ?? false
-  const remapScalar = (value: string): string => {
-    const mapped = workflowIdMap.get(value)
+  const remapScalar = (value: string, key: string): string => {
+    const mapped = resolve(value, [key])
     if (mapped) return mapped
     return clearUnmapped ? '' : value
   }
@@ -185,7 +190,7 @@ export function remapWorkflowReferencesInSubBlocks(
         typeof subBlock.value === 'string' &&
         subBlock.value
       ) {
-        updated[key] = { ...subBlock, value: remapScalar(subBlock.value) }
+        updated[key] = { ...subBlock, value: remapScalar(subBlock.value, key) }
         continue
       }
       // Remap only the STRUCTURED multi-workflow lists: the logs block's `workflowSelector` and
@@ -196,14 +201,23 @@ export function remapWorkflowReferencesInSubBlocks(
         baseKey === 'workflowSelector' ||
         (subBlock.type === 'dropdown' && baseKey === 'workflowIds')
       ) {
-        const remapped = remapWorkflowIdList(subBlock.value, workflowIdMap, clearUnmapped)
+        const remapped = remapWorkflowIdList(
+          subBlock.value,
+          (id) => resolve(id, [key]),
+          clearUnmapped
+        )
         if (remapped !== subBlock.value) {
           updated[key] = { ...subBlock, value: remapped }
           continue
         }
       }
       if (subBlock.type === 'tool-input') {
-        const remapped = remapWorkflowInputTools(subBlock.value, workflowIdMap, clearUnmapped)
+        const remapped = remapWorkflowInputTools(
+          subBlock.value,
+          (id, index) => resolve(id, [key, index ?? 0, 'params', 'workflowId']),
+          clearUnmapped,
+          options?.preserveToolIndices
+        )
         if (remapped !== subBlock.value) {
           updated[key] = { ...subBlock, value: remapped }
           continue
@@ -246,11 +260,11 @@ export function remapWorkflowReferencesInSubBlocks(
  */
 function remapWorkflowIdList(
   value: unknown,
-  workflowIdMap: Map<string, string>,
+  resolve: (id: string, index?: number) => string | null | undefined,
   clearUnmapped: boolean
 ): unknown {
   const remapId = (id: string): string | null => {
-    const mapped = workflowIdMap.get(id)
+    const mapped = resolve(id)
     if (mapped) return mapped
     return clearUnmapped ? null : id
   }
@@ -292,17 +306,19 @@ function remapWorkflowIdList(
  */
 function remapWorkflowInputTools(
   value: unknown,
-  workflowIdMap: Map<string, string>,
-  clearUnmapped: boolean
+  resolve: (id: string, index?: number) => string | null | undefined,
+  clearUnmapped: boolean,
+  preserveToolIndices = false
 ): unknown {
   const { array, wasString } = coerceObjectArray(value)
   if (!array) return value
   let changed = false
-  const next = array.flatMap((tool) => {
-    if (!isRecord(tool) || tool.type !== 'workflow_input' || !isRecord(tool.params)) return [tool]
+  const next = array.flatMap((tool, index) => {
+    if (!isRecordLike(tool) || tool.type !== 'workflow_input' || !isRecordLike(tool.params))
+      return [tool]
     const workflowId = tool.params.workflowId
     if (typeof workflowId !== 'string') return [tool]
-    const mapped = workflowIdMap.get(workflowId)
+    const mapped = resolve(workflowId, index)
     if (mapped) {
       if (mapped === workflowId) return [tool]
       changed = true
@@ -310,6 +326,7 @@ function remapWorkflowInputTools(
     }
     if (clearUnmapped) {
       changed = true
+      if (preserveToolIndices) return [{ ...tool, params: { ...tool.params, workflowId: '' } }]
       return []
     }
     return [tool]
@@ -321,9 +338,16 @@ function remapWorkflowInputTools(
 /**
  * Remap condition/router block IDs within subBlocks when a block is copied with
  * a new ID. Returns a new object without mutating the input.
+ *
+ * Gated on the BLOCK type + canonical subblock key (`conditions`/`routes`), not
+ * the stored subblock `type`: edge handles are remapped by string prefix with no
+ * type gate, so keying this side on mutable stored metadata lets a drifted type
+ * (e.g. a `conditions` entry stamped `short-input` by a fallback writer) skip the
+ * id remap while the handles still move — orphaning every edge out of the block.
  */
 export function remapConditionIdsInSubBlocks(
   subBlocks: SubBlockRecord,
+  blockType: string | undefined,
   oldBlockId: string,
   newBlockId: string
 ): SubBlockRecord {
@@ -332,7 +356,7 @@ export function remapConditionIdsInSubBlocks(
     if (
       subBlock &&
       typeof subBlock === 'object' &&
-      (subBlock.type === 'condition-input' || subBlock.type === 'router-input') &&
+      isDynamicHandleSubblock(blockType, key) &&
       typeof subBlock.value === 'string'
     ) {
       try {

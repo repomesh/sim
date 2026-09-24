@@ -7,10 +7,9 @@
  *
  * @vitest-environment node
  */
-import { dbChainMock, dbChainMockFns } from '@sim/testing'
+import { setRequestAuth } from '@sim/logger'
+import { dbChainMockFns } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-
-vi.mock('@sim/db', () => dbChainMock)
 
 const { serviceLogger } = vi.hoisted(() => {
   const logger = {
@@ -33,6 +32,7 @@ vi.mock('@sim/logger', () => ({
   logger: serviceLogger,
   runWithRequestContext: vi.fn(<T>(_ctx: unknown, fn: () => T): T => fn()),
   getRequestContext: vi.fn(() => undefined),
+  setRequestAuth: vi.fn(),
 }))
 
 const { mockGetWorkspaceBillingSettings } = vi.hoisted(() => ({
@@ -94,6 +94,27 @@ describe('authenticateApiKeyFromHeader', () => {
       workspaceId: undefined,
     })
     expect(dbChainMockFns.where).toHaveBeenCalledTimes(1)
+  })
+
+  it('records the key kind on the request without replacing a more specific principal', async () => {
+    dbChainMockFns.where.mockResolvedValueOnce([
+      personalKeyRecord({ type: 'workspace', workspaceId: 'workspace-1' }),
+    ])
+
+    await authenticateApiKeyFromHeader('sk-sim-plain-key')
+
+    expect(vi.mocked(setRequestAuth)).toHaveBeenCalledWith(
+      { kind: 'workspace_api_key' },
+      { preserveExisting: true }
+    )
+  })
+
+  it('records nothing for a key that fails its checks', async () => {
+    dbChainMockFns.where.mockResolvedValueOnce([personalKeyRecord({ userId: 'other-user' })])
+
+    await authenticateApiKeyFromHeader('sk-sim-plain-key', { userId: 'user-1' })
+
+    expect(vi.mocked(setRequestAuth)).not.toHaveBeenCalled()
   })
 
   it('returns invalid when the hash lookup finds a row that fails scope checks', async () => {

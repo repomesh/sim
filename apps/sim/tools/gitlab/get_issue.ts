@@ -4,6 +4,7 @@ import type { ToolConfig } from '@/tools/types'
 
 export const gitlabGetIssueTool: ToolConfig<GitLabGetIssueParams, GitLabGetIssueResponse> = {
   id: 'gitlab_get_issue',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Get Issue',
   description: 'Get details of a specific GitLab issue',
   version: '1.0.0',
@@ -25,7 +26,7 @@ export const gitlabGetIssueTool: ToolConfig<GitLabGetIssueParams, GitLabGetIssue
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     issueIid: {
       type: 'number',

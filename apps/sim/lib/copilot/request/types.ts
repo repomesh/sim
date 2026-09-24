@@ -1,13 +1,17 @@
 import type { AsyncCompletionSignal } from '@/lib/copilot/async-runs/lifecycle'
-import { MothershipStreamV1ToolOutcome } from '@/lib/copilot/generated/mothership-stream-v1'
+import {
+  type MothershipStreamV1CompletionStatus,
+  MothershipStreamV1ToolOutcome,
+} from '@/lib/copilot/generated/mothership-stream-v1'
 import type { RequestTraceV1Span } from '@/lib/copilot/generated/request-trace-v1'
+import type { ProviderToolCallIdentity } from '@/lib/copilot/request/go/tool-call-identity'
 import type { StreamEvent } from '@/lib/copilot/request/session'
 import type { TraceCollector } from '@/lib/copilot/request/trace'
 import type { ToolExecutionContext, ToolExecutionResult } from '@/lib/copilot/tool-executor/types'
 
 export type { StreamEvent }
 
-export type LocalToolCallStatus = 'pending' | 'executing'
+export type LocalToolCallStatus = 'pending' | 'executing' | 'awaiting_approval'
 export type ToolCallStatus = LocalToolCallStatus | MothershipStreamV1ToolOutcome
 
 const TERMINAL_TOOL_STATUSES: ReadonlySet<ToolCallStatus> = new Set<MothershipStreamV1ToolOutcome>(
@@ -22,7 +26,15 @@ export interface ToolCallState {
   id: string
   name: string
   status: ToolCallStatus
+  /** Bounded registry ID of the agent that invoked this tool. */
+  agentId?: string
   displayTitle?: string
+  /** Model-authored activity text, separate from executable tool arguments. */
+  activityDescription?: string
+  /** Model-authored activity text for a gateway-resolved integration call. */
+  integrationDescription?: string
+  /** Accumulated partial JSON of the arguments while the model streams them. */
+  streamingArgs?: string
   params?: Record<string, unknown>
   result?: ToolCallStateResult
   error?: string
@@ -32,7 +44,7 @@ export interface ToolCallState {
    * For a subagent-scoped tool call, the invoking subagent's channel id (its
    * outer tool_use id, = event.scope.parentToolCallId). Captured at dispatch so
    * the executor can thread it into the server tool context and scope the
-   * workspace_file -> edit_content intent handoff per file subagent. Undefined
+   * prepare_file_edit -> apply_file_edit intent handoff per file subagent. Undefined
    * for main-lane tool calls.
    */
   parentToolCallId?: string
@@ -65,6 +77,14 @@ export interface ContentBlock {
   timestamp: number
   endedAt?: number
   parentToolCallId?: string
+  /**
+   * Subagent name for lane blocks (from the event scope's agentId). Persisted
+   * so a reloaded transcript can rebuild the lane's group even when the
+   * `subagent` start block is missing (resume legs re-emit text without start).
+   */
+  subagent?: string
+  /** Orchestrator-chosen display name for a `subagent` start block. */
+  subagentName?: string
   /**
    * Deterministic agent-run identity. `spanId` is the stable per-invocation id
    * of the subagent that produced the block; `parentSpanId` links it to the run
@@ -116,6 +136,12 @@ export interface StreamingContext {
   executionId?: string
   runId?: string
   messageId: string
+  /**
+   * Shared by all live resume legs. Reconnects replay events without resuming Go; any future
+   * durable lifecycle takeover must persist and restore this map alongside its checkpoints.
+   * Absent on legacy contexts, whose tool IDs retain their original meaning.
+   */
+  providerToolCallIdentity?: ProviderToolCallIdentity
   accumulatedContent: string
   finalAssistantContent: string
   sawMainToolCall: boolean
@@ -131,6 +157,8 @@ export interface StreamingContext {
    * block. Per-lane keying keeps each subagent's reasoning intact.
    */
   subagentThinkingBlocks: Map<string, ContentBlock>
+  /** Span ids whose lane start block has been persisted (dedupe across replays). */
+  openSubagentSpans?: Set<string>
   isInThinkingBlock: boolean
   subAgentContent: Record<string, string>
   subAgentToolCalls: Record<string, ToolCallState[]>
@@ -139,6 +167,13 @@ export interface StreamingContext {
   streamComplete: boolean
   wasAborted: boolean
   errors: string[]
+  /**
+   * Terminal status carried by the backend's `complete` event. Set only once
+   * the backend declares the turn finished, so it can outrank in-band failures
+   * recorded on the way there (a tool or subagent that failed and was handed
+   * back to the model as data).
+   */
+  completionStatus?: MothershipStreamV1CompletionStatus
   usage?: { prompt: number; completion: number }
   cost?: { input: number; output: number; total: number }
   /**
@@ -151,6 +186,22 @@ export interface StreamingContext {
   activeFileIntents: Map<string, ActiveFileIntent>
   trace: TraceCollector
   subAgentTraceSpans?: Map<string, RequestTraceV1Span>
+  /**
+   * Per-request state for the tool permission gate. `autoAllowed` starts from
+   * the user's saved always-allow list and is added to in place when they pick
+   * "always allow" mid-turn, so a later call to the same tool in this same turn
+   * is not prompted a second time.
+   */
+  toolPermissions: {
+    enabled: boolean
+    autoAllowed: Set<string>
+    /**
+     * Whether this user may silence a confirmation at all. False when the
+     * permission group withholds `copilot.tool_auto_approval`, in which case
+     * every gated call prompts however the stored list reads.
+     */
+    autoAllowPermitted: boolean
+  }
 }
 
 interface FileAttachment {
@@ -166,13 +217,12 @@ interface OrchestratorRequest {
   workflowId: string
   userId: string
   chatId?: string
-  mode?: 'agent' | 'ask' | 'plan'
+  mode?: 'agent' | 'assistant' | 'plan'
   model?: string
   contexts?: Array<{ type: string; content: string }>
   fileAttachments?: FileAttachment[]
   commands?: string[]
   provider?: string
-  streamToolCalls?: boolean
   version?: string
   prefetch?: boolean
   userName?: string

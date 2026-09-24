@@ -1,5 +1,5 @@
 import { cn } from '@sim/emcn'
-import { createEnvMock } from '@sim/testing'
+import { resetEnvMock, setEnv } from '@sim/testing'
 import {
   formatDate,
   formatDateTime,
@@ -7,7 +7,34 @@ import {
   formatTime,
   getTimezoneAbbreviation,
 } from '@sim/utils/formatting'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+beforeAll(() => {
+  setEnv({
+    ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    OPENAI_API_KEY_1: 'test-openai-key-1',
+    OPENAI_API_KEY_2: 'test-openai-key-2',
+    OPENAI_API_KEY_3: 'test-openai-key-3',
+    ANTHROPIC_API_KEY_1: 'test-anthropic-key-1',
+    ANTHROPIC_API_KEY_2: 'test-anthropic-key-2',
+    ANTHROPIC_API_KEY_3: 'test-anthropic-key-3',
+    GEMINI_API_KEY_1: 'test-gemini-key-1',
+    GEMINI_API_KEY_2: 'test-gemini-key-2',
+    GEMINI_API_KEY_3: 'test-gemini-key-3',
+    XAI_API_KEY_1: 'test-xai-key-1',
+    XAI_API_KEY_2: 'test-xai-key-2',
+    XAI_API_KEY_3: 'test-xai-key-3',
+    TYPESAFE_API_KEY_1: 'test-typesafe-key-1',
+    TYPESAFE_API_KEY_2: 'test-typesafe-key-2',
+    TYPESAFE_API_KEY_3: 'test-typesafe-key-3',
+    FIREWORKS_API_KEY_1: 'test-fireworks-key-1',
+    FIREWORKS_API_KEY_2: 'test-fireworks-key-2',
+    FIREWORKS_API_KEY_3: 'test-fireworks-key-3',
+  })
+})
+
+afterAll(resetEnvMock)
+
 import { getRotatingApiKey } from '@/lib/core/config/api-keys'
 import { decryptSecret, encryptSecret } from '@/lib/core/security/encryption'
 import { convertScheduleOptionsToCron } from '@/lib/core/utils/scheduling'
@@ -30,24 +57,6 @@ vi.mock('crypto', () => ({
     toString: vi.fn().mockReturnValue('random-iv'),
   }),
 }))
-
-vi.mock('@/lib/core/config/env', () =>
-  createEnvMock({
-    ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-    OPENAI_API_KEY_1: 'test-openai-key-1',
-    OPENAI_API_KEY_2: 'test-openai-key-2',
-    OPENAI_API_KEY_3: 'test-openai-key-3',
-    ANTHROPIC_API_KEY_1: 'test-anthropic-key-1',
-    ANTHROPIC_API_KEY_2: 'test-anthropic-key-2',
-    ANTHROPIC_API_KEY_3: 'test-anthropic-key-3',
-    GEMINI_API_KEY_1: 'test-gemini-key-1',
-    GEMINI_API_KEY_2: 'test-gemini-key-2',
-    GEMINI_API_KEY_3: 'test-gemini-key-3',
-    XAI_API_KEY_1: 'test-xai-key-1',
-    XAI_API_KEY_2: 'test-xai-key-2',
-    XAI_API_KEY_3: 'test-xai-key-3',
-  })
-)
 
 afterEach(() => {
   vi.clearAllMocks()
@@ -315,6 +324,9 @@ describe('getInvalidCharacters', () => {
 })
 
 describe('getRotatingApiKey', () => {
+  it.concurrent('rotates the TypeSafe key pool through the shared selector', () => {
+    expect(getRotatingApiKey('typesafe')).toMatch(/^test-typesafe-key-[1-3]$/)
+  })
   it.concurrent('should return OpenAI API key based on current minute', () => {
     const result = getRotatingApiKey('openai')
     expect(result).toMatch(/^test-openai-key-[1-3]$/)
@@ -333,6 +345,29 @@ describe('getRotatingApiKey', () => {
   it.concurrent('should return xAI API key based on current minute', () => {
     const result = getRotatingApiKey('xai')
     expect(result).toMatch(/^test-xai-key-[1-3]$/)
+  })
+
+  it.concurrent('should return Fireworks API key based on current minute', () => {
+    const result = getRotatingApiKey('fireworks')
+    expect(result).toMatch(/^test-fireworks-key-[1-3]$/)
+  })
+
+  it('falls back to the single platform Fireworks key when no rotation slot is set', () => {
+    setEnv({
+      FIREWORKS_API_KEY_1: undefined,
+      FIREWORKS_API_KEY_2: undefined,
+      FIREWORKS_API_KEY_3: undefined,
+      FIREWORKS_API_KEY: 'test-fireworks-platform-key',
+    })
+
+    expect(getRotatingApiKey('fireworks')).toBe('test-fireworks-platform-key')
+
+    setEnv({
+      FIREWORKS_API_KEY: undefined,
+      FIREWORKS_API_KEY_1: 'test-fireworks-key-1',
+      FIREWORKS_API_KEY_2: 'test-fireworks-key-2',
+      FIREWORKS_API_KEY_3: 'test-fireworks-key-3',
+    })
   })
 
   it.concurrent('should throw error for unsupported provider', () => {

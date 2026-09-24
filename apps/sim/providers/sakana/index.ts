@@ -1,14 +1,30 @@
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import OpenAI from 'openai'
+import type { ChatCompletionChunk } from 'openai/resources/chat/completions'
 import type { StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
 import { formatMessagesForProvider } from '@/providers/attachments'
+import {
+  isConversationContextError,
+  prepareConversationGeneration,
+} from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
 import { getProviderDefaultModel, getProviderModels } from '@/providers/models'
+import { createOpenAICompatAssistantHistory } from '@/providers/openai-compat/assistant-history'
+import { getChatCompletionConversationUsage } from '@/providers/openai-compat/conversation-usage'
+import { executeProviderTool } from '@/providers/runtime-context'
 import { createReadableStreamFromSakanaStream } from '@/providers/sakana/utils'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
 import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError, parseToolArguments } from '@/providers/streaming-tool-loop-shared'
 import { adaptOpenAIChatToolSchema } from '@/providers/tool-schema-adapter'
 import { enrichLastModelSegmentFromChatCompletions } from '@/providers/trace-enrichment'
+import { openAICompatTransport } from '@/providers/transport'
 import type {
   ProviderConfig,
   ProviderRequest,
@@ -18,12 +34,12 @@ import type {
 import { ProviderError } from '@/providers/types'
 import {
   calculateCost,
+  isFunctionToolCall,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
   trackForcedToolUsage,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 
 const logger = createLogger('SakanaProvider')
 
@@ -32,7 +48,7 @@ const SAKANA_BASE_URL = 'https://api.sakana.ai/v1'
 export const sakanaProvider: ProviderConfig = {
   id: 'sakana',
   name: 'Sakana AI',
-  description: "Sakana AI's Fugu multi-agent models via an OpenAI-compatible API",
+  description: 'Sakana AI Fugu and Namazu models via an OpenAI-compatible API',
   version: '1.0.0',
   models: getProviderModels('sakana'),
   defaultModel: getProviderDefaultModel('sakana'),
@@ -49,6 +65,7 @@ export const sakanaProvider: ProviderConfig = {
 
     try {
       const sakana = new OpenAI({
+        ...openAICompatTransport(),
         apiKey: request.apiKey,
         baseURL: SAKANA_BASE_URL,
       })
@@ -126,6 +143,7 @@ export const sakanaProvider: ProviderConfig = {
       // backends reject a request that carries both `response_format` and active
       // `tools`/`tool_choice`. Defer the schema until after the tool loop completes.
       const deferResponseFormat = !!responseFormatPayload && hasActiveTools
+      let appliedDeferredResponseFormat = false
       if (responseFormatPayload && !deferResponseFormat) {
         payload.response_format = responseFormatPayload
       }
@@ -134,11 +152,11 @@ export const sakanaProvider: ProviderConfig = {
         logger.info('Using streaming response for Sakana request (no tools)')
 
         const streamResponse = await sakana.chat.completions.create(
-          {
+          await prepareConversationGeneration(request, 'chat-completions', {
             ...payload,
             stream: true,
             stream_options: { include_usage: true },
-          },
+          }),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
 
@@ -150,26 +168,32 @@ export const sakanaProvider: ProviderConfig = {
           initialTokens: { input: 0, output: 0, total: 0 },
           initialCost: { input: 0, output: 0, total: 0 },
           isStreaming: true,
+          streamFormat: 'agent-events-v1',
           createStream: ({ output }) =>
-            createReadableStreamFromSakanaStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: usage.total_tokens,
-              }
+            createReadableStreamFromSakanaStream(
+              // double-cast-allowed: payload is untyped so the SDK cannot resolve the streaming overload; the stream yields OpenAI ChatCompletionChunk objects
+              streamResponse as unknown as AsyncIterable<ChatCompletionChunk>,
+              (content, usage) => {
+                output.content = content
+                output.tokens = {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  total: usage.total_tokens,
+                }
 
-              const costResult = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              output.cost = {
-                input: costResult.input,
-                output: costResult.output,
-                total: costResult.total,
-              }
-            }),
+                const costResult = calculateCost(
+                  request.model,
+                  usage.prompt_tokens,
+                  usage.completion_tokens
+                )
+                output.cost = {
+                  input: costResult.input,
+                  output: costResult.output,
+                  total: costResult.total,
+                }
+              },
+              request
+            ),
         })
 
         return streamingResult
@@ -181,9 +205,17 @@ export const sakanaProvider: ProviderConfig = {
       let usedForcedTools: string[] = []
 
       let currentResponse = await sakana.chat.completions.create(
-        payload,
+        await prepareConversationGeneration(request, 'chat-completions', payload),
         request.abortSignal ? { signal: request.abortSignal } : undefined
       )
+      if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+        await captureProviderConversationStep(
+          request,
+          'chat-completions',
+          currentResponse.choices[0]?.message,
+          getChatCompletionConversationUsage(currentResponse.usage)
+        )
+      }
       const firstResponseTime = Date.now() - initialCallTime
 
       let content = currentResponse.choices[0]?.message?.content || ''
@@ -211,11 +243,9 @@ export const sakanaProvider: ProviderConfig = {
         },
       ]
 
-      if (
-        typeof originalToolChoice === 'object' &&
-        currentResponse.choices[0]?.message?.tool_calls
-      ) {
-        const toolCallsResponse = currentResponse.choices[0].message.tool_calls
+      const toolCallsResponse =
+        currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+      if (typeof originalToolChoice === 'object' && toolCallsResponse?.length) {
         const result = trackForcedToolUsage(
           toolCallsResponse,
           originalToolChoice,
@@ -234,7 +264,8 @@ export const sakanaProvider: ProviderConfig = {
             content = currentResponse.choices[0].message.content
           }
 
-          const toolCallsInResponse = currentResponse.choices[0]?.message?.tool_calls
+          const toolCallsInResponse =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
 
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
@@ -249,18 +280,30 @@ export const sakanaProvider: ProviderConfig = {
 
           const toolsStartTime = Date.now()
 
+          await captureProviderConversationStep(
+            request,
+            'chat-completions',
+            currentResponse.choices[0]?.message,
+            getChatCompletionConversationUsage(currentResponse.usage)
+          )
           const toolExecutionPromises = toolCallsInResponse.map(async (toolCall) => {
             const toolCallStartTime = Date.now()
             const toolName = toolCall.function.name
 
             try {
-              const toolArgs = JSON.parse(toolCall.function.arguments)
+              const toolArgs = parseToolArguments(toolCall.function.arguments, toolName)
               const tool = request.tools?.find((t) => t.id === toolName)
 
               // Every tool_call in the assistant message must be answered by a matching
               // `tool` message, or the next request violates the OpenAI message contract.
               // Emit an error result for an unknown tool rather than dropping it.
               if (!tool) {
+                await recordProviderConversationToolError(
+                  request,
+                  toolCall.id,
+                  toolName,
+                  `Tool "${toolName}" is not available`
+                )
                 const toolCallEndTime = Date.now()
                 return {
                   toolCall,
@@ -277,22 +320,41 @@ export const sakanaProvider: ProviderConfig = {
                 }
               }
 
-              const { toolParams, executionParams } = prepareToolExecution(tool, toolArgs, request)
-              const result = await executeTool(toolName, executionParams, {
-                signal: request.abortSignal,
-              })
+              const { toolParams, executionParams } = prepareToolExecution(
+                tool,
+                toolArgs,
+                request,
+                toolCall.id
+              )
+              const { rawResponse, modelResponse } = await executeProviderTool(
+                toolName,
+                executionParams,
+                {
+                  signal: request.abortSignal,
+                }
+              )
               const toolCallEndTime = Date.now()
 
               return {
                 toolCall,
                 toolName,
                 toolParams,
-                result,
+                result: rawResponse,
+                modelResult: modelResponse,
                 startTime: toolCallStartTime,
                 endTime: toolCallEndTime,
                 duration: toolCallEndTime - toolCallStartTime,
               }
             } catch (error) {
+              if (isAbortError(error) || request.abortSignal?.aborted) {
+                throw error
+              }
+              await recordProviderConversationToolError(
+                request,
+                toolCall.id,
+                toolName,
+                getErrorMessage(error, 'Tool execution failed')
+              )
               const toolCallEndTime = Date.now()
               logger.error('Error processing tool call:', { error, toolName })
 
@@ -312,26 +374,24 @@ export const sakanaProvider: ProviderConfig = {
             }
           })
 
-          const executionResults = await Promise.allSettled(toolExecutionPromises)
+          const executionResults = await Promise.all(toolExecutionPromises)
 
-          currentMessages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: toolCallsInResponse.map((tc) => ({
-              id: tc.id,
-              type: 'function',
-              function: {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-              },
-            })),
-          })
+          const assistantMessage = currentResponse.choices[0]?.message
+          if (assistantMessage) {
+            currentMessages.push(
+              createOpenAICompatAssistantHistory({
+                message: assistantMessage,
+                toolCalls: toolCallsInResponse,
+                reasoningFields: ['reasoning_content'],
+              })
+            )
+          }
 
-          for (const settledResult of executionResults) {
-            if (settledResult.status === 'rejected' || !settledResult.value) continue
-
+          for (const executionResult of executionResults) {
             const { toolCall, toolName, toolParams, result, startTime, endTime, duration } =
-              settledResult.value
+              executionResult
+            const modelResult =
+              'modelResult' in executionResult ? (executionResult.modelResult ?? result) : result
 
             timeSegments.push({
               type: 'tool',
@@ -342,10 +402,12 @@ export const sakanaProvider: ProviderConfig = {
               toolCallId: toolCall.id,
             })
 
-            let resultContent: any
-            if (result.success && result.output) {
-              toolResults.push(result.output)
-              resultContent = result.output
+            let resultContent: unknown
+            if (result.success) {
+              if (isRecordLike(result.output)) {
+                toolResults.push(result.output)
+              }
+              resultContent = result.output ?? null
             } else {
               resultContent = {
                 error: true,
@@ -353,6 +415,13 @@ export const sakanaProvider: ProviderConfig = {
                 tool: toolName,
               }
             }
+            const modelResultContent = modelResult.success
+              ? (modelResult.output ?? null)
+              : {
+                  error: true,
+                  message: modelResult.error || 'Tool execution failed',
+                  tool: toolName,
+                }
 
             toolCalls.push({
               name: toolName,
@@ -367,7 +436,7 @@ export const sakanaProvider: ProviderConfig = {
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
-              content: JSON.stringify(resultContent),
+              content: JSON.stringify(modelResultContent),
             })
           }
 
@@ -400,15 +469,21 @@ export const sakanaProvider: ProviderConfig = {
 
           const nextModelStartTime = Date.now()
           currentResponse = await sakana.chat.completions.create(
-            nextPayload,
+            await prepareConversationGeneration(request, 'chat-completions', nextPayload),
             request.abortSignal ? { signal: request.abortSignal } : undefined
           )
+          if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+            await captureProviderConversationStep(
+              request,
+              'chat-completions',
+              currentResponse.choices[0]?.message,
+              getChatCompletionConversationUsage(currentResponse.usage)
+            )
+          }
 
-          if (
-            typeof nextPayload.tool_choice === 'object' &&
-            currentResponse.choices[0]?.message?.tool_calls
-          ) {
-            const toolCallsResponse = currentResponse.choices[0].message.tool_calls
+          const toolCallsResponse =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
+          if (typeof nextPayload.tool_choice === 'object' && toolCallsResponse?.length) {
             const result = trackForcedToolUsage(
               toolCallsResponse,
               nextPayload.tool_choice,
@@ -448,104 +523,78 @@ export const sakanaProvider: ProviderConfig = {
         }
 
         if (iterationCount === MAX_TOOL_ITERATIONS) {
+          const cappedToolCalls =
+            currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall)
           enrichLastModelSegmentFromChatCompletions(
             timeSegments,
             currentResponse,
-            currentResponse.choices[0]?.message?.tool_calls,
+            cappedToolCalls,
             { model: request.model, provider: 'sakana' }
           )
+
+          if (cappedToolCalls?.length) {
+            const finalPayload: any = {
+              ...payload,
+              messages: currentMessages,
+              tool_choice: 'none',
+            }
+            if (deferResponseFormat && responseFormatPayload) {
+              finalPayload.response_format = responseFormatPayload
+              finalPayload.parallel_tool_calls = false
+              appliedDeferredResponseFormat = true
+            }
+
+            const finalModelStartTime = Date.now()
+            currentResponse = await sakana.chat.completions.create(
+              await prepareConversationGeneration(request, 'chat-completions', finalPayload),
+              request.abortSignal ? { signal: request.abortSignal } : undefined
+            )
+            if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+              await captureProviderConversationStep(
+                request,
+                'chat-completions',
+                currentResponse.choices[0]?.message,
+                getChatCompletionConversationUsage(currentResponse.usage)
+              )
+            }
+            const finalModelEndTime = Date.now()
+            const finalModelDuration = finalModelEndTime - finalModelStartTime
+
+            timeSegments.push({
+              type: 'model',
+              name: request.model,
+              startTime: finalModelStartTime,
+              endTime: finalModelEndTime,
+              duration: finalModelDuration,
+            })
+            modelTime += finalModelDuration
+
+            if (currentResponse.choices[0]?.message?.content) {
+              content = currentResponse.choices[0].message.content
+            }
+            if (currentResponse.usage) {
+              tokens.input += currentResponse.usage.prompt_tokens || 0
+              tokens.output += currentResponse.usage.completion_tokens || 0
+              tokens.total += currentResponse.usage.total_tokens || 0
+            }
+
+            enrichLastModelSegmentFromChatCompletions(
+              timeSegments,
+              currentResponse,
+              currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
+              { model: request.model, provider: 'sakana' }
+            )
+            iterationCount++
+          }
         }
       } catch (error) {
         logger.error('Error in Sakana request:', { error })
         throw error
       }
 
-      if (request.stream) {
-        logger.info('Using streaming for final Sakana response after tool processing')
-
-        // The tool loop is complete: this final pass only produces the textual answer.
-        // Force `tool_choice: 'none'` so the model cannot emit fresh tool calls that the
-        // text-only stream adapter would silently drop.
-        const streamingPayload: any = {
-          ...payload,
-          messages: currentMessages,
-          tool_choice: 'none',
-          stream: true,
-          stream_options: { include_usage: true },
-        }
-        if (deferResponseFormat && responseFormatPayload) {
-          streamingPayload.response_format = responseFormatPayload
-          streamingPayload.parallel_tool_calls = false
-        }
-
-        const streamResponse = await sakana.chat.completions.create(
-          streamingPayload,
-          request.abortSignal ? { signal: request.abortSignal } : undefined
-        )
-
-        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
-
-        const streamingResult = createStreamingExecution({
-          model: request.model,
-          providerStartTime,
-          providerStartTimeISO,
-          timing: {
-            kind: 'accumulated',
-            modelTime,
-            toolsTime,
-            firstResponseTime,
-            iterations: iterationCount + 1,
-            timeSegments,
-          },
-          initialTokens: {
-            input: tokens.input,
-            output: tokens.output,
-            total: tokens.total,
-          },
-          initialCost: {
-            input: accumulatedCost.input,
-            output: accumulatedCost.output,
-            toolCost: undefined as number | undefined,
-            total: accumulatedCost.total,
-          },
-          toolCalls:
-            toolCalls.length > 0
-              ? {
-                  list: toolCalls,
-                  count: toolCalls.length,
-                }
-              : undefined,
-          isStreaming: true,
-          createStream: ({ output }) =>
-            createReadableStreamFromSakanaStream(streamResponse as any, (content, usage) => {
-              output.content = content
-              output.tokens = {
-                input: tokens.input + usage.prompt_tokens,
-                output: tokens.output + usage.completion_tokens,
-                total: tokens.total + usage.total_tokens,
-              }
-
-              const streamCost = calculateCost(
-                request.model,
-                usage.prompt_tokens,
-                usage.completion_tokens
-              )
-              const tc = sumToolCosts(toolResults)
-              output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-              }
-            }),
-        })
-
-        return streamingResult
-      }
-
       // Tools were active, so `response_format` was withheld from the loop. Make one final
       // tool-free call to obtain the structured response now that the tool work is done.
-      if (deferResponseFormat && responseFormatPayload) {
+      if (deferResponseFormat && responseFormatPayload && !appliedDeferredResponseFormat) {
         logger.info('Applying deferred JSON schema response format after tool processing')
 
         const finalFormatStartTime = Date.now()
@@ -558,9 +607,17 @@ export const sakanaProvider: ProviderConfig = {
         }
 
         currentResponse = await sakana.chat.completions.create(
-          finalPayload,
+          await prepareConversationGeneration(request, 'chat-completions', finalPayload),
           request.abortSignal ? { signal: request.abortSignal } : undefined
         )
+        if (!currentResponse.choices[0]?.message?.tool_calls?.length) {
+          await captureProviderConversationStep(
+            request,
+            'chat-completions',
+            currentResponse.choices[0]?.message,
+            getChatCompletionConversationUsage(currentResponse.usage)
+          )
+        }
 
         const finalFormatEndTime = Date.now()
         timeSegments.push({
@@ -586,9 +643,55 @@ export const sakanaProvider: ProviderConfig = {
         enrichLastModelSegmentFromChatCompletions(
           timeSegments,
           currentResponse,
-          currentResponse.choices[0]?.message?.tool_calls,
+          currentResponse.choices[0]?.message?.tool_calls?.filter(isFunctionToolCall),
           { model: request.model, provider: 'sakana' }
         )
+      }
+
+      if (request.stream) {
+        const accumulatedCost = calculateCost(request.model, tokens.input, tokens.output)
+        const toolCost = sumToolCosts(toolResults)
+
+        const streamingResult = createStreamingExecution({
+          model: request.model,
+          providerStartTime,
+          providerStartTimeISO,
+          timing: {
+            kind: 'accumulated',
+            modelTime,
+            toolsTime,
+            firstResponseTime,
+            iterations: timeSegments.filter((segment) => segment.type === 'model').length,
+            timeSegments,
+          },
+          initialTokens: {
+            input: tokens.input,
+            output: tokens.output,
+            total: tokens.total,
+          },
+          initialCost: {
+            input: accumulatedCost.input,
+            output: accumulatedCost.output,
+            toolCost: toolCost || undefined,
+            total: accumulatedCost.total + toolCost,
+          },
+          toolCalls:
+            toolCalls.length > 0
+              ? {
+                  list: toolCalls,
+                  count: toolCalls.length,
+                }
+              : undefined,
+          isStreaming: true,
+          streamFormat: 'agent-events-v1',
+          createStream: ({ output, finalizeTiming }) => {
+            output.content = content
+            finalizeTiming()
+            return createSettledAgentEventStream(content)
+          },
+        })
+
+        return streamingResult
       }
 
       const providerEndTime = Date.now()
@@ -608,7 +711,7 @@ export const sakanaProvider: ProviderConfig = {
           modelTime: modelTime,
           toolsTime: toolsTime,
           firstResponseTime: firstResponseTime,
-          iterations: iterationCount + 1,
+          iterations: timeSegments.filter((segment) => segment.type === 'model').length,
           timeSegments: timeSegments,
         },
       }
@@ -621,6 +724,14 @@ export const sakanaProvider: ProviderConfig = {
         error,
         duration: totalDuration,
       })
+
+      if (
+        isAbortError(error) ||
+        request.abortSignal?.aborted ||
+        isConversationContextError(error)
+      ) {
+        throw error
+      }
 
       throw new ProviderError(toError(error).message, {
         startTime: providerStartTimeISO,

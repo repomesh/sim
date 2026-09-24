@@ -32,6 +32,8 @@ export const SLACK_CUSTOM_BOT_PROVIDER_ID = 'slack-custom-bot' as const
 export const SLACK_CUSTOM_BOT_SECRET_TYPE = 'slack_custom_bot' as const
 
 export type OAuthProvider =
+  | 'github-repositories'
+  | 'github-app-installation'
   | 'google'
   | 'google-email'
   | 'google-drive'
@@ -46,11 +48,13 @@ export type OAuthProvider =
   | 'google-forms'
   | 'google-groups'
   | 'google-meet'
+  | 'google-chat'
   | 'vertex-ai'
   | 'x'
   | 'tiktok'
   | 'confluence'
   | 'airtable'
+  | 'bitbucket'
   | 'notion'
   | 'jira'
   | 'atlassian-service-account'
@@ -62,9 +66,11 @@ export type OAuthProvider =
   | 'microsoft-excel'
   | 'microsoft-planner'
   | 'microsoft-teams'
+  | 'microsoft-word'
   | 'outlook'
   | 'onedrive'
   | 'sharepoint'
+  | 'clickup'
   | 'linear'
   | 'slack'
   | 'reddit'
@@ -74,7 +80,10 @@ export type OAuthProvider =
   | 'asana'
   | 'attio'
   | 'pipedrive'
+  | 'quickbooks'
   | 'hubspot'
+  | 'harmonic'
+  | 'coda'
   | 'salesforce'
   | 'linkedin'
   | 'instagram'
@@ -84,8 +93,11 @@ export type OAuthProvider =
   | 'spotify'
   | 'calcom'
   | 'docusign'
+  | 'manageengine-sdp'
+  | 'zoho-desk'
 
 export type OAuthService =
+  | 'github-repositories'
   | 'google'
   | 'google-email'
   | 'google-drive'
@@ -100,11 +112,13 @@ export type OAuthService =
   | 'google-forms'
   | 'google-groups'
   | 'google-meet'
+  | 'google-chat'
   | 'vertex-ai'
   | 'x'
   | 'tiktok'
   | 'confluence'
   | 'airtable'
+  | 'bitbucket'
   | 'notion'
   | 'jira'
   | 'atlassian-service-account'
@@ -115,8 +129,10 @@ export type OAuthService =
   | 'microsoft-excel'
   | 'microsoft-teams'
   | 'microsoft-planner'
+  | 'microsoft-word'
   | 'sharepoint'
   | 'outlook'
+  | 'clickup'
   | 'linear'
   | 'slack'
   | 'reddit'
@@ -127,7 +143,10 @@ export type OAuthService =
   | 'asana'
   | 'attio'
   | 'pipedrive'
+  | 'quickbooks'
   | 'hubspot'
+  | 'harmonic'
+  | 'coda'
   | 'salesforce'
   | 'linkedin'
   | 'instagram'
@@ -139,6 +158,8 @@ export type OAuthService =
   | 'docusign'
   | 'github'
   | 'monday'
+  | 'manageengine-sdp'
+  | 'zoho-desk'
 
 export interface OAuthProviderConfig {
   name: string
@@ -149,6 +170,15 @@ export interface OAuthProviderConfig {
 
 export type OAuthAuthType = 'oauth' | 'service_account'
 
+export interface OAuthClientConfigurationField {
+  id: 'clientId' | 'clientSecret' | 'environment' | 'webhookVerifierToken'
+  label: string
+  placeholder: string
+  secret: boolean
+  options?: readonly { value: string; label: string }[]
+  hint?: string
+}
+
 export interface OAuthServiceConfig {
   name: string
   description: string
@@ -158,23 +188,59 @@ export interface OAuthServiceConfig {
   scopes: string[]
   authType?: OAuthAuthType
   serviceAccountProviderId?: string
+  /**
+   * Further OAuth provider ids whose credentials authenticate this same
+   * service. Used when one integration is reachable through more than one
+   * authorization server and Better Auth therefore needs a separate static
+   * provider registration for each — Salesforce production
+   * (`login.salesforce.com`) versus sandbox (`test.salesforce.com`).
+   *
+   * Credentials stored under any of these ids resolve to this service, so they
+   * appear in the same block credential picker and group under the same
+   * integration. Distinct from {@link serviceAccountProviderId}, which is the
+   * one non-OAuth credential family the service accepts.
+   */
+  additionalProviderIds?: readonly string[]
+  /**
+   * Labels for the connect modal's authorization-server picker, keyed by
+   * provider id and including the primary {@link providerId}. Required
+   * whenever {@link additionalProviderIds} is set — without it the picker has
+   * nothing to render and the alternate server is unreachable from the UI.
+   */
+  providerIdLabels?: Readonly<Record<string, string>>
+  /**
+   * One-line guidance under the authorization-server picker. Earns its place
+   * because picking the wrong server fails as an ordinary bad-password error,
+   * which does not hint that the environment was the problem.
+   */
+  providerIdPickerHint?: string
+  /** Write-only OAuth app fields a user must supply before provider authorization starts. */
+  clientConfiguration?: {
+    fields: readonly OAuthClientConfigurationField[]
+    redirectPath?: `/${string}`
+  }
 }
 
 /**
  * Service metadata without React components - safe for server-side use
  */
 export interface OAuthServiceMetadata {
+  serviceId: string
   providerId: string
+  serviceAccountProviderId?: string
+  additionalProviderIds?: readonly string[]
   name: string
   description: string
   baseProvider: string
+  clientConfiguration?: OAuthServiceConfig['clientConfiguration']
+  authType: OAuthAuthType
 }
 
 export interface Credential {
   id: string
   name: string
   provider: OAuthProvider
-  type?: 'oauth' | 'service_account'
+  type?: 'oauth' | 'service_account' | 'managed_oauth'
   serviceId?: string
   lastUsed?: string
   isDefault?: boolean

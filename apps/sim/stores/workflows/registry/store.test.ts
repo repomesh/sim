@@ -8,19 +8,10 @@
  * variables / deployment stores, guarding against superseded responses.
  */
 import { QueryClient } from '@tanstack/react-query'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockRequestJson, sharedQueryClient } = vi.hoisted(() => ({
-  mockRequestJson: vi.fn(),
+const { sharedQueryClient } = vi.hoisted(() => ({
   sharedQueryClient: { current: null as unknown },
-}))
-
-vi.mock('@/lib/api/client/request', () => ({
-  requestJson: mockRequestJson,
-}))
-
-vi.mock('@/app/_shell/providers/get-query-client', () => ({
-  getQueryClient: () => sharedQueryClient.current as QueryClient,
 }))
 
 const { replaceWorkflowState, initializeFromWorkflow, setVariablesState, clearError } = vi.hoisted(
@@ -79,8 +70,27 @@ vi.mock('@/hooks/queries/deployments', () => ({
   },
 }))
 
+import * as requestModule from '@/lib/api/client/request'
+import * as getQueryClientModule from '@/app/_shell/providers/get-query-client'
 import { workflowKeys } from '@/hooks/queries/utils/workflow-keys'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
+
+/**
+ * Spy on the real module namespaces instead of vi.mock: under `isolate: false`
+ * shared consumers (`@/hooks/queries/utils/fetch-workflow-envelope`, the
+ * registry store) may be cached across test files, so patching the real
+ * namespaces is the only wiring that composes — and vi.mock here would leak
+ * this file's fixtures into later files that share those consumers.
+ */
+const mockRequestJson = vi.spyOn(requestModule, 'requestJson')
+const getQueryClientSpy = vi
+  .spyOn(getQueryClientModule, 'getQueryClient')
+  .mockImplementation(() => sharedQueryClient.current as QueryClient)
+
+afterAll(() => {
+  mockRequestJson.mockRestore()
+  getQueryClientSpy.mockRestore()
+})
 
 function makeEnvelope(overrides: Record<string, unknown> = {}) {
   return {
@@ -102,6 +112,7 @@ function makeEnvelope(overrides: Record<string, unknown> = {}) {
 describe('registry store loadWorkflowState (collapsed cache)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    getQueryClientSpy.mockImplementation(() => sharedQueryClient.current as QueryClient)
     // The store dispatches an `active-workflow-changed` CustomEvent on the
     // window; provide a minimal stub under the node environment.
     vi.stubGlobal('window', { dispatchEvent: vi.fn() })
@@ -152,6 +163,43 @@ describe('registry store loadWorkflowState (collapsed cache)', () => {
     expect(useWorkflowRegistry.getState().hydration.phase).toBe('ready')
   })
 
+  it('preserves the cached in-flight deployment attempt across envelope hydration', async () => {
+    const client = sharedQueryClient.current as QueryClient
+    const preparingAttempt = {
+      id: 'op-1',
+      deploymentVersionId: 'dv-1',
+      version: 2,
+      action: 'deploy',
+      status: 'preparing',
+      readiness: { webhooks: 'pending', schedules: 'pending', mcp: 'pending' },
+      requestedAt: '2026-07-14T00:00:00.000Z',
+      activatedAt: null,
+      error: null,
+    }
+    client.setQueryData(['deployments', 'info', 'wf-1'], {
+      isDeployed: false,
+      deployedAt: null,
+      apiKey: 'Workspace API keys',
+      needsRedeployment: true,
+      isPublicApi: false,
+      warnings: ['Deployment preparation is queued'],
+      activeDeployment: null,
+      latestDeploymentAttempt: preparingAttempt,
+    })
+    mockRequestJson.mockResolvedValue({ data: makeEnvelope({ isDeployed: false }) })
+
+    await useWorkflowRegistry.getState().loadWorkflowState('wf-1')
+
+    const deploymentInfo = client.getQueryData(['deployments', 'info', 'wf-1'])
+    expect(deploymentInfo).toMatchObject({
+      isDeployed: false,
+      apiKey: 'Workspace API keys',
+      needsRedeployment: true,
+      warnings: ['Deployment preparation is queued'],
+      latestDeploymentAttempt: { id: 'op-1', status: 'preparing' },
+    })
+  })
+
   it('hydrates the SAME workflowKeys.state(id) cache entry the hooks read', async () => {
     const envelope = makeEnvelope()
     mockRequestJson.mockResolvedValue({ data: envelope })
@@ -178,6 +226,35 @@ describe('registry store loadWorkflowState (collapsed cache)', () => {
     await useWorkflowRegistry.getState().loadWorkflowState('wf-1')
 
     expect(mockRequestJson).toHaveBeenCalledTimes(2)
+  })
+
+  it('exposes a failed load and recovers when the user retries the same workflow', async () => {
+    mockRequestJson.mockRejectedValueOnce(new Error('Unable to fetch workflow'))
+
+    await expect(useWorkflowRegistry.getState().setActiveWorkflow('wf-1')).rejects.toThrow(
+      'Unable to fetch workflow'
+    )
+    expect(useWorkflowRegistry.getState().hydration).toMatchObject({
+      phase: 'error',
+      workflowId: 'wf-1',
+      error: 'Unable to fetch workflow',
+    })
+    expect(replaceWorkflowState).not.toHaveBeenCalled()
+
+    mockRequestJson.mockResolvedValueOnce({ data: makeEnvelope() })
+    const retry = useWorkflowRegistry.getState().setActiveWorkflow('wf-1')
+    expect(useWorkflowRegistry.getState().hydration).toMatchObject({
+      phase: 'state-loading',
+      error: null,
+    })
+    await retry
+
+    expect(mockRequestJson).toHaveBeenCalledTimes(2)
+    expect(useWorkflowRegistry.getState().hydration).toMatchObject({
+      phase: 'ready',
+      workflowId: 'wf-1',
+      error: null,
+    })
   })
 
   it('discards a superseded response via the staleness guard', async () => {
@@ -207,5 +284,27 @@ describe('registry store loadWorkflowState (collapsed cache)', () => {
     // The stale wf-1 result must not project again — hydration is now wf-2.
     expect(replaceWorkflowState.mock.calls.length).toBe(projectionsAfterSecond)
     expect(useWorkflowRegistry.getState().activeWorkflowId).toBe('wf-2')
+  })
+
+  it('does not show a stale load error after switching to another workflow', async () => {
+    let rejectFirst: (reason: Error) => void = () => {}
+    const firstPending = new Promise<never>((_resolve, reject) => {
+      rejectFirst = reject
+    })
+    mockRequestJson
+      .mockImplementationOnce(() => firstPending)
+      .mockResolvedValueOnce({ data: makeEnvelope({ id: 'wf-2' }) })
+
+    const firstLoad = useWorkflowRegistry.getState().setActiveWorkflow('wf-1')
+    await useWorkflowRegistry.getState().setActiveWorkflow('wf-2')
+    rejectFirst(new Error('Previous workflow failed to load'))
+    await firstLoad
+
+    expect(useWorkflowRegistry.getState().activeWorkflowId).toBe('wf-2')
+    expect(useWorkflowRegistry.getState().hydration).toMatchObject({
+      phase: 'ready',
+      workflowId: 'wf-2',
+      error: null,
+    })
   })
 })

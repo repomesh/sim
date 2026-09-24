@@ -2,11 +2,13 @@
  * @vitest-environment node
  */
 
-import { loggingSessionMock } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { loggingSessionMock, workflowAuthzMockFns } from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ADMISSION_ERROR_CODE } from '@/lib/core/admission/transient-failure'
+import type { LoggingSession } from '@/lib/logs/execution/logging-session'
 
 const {
+  mockSleep,
   mockCheckAttributedUsageLimits,
   mockCheckRateLimit,
   mockGetActivelyBannedUserIds,
@@ -14,6 +16,7 @@ const {
   mockResolveBillingAttribution,
   mockResolveSystemBillingAttribution,
 } = vi.hoisted(() => ({
+  mockSleep: vi.fn().mockResolvedValue(undefined),
   mockCheckAttributedUsageLimits: vi.fn(),
   mockCheckRateLimit: vi.fn(),
   mockGetActivelyBannedUserIds: vi.fn().mockResolvedValue([]),
@@ -22,8 +25,9 @@ const {
   mockResolveSystemBillingAttribution: vi.fn(),
 }))
 
-vi.mock('@sim/db', () => ({ db: {} }))
-vi.mock('drizzle-orm', () => ({ eq: vi.fn() }))
+vi.mock('@sim/utils/helpers', () => ({
+  sleep: mockSleep,
+}))
 vi.mock('@/lib/auth/ban', () => ({
   getActivelyBannedUserIds: mockGetActivelyBannedUserIds,
 }))
@@ -36,19 +40,28 @@ vi.mock('@/lib/billing/calculations/usage-reservation', () => ({
     readonly code = 'SERVICE_OVERLOADED'
     readonly statusCode = 503
     readonly retryable = true
+    /** Mirrors ADMISSION_ERROR_DESCRIPTOR.RESERVATION_INFRASTRUCTURE. */
+    readonly retryAfterSeconds = 5
   },
 }))
 vi.mock('@/lib/billing/core/billing-attribution', () => ({
   assertBillingAttributionSnapshot: vi.fn((value) => value),
-  checkAttributedUsageLimits: mockCheckAttributedUsageLimits,
   resolveBillingAttribution: mockResolveBillingAttribution,
   resolveSystemBillingAttribution: mockResolveSystemBillingAttribution,
+}))
+vi.mock('@/lib/billing/core/usage-gate-cache', () => ({
+  checkExecutionUsageLimits: mockCheckAttributedUsageLimits,
 }))
 vi.mock('@/lib/billing/core/subscription', () => ({
   getHighestPrioritySubscription: vi.fn(),
 }))
 vi.mock('@/lib/core/execution-limits', () => ({
   getExecutionTimeout: vi.fn(() => 0),
+  resolveAsyncExecutionTimeout: vi.fn((policyTimeoutMs, requestedTimeoutSeconds) => {
+    if (requestedTimeoutSeconds === undefined) return policyTimeoutMs
+    const requestedTimeoutMs = requestedTimeoutSeconds * 1000
+    return policyTimeoutMs > 0 ? Math.min(policyTimeoutMs, requestedTimeoutMs) : requestedTimeoutMs
+  }),
 }))
 vi.mock('@/lib/core/rate-limiter/rate-limiter', () => ({
   RateLimiter: vi.fn(function (this: unknown) {
@@ -57,17 +70,8 @@ vi.mock('@/lib/core/rate-limiter/rate-limiter', () => ({
 }))
 vi.mock('@/lib/logs/execution/logging-session', () => loggingSessionMock)
 
-vi.mock('@sim/platform-authz/workflow', () => ({
-  getActiveWorkflowRecord: vi.fn().mockResolvedValue({
-    id: 'workflow-1',
-    userId: 'creator-1',
-    workspaceId: 'workspace-1',
-    isDeployed: true,
-  }),
-}))
-
 import { getHighestPrioritySubscription } from '@/lib/billing/core/subscription'
-import { preprocessExecution } from './preprocessing'
+import { preprocessExecution, WORKFLOW_NOT_DEPLOYED_CODE } from './preprocessing'
 
 const ORGANIZATION_ATTRIBUTION = {
   actorUserId: 'actor-1',
@@ -90,7 +94,17 @@ const ORGANIZATION_ATTRIBUTION = {
   workspaceId: 'workspace-1',
 }
 
+afterAll(() => {
+  workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockReset()
+})
+
 beforeEach(() => {
+  workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockResolvedValue({
+    id: 'workflow-1',
+    userId: 'creator-1',
+    workspaceId: 'workspace-1',
+    isDeployed: true,
+  })
   mockResolveBillingAttribution.mockImplementation(
     ({ actorUserId, workspaceId }: { actorUserId: string; workspaceId: string }) => ({
       ...ORGANIZATION_ATTRIBUTION,
@@ -109,6 +123,34 @@ beforeEach(() => {
     payerUsage: { currentUsage: 1, limit: 10 },
   })
   mockReserveExecutionSlot.mockResolvedValue({ reserved: true })
+})
+
+describe('preprocessExecution deployment checks', () => {
+  it('returns a structured code when a required deployment is missing', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockResolvedValueOnce({
+      id: 'workflow-1',
+      userId: 'user-1',
+      workspaceId: 'workspace-1',
+      isDeployed: false,
+    })
+    const result = await preprocessExecution({
+      workflowId: 'workflow-1',
+      userId: 'user-1',
+      triggerType: 'copilot',
+      executionId: 'execution-1',
+      requestId: 'request-1',
+      checkDeployment: true,
+    })
+
+    expect(result).toEqual({
+      success: false,
+      error: {
+        message: 'Workflow is not deployed',
+        statusCode: 403,
+        code: WORKFLOW_NOT_DEPLOYED_CODE,
+      },
+    })
+  })
 })
 
 describe('preprocessExecution correlation logging', () => {
@@ -210,6 +252,112 @@ describe('preprocessExecution logPreprocessingErrors option', () => {
 
     expect(result).toMatchObject({ success: false, error: { statusCode: 402 } })
     expect(loggingSession.safeStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('preprocessExecution suppressRetryableFailureLogs option', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const baseOptions = {
+    workflowId: 'workflow-1',
+    userId: 'owner-1',
+    triggerType: 'webhook' as const,
+    executionId: 'execution-1',
+    requestId: 'request-1',
+    checkDeployment: false,
+    checkRateLimit: false,
+    workspaceId: 'workspace-1',
+  }
+
+  function makeLoggingSession() {
+    return {
+      safeStart: vi.fn().mockResolvedValue(true),
+      safeCompleteWithError: vi.fn().mockResolvedValue(undefined),
+    }
+  }
+
+  /** Preprocessing only reaches `safeStart`/`safeCompleteWithError`, so the mock stands in for the full session. */
+  function asLoggingSession(session: ReturnType<typeof makeLoggingSession>): LoggingSession {
+    return session as unknown as LoggingSession
+  }
+
+  it('skips the failure row for a retryable infrastructure failure', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValue(
+      Object.assign(new Error('write CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' })
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      suppressRetryableFailureLogs: true,
+      loggingSession: asLoggingSession(loggingSession),
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: {
+        message: 'Internal error while fetching workflow',
+        statusCode: 500,
+        retryable: true,
+      },
+    })
+    expect(loggingSession.safeStart).not.toHaveBeenCalled()
+  })
+
+  it('still records non-retryable failures while suppression is on', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValueOnce(
+      new Error('column "unknown" does not exist')
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      suppressRetryableFailureLogs: true,
+      loggingSession: asLoggingSession(loggingSession),
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { statusCode: 500, retryable: false },
+    })
+    expect(loggingSession.safeStart).toHaveBeenCalled()
+  })
+
+  it('retries the workflow fetch before surfacing a transient failure', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValue(
+      Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+    )
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      loggingSession: asLoggingSession(makeLoggingSession()),
+    })
+
+    expect(workflowAuthzMockFns.mockGetActiveWorkflowRecord).toHaveBeenCalledTimes(3)
+    expect(result).toMatchObject({
+      success: false,
+      error: { message: 'Internal error while fetching workflow', retryable: true },
+    })
+  })
+
+  it('records retryable failures when the option is absent', async () => {
+    workflowAuthzMockFns.mockGetActiveWorkflowRecord.mockRejectedValue(
+      Object.assign(new Error('write CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' })
+    )
+    const loggingSession = makeLoggingSession()
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      loggingSession: asLoggingSession(loggingSession),
+    })
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { statusCode: 500, retryable: true },
+    })
+    expect(loggingSession.safeStart).toHaveBeenCalled()
   })
 })
 
@@ -386,23 +534,70 @@ describe('preprocessExecution ban gate', () => {
     expect(mockCheckRateLimit).toHaveBeenCalledTimes(1)
   })
 
-  it('checks the actor, caller-provided userId, and workflow owner in one call', async () => {
+  /** The default is the blocking one: an undeclared `userId` stays a candidate. */
+  it('checks the actor and the caller-provided userId by default', async () => {
     const result = await preprocessExecution(baseOptions)
 
     expect(result.success).toBe(true)
     expect(mockGetActivelyBannedUserIds).toHaveBeenCalledTimes(1)
-    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith([
-      'billed-account-1',
-      'owner-1',
-      'creator-1',
-    ])
+    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith(['billed-account-1', 'owner-1'])
   })
 
-  it('excludes the "unknown" sentinel userId but still checks the workflow owner', async () => {
+  /**
+   * Resume is the shape that must keep blocking: it passes the live
+   * authenticated resumer as `userId` while attribution stays pinned to the
+   * original actor across the pause, and deliberately leaves
+   * `useAuthenticatedUserAsActor` false. Keying the gate on that flag excluded
+   * exactly the person who just acted.
+   */
+  it('checks a live resumer whose captured attribution names a different actor', async () => {
+    mockGetActivelyBannedUserIds.mockImplementation(async (ids: string[]) =>
+      ids.filter((id) => id === 'suspended-resumer')
+    )
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      userId: 'suspended-resumer',
+      billingAttribution: { ...ORGANIZATION_ATTRIBUTION, actorUserId: 'original-actor-1' } as any,
+    })
+
+    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith([
+      'original-actor-1',
+      'suspended-resumer',
+    ])
+    expect(result).toMatchObject({
+      success: false,
+      error: { statusCode: 403, message: 'Account suspended' },
+    })
+  })
+
+  it('excludes the "unknown" sentinel userId', async () => {
     const result = await preprocessExecution({ ...baseOptions, userId: 'unknown' })
 
     expect(result.success).toBe(true)
-    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith(['billed-account-1', 'creator-1'])
+    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith(['billed-account-1'])
+  })
+
+  /**
+   * The webhook and deployed-chat shape: `userId` names the workflow owner or
+   * the chat's creator, so a ban on them must not take down automation their
+   * teammates depend on. Those call sites declare it explicitly rather than the
+   * gate inferring it.
+   */
+  it('skips a userId the caller declares a stored reference', async () => {
+    mockGetActivelyBannedUserIds.mockImplementation(async (ids: string[]) =>
+      ids.filter((id) => id === 'creator-1')
+    )
+
+    const result = await preprocessExecution({
+      ...baseOptions,
+      userId: 'creator-1',
+      userIdIsStoredReference: true,
+    })
+
+    expect(result.success).toBe(true)
+    expect(mockGetActivelyBannedUserIds).toHaveBeenCalledWith(['billed-account-1'])
+    expect(mockGetActivelyBannedUserIds.mock.calls[0][0]).not.toContain('creator-1')
   })
 
   it('fails closed with 500 when the ban check errors', async () => {
@@ -639,6 +834,8 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 429,
       code: ADMISSION_ERROR_CODE.RESERVATION_CONCURRENCY,
       retryable: true,
+      /** A retryable denial must carry the descriptor's declared wait to the transport. */
+      retryAfterMs: 5000,
       message: 'Too many concurrent executions',
     },
     {
@@ -646,6 +843,8 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 402,
       code: ADMISSION_ERROR_CODE.RESERVATION_PAYER_HEADROOM,
       retryable: false,
+      /** Waiting does not fix a billing limit, so no retry pacing is offered. */
+      retryAfterMs: undefined,
       message: 'billing account has no guaranteed base-charge headroom',
     },
     {
@@ -653,11 +852,12 @@ describe('preprocessExecution billing attribution', () => {
       statusCode: 402,
       code: ADMISSION_ERROR_CODE.RESERVATION_MEMBER_HEADROOM,
       retryable: false,
+      retryAfterMs: undefined,
       message: 'organization member usage limit has no guaranteed base-charge headroom',
     },
   ])(
     'maps $reason to stable admission metadata while retaining local wording',
-    async ({ reason, statusCode, code, retryable, message }) => {
+    async ({ reason, statusCode, code, retryable, retryAfterMs, message }) => {
       mockCheckAttributedUsageLimits.mockResolvedValueOnce({
         isExceeded: false,
         payerUsage: { currentUsage: 1, limit: 10 },
@@ -685,6 +885,7 @@ describe('preprocessExecution billing attribution', () => {
       })
       if (result.success) throw new Error('Expected preprocessing to reject the reservation')
       expect(result.error.message).toContain(message)
+      expect(result.error.retryAfterMs).toBe(retryAfterMs)
     }
   )
 
@@ -702,6 +903,7 @@ describe('preprocessExecution billing attribution', () => {
       error: {
         statusCode: 503,
         retryable: true,
+        retryAfterMs: 5000,
         code: ADMISSION_ERROR_CODE.RESERVATION_INFRASTRUCTURE,
         cause: { code: 'SERVICE_OVERLOADED' },
       },

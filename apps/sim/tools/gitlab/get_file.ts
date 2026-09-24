@@ -4,6 +4,7 @@ import type { ToolConfig } from '@/tools/types'
 
 export const gitlabGetFileTool: ToolConfig<GitLabGetFileParams, GitLabGetFileResponse> = {
   id: 'gitlab_get_file',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Get File',
   description: 'Get the contents of a file from a GitLab project repository',
   version: '1.0.0',
@@ -25,7 +26,7 @@ export const gitlabGetFileTool: ToolConfig<GitLabGetFileParams, GitLabGetFileRes
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     filePath: {
       type: 'string',
@@ -66,6 +67,10 @@ export const gitlabGetFileTool: ToolConfig<GitLabGetFileParams, GitLabGetFileRes
 
     const data = await response.json()
     const decoded = Buffer.from(data.content ?? '', 'base64').toString('utf-8')
+    // Repository blobs can be hundreds of MB; cap what flows into the workflow
+    // payload so a huge file cannot blow up the execution log.
+    const maxContentChars = 1_000_000
+    const truncated = decoded.length > maxContentChars
 
     return {
       success: true,
@@ -76,7 +81,8 @@ export const gitlabGetFileTool: ToolConfig<GitLabGetFileParams, GitLabGetFileRes
         ref: data.ref ?? null,
         blobId: data.blob_id ?? null,
         lastCommitId: data.last_commit_id ?? null,
-        content: decoded,
+        content: truncated ? decoded.slice(0, maxContentChars) : decoded,
+        truncated,
       },
     }
   },
@@ -108,7 +114,11 @@ export const gitlabGetFileTool: ToolConfig<GitLabGetFileParams, GitLabGetFileRes
     },
     content: {
       type: 'string',
-      description: 'The decoded file content',
+      description: 'The decoded file content, truncated to 1M characters',
+    },
+    truncated: {
+      type: 'boolean',
+      description: 'Whether the content was truncated',
     },
   },
 }

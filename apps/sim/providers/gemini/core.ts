@@ -13,8 +13,16 @@ import {
 } from '@google/genai'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
-import type { IterationToolCall, StreamingExecution } from '@/executor/types'
+import { isRecordLike } from '@sim/utils/object'
+import type { IterationToolCall, NormalizedBlockOutput, StreamingExecution } from '@/executor/types'
 import { MAX_TOOL_ITERATIONS } from '@/providers'
+import { prepareConversationGeneration } from '@/providers/conversation-generation'
+import {
+  captureProviderConversationStep,
+  recordProviderConversationToolError,
+} from '@/providers/conversation-history'
+import { createGeminiStreamingToolLoopStream } from '@/providers/gemini/streaming-tool-loop'
+import { priceGeminiTokens, splitGeminiTokens, splitGeminiUsage } from '@/providers/gemini/usage'
 import {
   checkForForcedToolUsage,
   cleanSchemaForGemini,
@@ -28,6 +36,12 @@ import {
   mapToThinkingLevel,
   supportsDisablingGemini25Thinking,
 } from '@/providers/google/utils'
+import { getModelCapabilities, isKnownModelId } from '@/providers/models'
+import { executeProviderTool } from '@/providers/runtime-context'
+import { createSettledAgentEventStream } from '@/providers/stream-events'
+import { createStreamingExecution } from '@/providers/streaming-execution'
+import { isAbortError } from '@/providers/streaming-tool-loop-shared'
+import { ensureToolCallId } from '@/providers/tool-call-id'
 import { enrichLastModelSegment } from '@/providers/trace-enrichment'
 import type {
   FunctionCallResponse,
@@ -36,14 +50,12 @@ import type {
   TimeSegment,
 } from '@/providers/types'
 import {
-  calculateCost,
   isDeepResearchModel,
   isGemini3Model,
   prepareToolExecution,
   prepareToolsWithUsageControl,
   sumToolCosts,
 } from '@/providers/utils'
-import { executeTool } from '@/tools'
 import type { ExecutionState, GeminiProviderType, GeminiUsage } from './types'
 
 /**
@@ -57,20 +69,12 @@ function createInitialState(
   model: string,
   toolConfig: ToolConfig | undefined
 ): ExecutionState {
-  const initialCost = calculateCost(
-    model,
-    initialUsage.promptTokenCount,
-    initialUsage.candidatesTokenCount
-  )
+  const split = splitGeminiUsage(initialUsage)
 
   return {
     contents,
-    tokens: {
-      input: initialUsage.promptTokenCount,
-      output: initialUsage.candidatesTokenCount,
-      total: initialUsage.totalTokenCount,
-    },
-    cost: initialCost,
+    tokens: { ...split, total: initialUsage.totalTokenCount },
+    cost: priceGeminiTokens(model, split),
     toolCalls: [],
     toolResults: [],
     iterationCount: 0,
@@ -101,7 +105,8 @@ async function executeToolCallsBatch(
   request: ProviderRequest,
   state: ExecutionState,
   forcedTools: string[],
-  logger: ReturnType<typeof createLogger>
+  logger: ReturnType<typeof createLogger>,
+  assistantContent: Content
 ): Promise<{ success: boolean; state: ExecutionState }> {
   if (functionCallParts.length === 0) {
     return { success: false, state }
@@ -111,10 +116,16 @@ async function executeToolCallsBatch(
     const toolCallStartTime = Date.now()
     const functionCall = part.functionCall!
     const toolName = functionCall.name ?? ''
-    const args = (functionCall.args ?? {}) as Record<string, unknown>
+    const args = isRecordLike(functionCall.args) ? functionCall.args : undefined
 
     const tool = request.tools?.find((t) => t.id === toolName)
     if (!tool) {
+      await recordProviderConversationToolError(
+        request,
+        functionCall.id,
+        toolName,
+        `Tool ${toolName} not found`
+      )
       logger.warn(`Tool ${toolName} not found in registry, skipping`)
       return {
         success: false,
@@ -130,30 +141,60 @@ async function executeToolCallsBatch(
     }
 
     try {
-      const { toolParams, executionParams } = prepareToolExecution(tool, args, request)
-      const result = await executeTool(toolName, executionParams, {
+      if (!args) {
+        throw new Error(`Arguments for tool "${toolName}" must be an object`)
+      }
+
+      /*
+       * The RAW model id, not a synthesized one. Gemini often omits an id on a
+       * function-call part, in which case this is `undefined` and the keyed
+       * helper falls back loudly rather than deriving a token from something —
+       * a positional index, an execution-local id — that would look stable and
+       * not be.
+       */
+      const { toolParams, executionParams } = prepareToolExecution(
+        tool,
+        args,
+        request,
+        part.functionCall?.id
+      )
+      const { rawResponse, modelResponse } = await executeProviderTool(toolName, executionParams, {
         signal: request.abortSignal,
       })
       const toolCallEndTime = Date.now()
       const duration = toolCallEndTime - toolCallStartTime
 
-      const resultContent: Record<string, unknown> = result.success
-        ? ensureStructResponse(result.output)
-        : { error: true, message: result.error || 'Tool execution failed', tool: toolName }
+      const resultContent: Record<string, unknown> = rawResponse.success
+        ? ensureStructResponse(rawResponse.output)
+        : { error: true, message: rawResponse.error || 'Tool execution failed', tool: toolName }
+      const modelResultContent: Record<string, unknown> = modelResponse.success
+        ? ensureStructResponse(modelResponse.output)
+        : { error: true, message: modelResponse.error || 'Tool execution failed', tool: toolName }
 
       return {
-        success: result.success,
+        success: rawResponse.success,
         part,
         toolName,
         args,
         resultContent,
+        modelResultContent,
         toolParams,
-        result,
+        result: rawResponse,
         startTime: toolCallStartTime,
         endTime: toolCallEndTime,
         duration,
       }
     } catch (error) {
+      if (isAbortError(error) || request.abortSignal?.aborted) {
+        throw error
+      }
+      await recordProviderConversationToolError(
+        request,
+        functionCall.id,
+        toolName,
+        getErrorMessage(error, 'Tool execution failed')
+      )
+
       const toolCallEndTime = Date.now()
       logger.error('Error processing function call:', {
         error: toError(error).message,
@@ -163,7 +204,7 @@ async function executeToolCallsBatch(
         success: false,
         part,
         toolName,
-        args,
+        args: args ?? {},
         resultContent: {
           error: true,
           message: getErrorMessage(error, 'Tool execution failed'),
@@ -188,17 +229,17 @@ async function executeToolCallsBatch(
   // Build batched messages per Gemini spec:
   // ONE model message with ALL function call parts
   // ONE user message with ALL function responses
-  const modelParts: Part[] = results.map((r) => r.part)
   const userParts: Part[] = results.map((r) => ({
     functionResponse: {
       name: r.toolName,
-      response: r.resultContent,
+      response: 'modelResultContent' in r ? r.modelResultContent : r.resultContent,
+      ...(r.part.functionCall?.id ? { id: r.part.functionCall.id } : {}),
     },
   }))
 
   const updatedContents: Content[] = [
     ...state.contents,
-    { role: 'model', parts: modelParts },
+    assistantContent,
     { role: 'user', parts: userParts },
   ]
 
@@ -218,8 +259,8 @@ async function executeToolCallsBatch(
       result: r.resultContent,
     })
 
-    if (r.success && r.result?.output) {
-      newToolResults.push(r.result.output as Record<string, unknown>)
+    if (r.success && isRecordLike(r.result?.output)) {
+      newToolResults.push(r.result.output)
     }
 
     newTimeSegments.push({
@@ -228,7 +269,7 @@ async function executeToolCallsBatch(
       startTime: r.startTime,
       endTime: r.endTime,
       duration: r.duration,
-      toolCallId: r.part.functionCall?.id ?? undefined,
+      toolCallId: ensureToolCallId(r.part.functionCall?.id, 'gemini'),
     })
 
     totalToolsTime += r.duration
@@ -269,14 +310,16 @@ function updateStateWithResponse(
   endTime: number
 ): ExecutionState {
   const usage = convertUsageMetadata(response.usageMetadata)
-  const cost = calculateCost(model, usage.promptTokenCount, usage.candidatesTokenCount)
+  const split = splitGeminiUsage(usage)
+  const cost = priceGeminiTokens(model, split)
   const duration = endTime - startTime
 
   return {
     ...state,
     tokens: {
-      input: state.tokens.input + usage.promptTokenCount,
-      output: state.tokens.output + usage.candidatesTokenCount,
+      input: state.tokens.input + split.input,
+      output: state.tokens.output + split.output,
+      cacheRead: state.tokens.cacheRead + split.cacheRead,
       total: state.tokens.total + usage.totalTokenCount,
     },
     cost: {
@@ -296,7 +339,6 @@ function updateStateWithResponse(
         duration,
       },
     ],
-    iterationCount: state.iterationCount + 1,
   }
 }
 
@@ -352,7 +394,7 @@ function createStreamingResult(
       output: {
         content: '',
         model: '',
-        tokens: state?.tokens ?? { input: 0, output: 0, total: 0 },
+        tokens: state?.tokens ?? { input: 0, output: 0, cacheRead: 0, total: 0 },
         toolCalls: state?.toolCalls.length
           ? { list: state.toolCalls, count: state.toolCalls.length }
           : undefined,
@@ -364,7 +406,9 @@ function createStreamingResult(
           modelTime: state?.modelTime ?? firstResponseTime,
           toolsTime: state?.toolsTime ?? 0,
           firstResponseTime,
-          iterations: (state?.iterationCount ?? 0) + 1,
+          iterations: state
+            ? state.timeSegments.filter((segment) => segment.type === 'model').length
+            : 1,
           timeSegments: state?.timeSegments ?? [
             {
               type: 'model',
@@ -467,40 +511,47 @@ function collapseMessagesToInput(request: ProviderRequest): {
 }
 
 /**
- * Extracts text content from a completed interaction's outputs array.
- * The outputs array can contain text, thought, google_search_result, and other types.
- * We concatenate all text outputs to get the full research report.
+ * Extracts the report text from a completed interaction's step timeline.
+ *
+ * The v2 Interactions schema replaced the flat `outputs` array with `steps`, a
+ * type-discriminated timeline: the model's prose lives in `model_output` steps as text
+ * content, alongside thought, tool-call, and tool-result steps we deliberately skip.
  */
-function extractTextFromInteractionOutputs(outputs: Interactions.Interaction['outputs']): string {
-  if (!outputs || outputs.length === 0) return ''
+function extractTextFromInteractionSteps(steps: Interactions.Interaction['steps']): string {
+  if (!steps || steps.length === 0) return ''
 
   const textParts: string[] = []
-  for (const output of outputs) {
-    if (output.type === 'text') {
-      const text = (output as Interactions.TextContent).text
-      if (text) textParts.push(text)
+  for (const step of steps) {
+    if (step.type !== 'model_output') continue
+    for (const content of step.content ?? []) {
+      if (content.type === 'text' && content.text) textParts.push(content.text)
     }
   }
 
   return textParts.join('\n\n')
 }
 
-/**
- * Extracts token usage from an Interaction's Usage object.
- * The Interactions API provides total_input_tokens, total_output_tokens, total_tokens,
- * and total_reasoning_tokens (for thinking models).
- *
- * Also handles the raw API field name total_thought_tokens which the SDK may
- * map to total_reasoning_tokens.
- */
-function extractInteractionUsage(usage: Interactions.Usage | undefined): {
+/** Token usage for one deep research interaction. */
+interface DeepResearchUsage {
   inputTokens: number
   outputTokens: number
   reasoningTokens: number
+  cachedTokens: number
   totalTokens: number
-} {
+}
+
+/**
+ * Extracts token usage from an Interaction's Usage object.
+ * The Interactions API provides total_input_tokens, total_output_tokens, total_tokens,
+ * total_cached_tokens, and total_thought_tokens (for thinking models).
+ *
+ * The Interactions API supports implicit caching, and `total_cached_tokens` is a
+ * subset of `total_input_tokens` there just as `cachedContentTokenCount` is of
+ * `promptTokenCount` on generateContent.
+ */
+function extractInteractionUsage(usage: Interactions.Usage | undefined): DeepResearchUsage {
   if (!usage) {
-    return { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+    return { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedTokens: 0, totalTokens: 0 }
   }
 
   const usageLogger = createLogger('DeepResearchUsage')
@@ -508,13 +559,11 @@ function extractInteractionUsage(usage: Interactions.Usage | undefined): {
 
   const inputTokens = usage.total_input_tokens ?? 0
   const outputTokens = usage.total_output_tokens ?? 0
-  const reasoningTokens =
-    usage.total_reasoning_tokens ??
-    ((usage as Record<string, unknown>).total_thought_tokens as number) ??
-    0
+  const reasoningTokens = usage.total_thought_tokens ?? 0
+  const cachedTokens = usage.total_cached_tokens ?? 0
   const totalTokens = usage.total_tokens ?? inputTokens + outputTokens
 
-  return { inputTokens, outputTokens, reasoningTokens, totalTokens }
+  return { inputTokens, outputTokens, reasoningTokens, cachedTokens, totalTokens }
 }
 
 /**
@@ -523,25 +572,22 @@ function extractInteractionUsage(usage: Interactions.Usage | undefined): {
 function buildDeepResearchResponse(
   content: string,
   model: string,
-  usage: {
-    inputTokens: number
-    outputTokens: number
-    reasoningTokens: number
-    totalTokens: number
-  },
+  usage: DeepResearchUsage,
   providerStartTime: number,
   providerStartTimeISO: string,
   interactionId?: string
 ): ProviderResponse {
   const providerEndTime = Date.now()
   const duration = providerEndTime - providerStartTime
+  const split = splitGeminiTokens(usage.inputTokens, usage.outputTokens, usage.cachedTokens)
 
   return {
     content,
     model,
     tokens: {
-      input: usage.inputTokens,
-      output: usage.outputTokens,
+      input: split.input,
+      output: split.output,
+      cacheRead: split.cacheRead,
       total: usage.totalTokens,
     },
     timing: {
@@ -562,7 +608,7 @@ function buildDeepResearchResponse(
         },
       ],
     },
-    cost: calculateCost(model, usage.inputTokens, usage.outputTokens),
+    cost: priceGeminiTokens(model, split),
     interactionId,
   }
 }
@@ -571,50 +617,47 @@ function buildDeepResearchResponse(
  * Creates a ReadableStream from a deep research streaming interaction.
  *
  * Deep research streaming returns InteractionSSEEvent chunks including:
- * - interaction.start: initial interaction with ID
- * - content.delta: incremental text and thought_summary updates
- * - content.start / content.stop: output boundaries
- * - interaction.complete: final event (outputs is undefined in streaming; must reconstruct)
+ * - interaction.created: initial interaction with ID
+ * - step.delta: incremental text updates
+ * - step.start / step.stop: step boundaries
+ * - interaction.completed: final event (steps is undefined in streaming; must reconstruct)
  * - error: error events
  *
- * We stream text deltas to the client and track usage from the interaction.complete event.
+ * We stream text deltas to the client and track usage from the interaction.completed event.
  */
 function createDeepResearchStream(
   stream: AsyncIterable<Interactions.InteractionSSEEvent>,
-  onComplete?: (
-    content: string,
-    usage: {
-      inputTokens: number
-      outputTokens: number
-      reasoningTokens: number
-      totalTokens: number
-    },
-    interactionId?: string
-  ) => void
+  onComplete?: (content: string, usage: DeepResearchUsage, interactionId?: string) => void
 ): ReadableStream<Uint8Array> {
   const streamLogger = createLogger('DeepResearchStream')
   let fullContent = ''
-  let completionUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+  let completionUsage: DeepResearchUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+  }
   let completedInteractionId: string | undefined
 
   return new ReadableStream({
     async start(controller) {
       try {
         for await (const event of stream) {
-          if (event.event_type === 'content.delta') {
-            const delta = (event as Interactions.ContentDelta).delta
-            if (delta?.type === 'text' && 'text' in delta && delta.text) {
+          if (event.event_type === 'step.delta') {
+            const { delta } = event
+            if (delta?.type === 'text' && delta.text) {
               fullContent += delta.text
               controller.enqueue(new TextEncoder().encode(delta.text))
             }
-          } else if (event.event_type === 'interaction.complete') {
-            const interaction = (event as Interactions.InteractionEvent).interaction
+          } else if (event.event_type === 'interaction.completed') {
+            const { interaction } = event
             if (interaction?.usage) {
               completionUsage = extractInteractionUsage(interaction.usage)
             }
             completedInteractionId = interaction?.id
-          } else if (event.event_type === 'interaction.start') {
-            const interaction = (event as Interactions.InteractionEvent).interaction
+          } else if (event.event_type === 'interaction.created') {
+            const { interaction } = event
             if (interaction?.id) {
               completedInteractionId = interaction.id
             }
@@ -710,10 +753,17 @@ export async function executeDeepResearchRequest(
 
     // Streaming mode: create a streaming interaction and return a StreamingExecution
     if (request.stream) {
-      const streamParams: Interactions.CreateAgentInteractionParamsStreaming = {
+      /**
+       * `satisfies`, not an annotation: as of @google/genai 2.13.0 the namespace alias resolves
+       * to `CreateAgentInteraction`, whose `stream` is a plain `boolean`, so annotating erases
+       * the literal that discriminates `interactions.create`'s overloads and the call falls
+       * through to the union-returning signature. `satisfies` keeps the literal while still
+       * rejecting a misspelled or unknown field.
+       */
+      const streamParams = {
         ...baseParams,
-        stream: true,
-      }
+        stream: true as const,
+      } satisfies Interactions.CreateAgentInteractionParamsStreaming
 
       const streamResponse = await ai.interactions.create(
         streamParams,
@@ -766,16 +816,12 @@ export async function executeDeepResearchRequest(
       const stream = createDeepResearchStream(
         streamResponse,
         (content, usage, streamInteractionId) => {
-          streamingResult.execution.output.content = content
-          streamingResult.execution.output.tokens = {
-            input: usage.inputTokens,
-            output: usage.outputTokens,
-            total: usage.totalTokens,
-          }
-          streamingResult.execution.output.interactionId = streamInteractionId
+          const split = splitGeminiTokens(usage.inputTokens, usage.outputTokens, usage.cachedTokens)
 
-          const cost = calculateCost(model, usage.inputTokens, usage.outputTokens)
-          streamingResult.execution.output.cost = cost
+          streamingResult.execution.output.content = content
+          streamingResult.execution.output.tokens = { ...split, total: usage.totalTokens }
+          streamingResult.execution.output.interactionId = streamInteractionId
+          streamingResult.execution.output.cost = priceGeminiTokens(model, split)
 
           const streamEndTime = Date.now()
           if (streamingResult.execution.output.providerTiming) {
@@ -797,10 +843,11 @@ export async function executeDeepResearchRequest(
     }
 
     // Non-streaming mode: create and poll
-    const createParams: Interactions.CreateAgentInteractionParamsNonStreaming = {
+    /** `satisfies` for the same overload-discrimination reason as `streamParams` above. */
+    const createParams = {
       ...baseParams,
-      stream: false,
-    }
+      stream: false as const,
+    } satisfies Interactions.CreateAgentInteractionParamsNonStreaming
 
     const interaction = await ai.interactions.create(
       createParams,
@@ -827,6 +874,15 @@ export async function executeDeepResearchRequest(
         throw new Error(`Deep research interaction was cancelled: ${interactionId}`)
       }
 
+      /**
+       * Interactions v2 added terminal statuses beyond failed/cancelled. Without this they are
+       * polled until the hour-long ceiling and then reported as a Sim timeout, hiding a cause
+       * the caller can act on — `budget_exceeded` most of all.
+       */
+      if (result.status === 'budget_exceeded' || result.status === 'incomplete') {
+        throw new Error(`Deep research interaction ended as "${result.status}": ${interactionId}`)
+      }
+
       logger.info('Deep research in progress, polling...', {
         interactionId,
         status: result.status,
@@ -847,7 +903,7 @@ export async function executeDeepResearchRequest(
       )
     }
 
-    const content = extractTextFromInteractionOutputs(result.outputs)
+    const content = extractTextFromInteractionSteps(result.steps)
     const usage = extractInteractionUsage(result.usage)
 
     logger.info('Deep research completed', {
@@ -929,7 +985,10 @@ export async function executeGeminiRequest(
     if (request.abortSignal) {
       geminiConfig.abortSignal = request.abortSignal
     }
-    if (request.temperature !== undefined) {
+    if (
+      request.temperature !== undefined &&
+      (!isKnownModelId(request.model) || getModelCapabilities(request.model)?.temperature)
+    ) {
       geminiConfig.temperature = request.temperature
     }
     if (request.maxTokens != null) {
@@ -955,8 +1014,10 @@ export async function executeGeminiRequest(
     }
 
     // Gemini 3.x takes thinkingLevel directly; Gemini 2.5-series rejects it and needs thinkingBudget.
+    // includeThoughts is required for thought parts to appear; it is requested
+    // only on agent-events runs so legacy runs keep the pre-agent-events payload.
     if (request.thinkingLevel && request.thinkingLevel !== 'none') {
-      const thinkingConfig: ThinkingConfig = { includeThoughts: false }
+      const thinkingConfig: ThinkingConfig = { includeThoughts: request.agentEvents === true }
       if (isGemini3Model(model)) {
         thinkingConfig.thinkingLevel = mapToThinkingLevel(request.thinkingLevel)
       } else {
@@ -1019,17 +1080,81 @@ export async function executeGeminiRequest(
     }
 
     const initialCallTime = Date.now()
-    const shouldStream = request.stream && !tools?.length
+    /**
+     * Gemini 2 cannot combine responseSchema with tools, so structured output
+     * is applied on a final schema-configured request after tools settle — the
+     * silent path does this; the live loop would break as soon as a turn has
+     * no calls and skip the schema. Gemini 3 carries responseJsonSchema
+     * alongside tools, so its live loop keeps structured output.
+     */
+    const hasActiveTools = Boolean(geminiConfig.tools?.length)
+    const responseFormatNeedsFinalPass =
+      Boolean(request.responseFormat) && hasActiveTools && !isGemini3Model(model)
+    const liveToolLoopSupported = !responseFormatNeedsFinalPass
+    const shouldStream = request.stream && !hasActiveTools
+
+    // Live streaming tool loop
+    if (request.stream && liveToolLoopSupported && hasActiveTools) {
+      logger.info('Using streaming tool loop for Gemini request')
+
+      const timeSegments: TimeSegment[] = []
+      const forcedTools = preparedTools?.forcedTools ?? []
+
+      return createStreamingExecution({
+        model,
+        providerStartTime,
+        providerStartTimeISO,
+        timing: {
+          kind: 'accumulated',
+          modelTime: 0,
+          toolsTime: 0,
+          firstResponseTime: 0,
+          iterations: 1,
+          timeSegments,
+        },
+        initialTokens: { input: 0, output: 0, total: 0 },
+        initialCost: { total: 0.0, input: 0.0, output: 0.0 },
+        isStreaming: true,
+        streamFormat: 'agent-events-v1',
+        createStream: ({ output, finalizeTiming }) =>
+          createGeminiStreamingToolLoopStream({
+            ai,
+            model,
+            baseConfig: geminiConfig,
+            contents,
+            request,
+            logger,
+            timeSegments,
+            forcedTools,
+            toolConfig,
+            onComplete: (result) => {
+              output.content = result.content
+              output.tokens = result.tokens
+              output.cost = result.cost
+              output.toolCalls = result.toolCalls as NormalizedBlockOutput['toolCalls']
+              if (output.providerTiming) {
+                output.providerTiming.modelTime = result.modelTime
+                output.providerTiming.toolsTime = result.toolsTime
+                output.providerTiming.firstResponseTime = result.firstResponseTime
+                output.providerTiming.iterations = result.iterations
+              }
+              finalizeTiming()
+            },
+          }),
+      })
+    }
 
     // Streaming without tools
     if (shouldStream) {
       logger.info('Handling Gemini streaming response')
 
-      const streamGenerator = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: geminiConfig,
-      })
+      const streamGenerator = await ai.models.generateContentStream(
+        await prepareConversationGeneration(request, 'gemini', {
+          model,
+          contents,
+          config: geminiConfig,
+        })
+      )
       const firstResponseTime = Date.now() - initialCallTime
 
       const streamingResult = createStreamingResult(
@@ -1042,20 +1167,19 @@ export async function executeGeminiRequest(
 
       const stream = createReadableStreamFromGeminiStream(
         streamGenerator,
-        (content: string, usage: GeminiUsage) => {
-          streamingResult.execution.output.content = content
-          streamingResult.execution.output.tokens = {
-            input: usage.promptTokenCount,
-            output: usage.candidatesTokenCount,
-            total: usage.totalTokenCount,
-          }
+        (content: string, usage: GeminiUsage, thinking?: string) => {
+          const split = splitGeminiUsage(usage)
 
-          const costResult = calculateCost(
-            model,
-            usage.promptTokenCount,
-            usage.candidatesTokenCount
-          )
-          streamingResult.execution.output.cost = costResult
+          streamingResult.execution.output.content = content
+          streamingResult.execution.output.tokens = { ...split, total: usage.totalTokenCount }
+          streamingResult.execution.output.cost = priceGeminiTokens(request.model, split)
+
+          if (thinking) {
+            const segment = streamingResult.execution.output.providerTiming?.timeSegments?.[0]
+            if (segment) {
+              segment.thinkingContent = thinking
+            }
+          }
 
           const streamEndTime = Date.now()
           if (streamingResult.execution.output.providerTiming) {
@@ -1070,14 +1194,29 @@ export async function executeGeminiRequest(
               segments[0].duration = streamEndTime - providerStartTime
             }
           }
-        }
+        },
+        request
       )
 
-      return { ...streamingResult, stream }
+      return { ...streamingResult, stream, streamFormat: 'agent-events-v1' as const }
     }
 
     // Non-streaming request
-    const response = await ai.models.generateContent({ model, contents, config: geminiConfig })
+    const response = await ai.models.generateContent(
+      await prepareConversationGeneration(request, 'gemini', {
+        model,
+        contents,
+        config: geminiConfig,
+      })
+    )
+    if (!extractAllFunctionCallParts(response.candidates?.[0]).length) {
+      await captureProviderConversationStep(
+        request,
+        'gemini',
+        response.candidates?.[0]?.content,
+        splitGeminiUsage(convertUsageMetadata(response.usageMetadata))
+      )
+    }
     const firstResponseTime = Date.now() - initialCallTime
 
     // Check for UNEXPECTED_TOOL_CALL
@@ -1092,16 +1231,84 @@ export async function executeGeminiRequest(
       initialUsage,
       firstResponseTime,
       initialCallTime,
-      model,
+      request.model,
       toolConfig
     )
     enrichLastModelSegmentFromGeminiResponse(state.timeSegments, response, {
-      model,
+      model: request.model,
     })
     const forcedTools = preparedTools?.forcedTools ?? []
 
     let currentResponse = response
     let content = ''
+    const generateFinalSynthesis = async (
+      currentState: ExecutionState,
+      baseConfig: GenerateContentConfig
+    ): Promise<{ state: ExecutionState; response: GenerateContentResponse }> => {
+      const finalConfig: GenerateContentConfig = {
+        ...baseConfig,
+        tools: undefined,
+        toolConfig: undefined,
+      }
+      if (request.responseFormat && !isGemini3Model(model)) {
+        finalConfig.responseMimeType = 'application/json'
+        finalConfig.responseSchema = cleanSchemaForGemini(request.responseFormat.schema) as Schema
+      }
+
+      const finalStartTime = Date.now()
+      const finalResponse = await ai.models.generateContent(
+        await prepareConversationGeneration(request, 'gemini', {
+          model,
+          contents: currentState.contents,
+          config: finalConfig,
+        })
+      )
+      if (!extractAllFunctionCallParts(finalResponse.candidates?.[0]).length) {
+        await captureProviderConversationStep(
+          request,
+          'gemini',
+          finalResponse.candidates?.[0]?.content,
+          splitGeminiUsage(convertUsageMetadata(finalResponse.usageMetadata))
+        )
+      }
+      const finalState = updateStateWithResponse(
+        currentState,
+        finalResponse,
+        request.model,
+        finalStartTime,
+        Date.now()
+      )
+      enrichLastModelSegmentFromGeminiResponse(finalState.timeSegments, finalResponse, {
+        model: request.model,
+      })
+      return { state: finalState, response: finalResponse }
+    }
+    const createSettledStreamingResult = (
+      currentState: ExecutionState,
+      settledAnswer: string
+    ): StreamingExecution => {
+      const toolCost = sumToolCosts(currentState.toolResults)
+      const streamingResult = createStreamingResult(
+        providerStartTime,
+        providerStartTimeISO,
+        firstResponseTime,
+        initialCallTime,
+        currentState
+      )
+      streamingResult.execution.output.model = model
+      streamingResult.execution.output.content = settledAnswer
+      streamingResult.execution.output.cost = {
+        ...currentState.cost,
+        toolCost: toolCost || undefined,
+        total: currentState.cost.total + toolCost,
+      }
+
+      return {
+        ...streamingResult,
+        stream: createSettledAgentEventStream(settledAnswer),
+        streamFormat: 'agent-events-v1',
+      }
+    }
 
     // Tool execution loop
     const functionCalls = response.functionCalls
@@ -1109,11 +1316,32 @@ export async function executeGeminiRequest(
       const functionNames = functionCalls.map((fc) => fc.name).join(', ')
       logger.info(`Received ${functionCalls.length} function call(s) from Gemini: ${functionNames}`)
 
-      while (state.iterationCount < MAX_TOOL_ITERATIONS) {
+      while (true) {
         // Extract ALL function call parts from the response (Gemini can return multiple)
         const functionCallParts = extractAllFunctionCallParts(currentResponse.candidates?.[0])
         if (functionCallParts.length === 0) {
           content = extractTextContent(currentResponse.candidates?.[0])
+          break
+        }
+
+        if (state.iterationCount >= MAX_TOOL_ITERATIONS) {
+          logger.info('Gemini tool-batch cap reached; generating a tool-disabled final response')
+          const finalConfig = buildNextConfig(
+            geminiConfig,
+            state,
+            forcedTools,
+            request,
+            logger,
+            model
+          )
+          const finalSynthesis = await generateFinalSynthesis(state, finalConfig)
+          state = finalSynthesis.state
+          currentResponse = finalSynthesis.response
+          content = extractTextContent(finalSynthesis.response.candidates?.[0])
+
+          if (request.stream) {
+            return createSettledStreamingResult(state, content)
+          }
           break
         }
 
@@ -1122,13 +1350,20 @@ export async function executeGeminiRequest(
           `Processing ${functionCallParts.length} function call(s): ${callNames} (iteration ${state.iterationCount + 1})`
         )
 
+        await captureProviderConversationStep(
+          request,
+          'gemini',
+          currentResponse.candidates?.[0]?.content,
+          splitGeminiUsage(convertUsageMetadata(currentResponse.usageMetadata))
+        )
         // Execute ALL function calls in this batch
         const { success, state: updatedState } = await executeToolCallsBatch(
           functionCallParts,
           request,
           state,
           forcedTools,
-          logger
+          logger,
+          currentResponse.candidates?.[0]?.content ?? { role: 'model', parts: functionCallParts }
         )
         if (!success) {
           content = extractTextContent(currentResponse.candidates?.[0])
@@ -1138,106 +1373,50 @@ export async function executeGeminiRequest(
         state = { ...updatedState, iterationCount: updatedState.iterationCount + 1 }
         const nextConfig = buildNextConfig(geminiConfig, state, forcedTools, request, logger, model)
 
-        // Stream final response if requested
-        if (request.stream) {
-          const checkResponse = await ai.models.generateContent({
-            model,
-            contents: state.contents,
-            config: nextConfig,
-          })
-          state = updateStateWithResponse(state, checkResponse, model, Date.now() - 100, Date.now())
-          enrichLastModelSegmentFromGeminiResponse(state.timeSegments, checkResponse, {
-            model,
-          })
-
-          if (checkResponse.functionCalls?.length) {
-            currentResponse = checkResponse
-            continue
-          }
-
-          logger.info('No more function calls, streaming final response')
-
-          if (request.responseFormat) {
-            nextConfig.tools = undefined
-            nextConfig.toolConfig = undefined
-            if (!isGemini3Model(model)) {
-              nextConfig.responseMimeType = 'application/json'
-              nextConfig.responseSchema = cleanSchemaForGemini(
-                request.responseFormat.schema
-              ) as Schema
-            }
-          }
-
-          // Capture accumulated cost before streaming
-          const accumulatedCost = {
-            input: state.cost.input,
-            output: state.cost.output,
-            total: state.cost.total,
-          }
-          const accumulatedTokens = { ...state.tokens }
-
-          const streamGenerator = await ai.models.generateContentStream({
-            model,
-            contents: state.contents,
-            config: nextConfig,
-          })
-
-          const streamingResult = createStreamingResult(
-            providerStartTime,
-            providerStartTimeISO,
-            firstResponseTime,
-            initialCallTime,
-            state
-          )
-          streamingResult.execution.output.model = model
-
-          const stream = createReadableStreamFromGeminiStream(
-            streamGenerator,
-            (streamContent: string, usage: GeminiUsage) => {
-              streamingResult.execution.output.content = streamContent
-              streamingResult.execution.output.tokens = {
-                input: accumulatedTokens.input + usage.promptTokenCount,
-                output: accumulatedTokens.output + usage.candidatesTokenCount,
-                total: accumulatedTokens.total + usage.totalTokenCount,
-              }
-
-              const streamCost = calculateCost(
-                model,
-                usage.promptTokenCount,
-                usage.candidatesTokenCount
-              )
-              const tc = sumToolCosts(state.toolResults)
-              streamingResult.execution.output.cost = {
-                input: accumulatedCost.input + streamCost.input,
-                output: accumulatedCost.output + streamCost.output,
-                toolCost: tc || undefined,
-                total: accumulatedCost.total + streamCost.total + tc,
-                pricing: streamCost.pricing,
-              }
-
-              if (streamingResult.execution.output.providerTiming) {
-                streamingResult.execution.output.providerTiming.endTime = new Date().toISOString()
-                streamingResult.execution.output.providerTiming.duration =
-                  Date.now() - providerStartTime
-              }
-            }
-          )
-
-          return { ...streamingResult, stream }
-        }
-
-        // Non-streaming: get next response
+        /** Resolve the final turn, then project its settled answer when streaming was requested. */
         const nextModelStartTime = Date.now()
-        const nextResponse = await ai.models.generateContent({
-          model,
-          contents: state.contents,
-          config: nextConfig,
-        })
-        state = updateStateWithResponse(state, nextResponse, model, nextModelStartTime, Date.now())
+        const nextResponse = await ai.models.generateContent(
+          await prepareConversationGeneration(request, 'gemini', {
+            model,
+            contents: state.contents,
+            config: nextConfig,
+          })
+        )
+        if (!extractAllFunctionCallParts(nextResponse.candidates?.[0]).length) {
+          await captureProviderConversationStep(
+            request,
+            'gemini',
+            nextResponse.candidates?.[0]?.content,
+            splitGeminiUsage(convertUsageMetadata(nextResponse.usageMetadata))
+          )
+        }
+        state = updateStateWithResponse(
+          state,
+          nextResponse,
+          request.model,
+          nextModelStartTime,
+          Date.now()
+        )
         enrichLastModelSegmentFromGeminiResponse(state.timeSegments, nextResponse, {
-          model,
+          model: request.model,
         })
         currentResponse = nextResponse
+
+        if (
+          request.stream &&
+          extractAllFunctionCallParts(nextResponse.candidates?.[0]).length === 0
+        ) {
+          let settledResponse = nextResponse
+          if (responseFormatNeedsFinalPass) {
+            logger.info('Generating final schema-configured Gemini response')
+            const finalSynthesis = await generateFinalSynthesis(state, nextConfig)
+            state = finalSynthesis.state
+            settledResponse = finalSynthesis.response
+          }
+
+          const settledAnswer = extractTextContent(settledResponse.candidates?.[0])
+          return createSettledStreamingResult(state, settledAnswer)
+        }
       }
 
       if (!content) {
@@ -1262,7 +1441,7 @@ export async function executeGeminiRequest(
         modelTime: state.modelTime,
         toolsTime: state.toolsTime,
         firstResponseTime,
-        iterations: state.iterationCount + 1,
+        iterations: state.timeSegments.filter((segment) => segment.type === 'model').length,
         timeSegments: state.timeSegments,
       },
       cost: state.cost,
@@ -1275,6 +1454,10 @@ export async function executeGeminiRequest(
       error: toError(error).message,
       stack: error instanceof Error ? error.stack : undefined,
     })
+
+    if (isAbortError(error) || request.abortSignal?.aborted) {
+      throw error
+    }
 
     const enhancedError = toError(error)
     Object.assign(enhancedError, {
@@ -1318,13 +1501,13 @@ function enrichLastModelSegmentFromGeminiResponse(
       Boolean(p.functionCall)
     )
     .map((p) => ({
-      id: p.functionCall.id ?? '',
+      id: ensureToolCallId(p.functionCall.id, 'gemini'),
       name: p.functionCall.name ?? '',
       arguments: (p.functionCall.args ?? {}) as Record<string, unknown>,
     }))
 
   const usage = convertUsageMetadata(response.usageMetadata)
-  const cachedContentTokens = response.usageMetadata?.cachedContentTokenCount ?? 0
+  const split = splitGeminiUsage(usage)
   const thoughtsTokens = response.usageMetadata?.thoughtsTokenCount ?? 0
 
   let cost: { input: number; output: number; total: number } | undefined
@@ -1334,12 +1517,7 @@ function enrichLastModelSegmentFromGeminiResponse(
     typeof usage.promptTokenCount === 'number' &&
     typeof usage.candidatesTokenCount === 'number'
   ) {
-    const full = calculateCost(
-      extras.model,
-      usage.promptTokenCount,
-      usage.candidatesTokenCount,
-      cachedContentTokens > 0
-    )
+    const full = priceGeminiTokens(extras.model, split)
     cost = { input: full.input, output: full.output, total: full.total }
   }
 
@@ -1353,7 +1531,7 @@ function enrichLastModelSegmentFromGeminiResponse(
           input: usage.promptTokenCount,
           output: usage.candidatesTokenCount,
           total: usage.totalTokenCount,
-          ...(cachedContentTokens > 0 && { cacheRead: cachedContentTokens }),
+          ...(split.cacheRead > 0 && { cacheRead: split.cacheRead }),
           ...(thoughtsTokens > 0 && { reasoning: thoughtsTokens }),
         }
       : undefined,

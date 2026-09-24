@@ -3,9 +3,9 @@ import type { NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
 import { fileViewContract } from '@/lib/api/contracts/storage-transfer'
 import { parseRequest } from '@/lib/api/server'
-import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
+import { AuthType, checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
-import { type StorageContext, USE_BLOB_STORAGE } from '@/lib/uploads/config'
+import { getServeStoragePrefix, type StorageContext } from '@/lib/uploads/config'
 import { getFileMetadataById } from '@/lib/uploads/server/metadata'
 import { verifyFileAccess } from '@/app/api/files/authorization'
 
@@ -37,7 +37,9 @@ export const GET = withRouteHandler(
       record.key,
       authResult.userId,
       undefined,
-      record.context as StorageContext | 'general'
+      record.context as StorageContext | 'general',
+      undefined,
+      { knowledgeAccess: authResult.authType === AuthType.SESSION ? 'user' : undefined }
     )
     if (!hasAccess) {
       logger.warn('Unauthorized file view attempt', { id, userId: authResult.userId })
@@ -57,7 +59,7 @@ export const GET = withRouteHandler(
       )
     }
 
-    const storagePrefix = USE_BLOB_STORAGE ? 'blob' : 's3'
+    const storagePrefix = getServeStoragePrefix()
     const servePath = `/api/files/serve/${storagePrefix}/${encodeURIComponent(record.key)}`
     logger.info('Redirecting file view to serve path', { id, servePath })
 

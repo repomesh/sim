@@ -5,6 +5,7 @@ import {
   MothershipStreamV1ToolOutcome,
 } from '@/lib/copilot/generated/mothership-stream-v1'
 import { isToolHiddenInUi } from '@/lib/copilot/tools/client/hidden-tools'
+import { normalizeToolActivityDescription } from '@/lib/copilot/tools/tool-display'
 import {
   type ChatContextKind,
   type ChatMessage,
@@ -30,6 +31,7 @@ const STATE_TO_STATUS: Record<string, ToolCallStatus> = {
   interrupted: ToolCallStatus.interrupted,
   pending: ToolCallStatus.executing,
   executing: ToolCallStatus.executing,
+  awaiting_approval: ToolCallStatus.awaiting_approval,
 }
 
 function toToolCallInfo(block: PersistedContentBlock): ToolCallInfo | undefined {
@@ -37,11 +39,13 @@ function toToolCallInfo(block: PersistedContentBlock): ToolCallInfo | undefined 
   if (!tc) return undefined
   if (isToolHiddenInUi(tc.name)) return undefined
   const status: ToolCallStatus = STATE_TO_STATUS[tc.state] ?? ToolCallStatus.error
+  const activityDescription = normalizeToolActivityDescription(tc.activityDescription)
   return {
     id: tc.id,
     name: tc.name,
     status,
     displayTitle: status === ToolCallStatus.cancelled ? 'Stopped by user' : tc.display?.title,
+    ...(activityDescription ? { activityDescription } : {}),
     params: tc.params,
     calledBy: tc.calledBy,
     result: tc.result,
@@ -68,9 +72,17 @@ function toDisplayBlockBody(block: PersistedContentBlock): ContentBlock | undefi
     case MothershipStreamV1EventType.text:
       if (block.lane === 'subagent') {
         if (block.channel === 'thinking') {
-          return { type: ContentBlockType.subagent_thinking, content: block.content }
+          return {
+            type: ContentBlockType.subagent_thinking,
+            content: block.content,
+            ...(block.agent ? { subagent: block.agent } : {}),
+          }
         }
-        return { type: ContentBlockType.subagent_text, content: block.content }
+        return {
+          type: ContentBlockType.subagent_text,
+          content: block.content,
+          ...(block.agent ? { subagent: block.agent } : {}),
+        }
       }
       if (block.channel === 'thinking') {
         return { type: ContentBlockType.thinking, content: block.content }
@@ -83,7 +95,11 @@ function toDisplayBlockBody(block: PersistedContentBlock): ContentBlock | undefi
       if (block.lifecycle === MothershipStreamV1SpanLifecycleEvent.end) {
         return { type: ContentBlockType.subagent_end }
       }
-      return { type: ContentBlockType.subagent, content: block.content }
+      return {
+        type: ContentBlockType.subagent,
+        content: block.content,
+        ...(block.name ? { subagentName: block.name } : {}),
+      }
     case MothershipStreamV1EventType.complete:
       if (block.status === MothershipStreamV1CompletionStatus.cancelled) {
         return { type: ContentBlockType.stopped }
@@ -118,20 +134,28 @@ function toDisplayContexts(
     ...(c.fileId ? { fileId: c.fileId } : {}),
     ...(c.folderId ? { folderId: c.folderId } : {}),
     ...(c.chatId ? { chatId: c.chatId } : {}),
+    ...(c.blockType ? { blockType: c.blockType } : {}),
+    ...(c.skillId ? { skillId: c.skillId } : {}),
+    ...(c.serverId ? { serverId: c.serverId } : {}),
+    ...(c.fileName ? { fileName: c.fileName } : {}),
+    ...(c.tableName ? { tableName: c.tableName } : {}),
+    ...(c.tabId ? { tabId: c.tabId } : {}),
+    ...(c.terminalId ? { terminalId: c.terminalId } : {}),
+    ...(c.selection ? { selection: { ...c.selection } } : {}),
   }))
 }
 
-const WORKSPACE_FILE_TOOL = 'workspace_file'
-const EDIT_CONTENT_TOOL = 'edit_content'
+const WORKSPACE_FILE_TOOL = 'prepare_file_edit'
+const EDIT_CONTENT_TOOL = 'apply_file_edit'
 const MAIN_SPAN = 'main'
 
 /**
- * Collapses an `edit_content` write into the most-recent `workspace_file` row in
+ * Collapses an `apply_file_edit` write into the most-recent `prepare_file_edit` row in
  * the same subagent span, mirroring the live turn-model fold. The live view
  * folds these in `reduceEvent`, but the persisted transcript stores them as two
  * separate tool blocks; without this a reloaded chat splits the file write into
- * "workspace_file" + "edit_content" rows (and a refresh mid-write leaves the
- * second row spinning). The reopened row inherits the edit_content's final
+ * "prepare_file_edit" + "apply_file_edit" rows (and a refresh mid-write leaves the
+ * second row spinning). The reopened row inherits the apply_file_edit's final
  * status/result, exactly as the live single "writing" row resolves. Every other
  * block is passed through untouched, so this only affects file writes.
  */
@@ -177,6 +201,7 @@ export function toDisplayMessage(msg: PersistedMessage): ChatMessage {
     id: msg.id,
     role: msg.role,
     content: msg.content,
+    ...(msg.requestMode ? { requestMode: msg.requestMode } : {}),
   }
 
   if (msg.requestId) {

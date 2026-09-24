@@ -3,16 +3,18 @@
 import { useEffect } from 'react'
 import dynamic from 'next/dynamic'
 import { usePostHog } from 'posthog-js/react'
+import { getSettingsPermissionConfigKey } from '@/components/settings/navigation'
 import { useSession } from '@/lib/auth/auth-client'
+import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
 import { captureEvent } from '@/lib/posthog/client'
 import { useWorkspaceHostContext } from '@/app/workspace/[workspaceId]/providers/workspace-host-provider'
 import { General } from '@/app/workspace/[workspaceId]/settings/components/general/general'
 import { SettingsSectionProvider } from '@/app/workspace/[workspaceId]/settings/components/settings-panel'
 import {
   getSettingsSectionMeta,
-  isBillingEnabled,
   type SettingsSection,
 } from '@/app/workspace/[workspaceId]/settings/navigation'
+import { PermissionAccessBoundary } from '@/ee/access-requests/components/permission-access-boundary'
 
 const Admin = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/admin/admin').then((m) => m.Admin)
@@ -25,12 +27,19 @@ const ApiKeys = dynamic(() =>
 const BYOK = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/byok/byok').then((m) => m.BYOK)
 )
-const Copilot = dynamic(() =>
-  import('@/app/workspace/[workspaceId]/settings/components/copilot/copilot').then((m) => m.Copilot)
-)
 const Forks = dynamic(() => import('@/ee/workspace-forking/components/forks').then((m) => m.Forks))
 const Secrets = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/secrets/secrets').then((m) => m.Secrets)
+)
+const OrganizationConnectedAccounts = dynamic(() =>
+  import('@/ee/credential-groups/components/organization-connected-accounts').then(
+    (m) => m.OrganizationConnectedAccounts
+  )
+)
+const Sandboxes = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/sandboxes/sandboxes').then(
+    (m) => m.Sandboxes
+  )
 )
 const CustomTools = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/custom-tools/custom-tools').then(
@@ -53,6 +62,11 @@ const RecentlyDeleted = dynamic(() =>
     '@/app/workspace/[workspaceId]/settings/components/recently-deleted/recently-deleted'
   ).then((m) => m.RecentlyDeleted)
 )
+const SelfHost = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/self-host/self-host').then(
+    (m) => m.SelfHost
+  )
+)
 const Billing = dynamic(() =>
   import('@/app/workspace/[workspaceId]/settings/components/billing/billing').then((m) => m.Billing)
 )
@@ -74,6 +88,11 @@ const WorkflowMcpServers = dynamic(() =>
 const AccessControl = dynamic(() =>
   import('@/ee/access-control/components/access-control').then((m) => m.AccessControl)
 )
+const AccessRequestsSettings = dynamic(() =>
+  import('@/ee/access-requests/components/access-requests-settings').then(
+    (m) => m.AccessRequestsSettings
+  )
+)
 const CustomBlocks = dynamic(() =>
   import('@/ee/custom-blocks/components/custom-blocks').then((m) => m.CustomBlocks)
 )
@@ -89,28 +108,54 @@ const DataRetentionSettings = dynamic(() =>
 const DataDrainsSettings = dynamic(() =>
   import('@/ee/data-drains/components/data-drains-settings').then((m) => m.DataDrainsSettings)
 )
-const WhitelabelingSettings = dynamic(
-  () =>
-    import('@/ee/whitelabeling/components/whitelabeling-settings').then(
-      (m) => m.WhitelabelingSettings
-    ),
-  { ssr: false }
+const OrganizationSecuritySettings = dynamic(() =>
+  import('@/components/settings/organization-security').then((m) => m.OrganizationSecuritySettings)
+)
+const UsageMonitoring = dynamic(() =>
+  import('@/ee/organization-usage/components/usage-monitoring').then((m) => m.UsageMonitoring)
+)
+const Desktop = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/desktop/desktop').then((m) => m.Desktop)
+)
+const Browser = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/browser/browser').then((m) => m.Browser)
+)
+const Terminal = dynamic(() =>
+  import('@/app/workspace/[workspaceId]/settings/components/terminal/terminal').then(
+    (m) => m.Terminal
+  )
+)
+const WhitelabelingSettings = dynamic(() =>
+  import('@/ee/whitelabeling/components/whitelabeling-settings').then(
+    (m) => m.WhitelabelingSettings
+  )
 )
 
 interface SettingsPageProps {
   section: SettingsSection
 }
 
-export function SettingsPage({ section }: SettingsPageProps) {
+export function SettingsPage(props: SettingsPageProps) {
+  const configKey = getSettingsPermissionConfigKey(props.section)
+  if (!configKey) return <SettingsPageContent {...props} />
+  return (
+    <PermissionAccessBoundary configKey={configKey}>
+      <SettingsPageContent {...props} />
+    </PermissionAccessBoundary>
+  )
+}
+
+function SettingsPageContent({ section }: SettingsPageProps) {
   const { data: session, isPending: sessionLoading } = useSession()
   const hostContext = useWorkspaceHostContext()
+  const { billingEnabled } = useDeploymentShape()
   const posthog = usePostHog()
 
   const isAdminRole = session?.user?.role === 'admin'
   const normalizedSection: SettingsSection =
     (section as string) === 'subscription' ? 'billing' : section
   const effectiveSection =
-    !isBillingEnabled && (normalizedSection === 'billing' || normalizedSection === 'organization')
+    !billingEnabled && normalizedSection === 'billing'
       ? 'general'
       : normalizedSection === 'admin' && !sessionLoading && !isAdminRole
         ? 'general'
@@ -131,19 +176,41 @@ export function SettingsPage({ section }: SettingsPageProps) {
   return (
     <SettingsSectionProvider section={effectiveSection} meta={meta ?? undefined}>
       {effectiveSection === 'general' && <General />}
+      {effectiveSection === 'desktop' && <Desktop />}
+      {effectiveSection === 'browser' && <Browser />}
+      {effectiveSection === 'terminal' && <Terminal />}
       {effectiveSection === 'secrets' && <Secrets />}
+      {effectiveSection === 'connected-accounts' && organizationId && (
+        <OrganizationConnectedAccounts organizationId={organizationId} />
+      )}
       {effectiveSection === 'access-control' && organizationId && (
         <AccessControl
           organizationId={organizationId}
           isOrganizationAdmin={hostContext.viewer.isHostOrganizationAdmin}
+          requestsHref={`/workspace/${hostContext.workspace.id}/settings/requests`}
+        />
+      )}
+      {effectiveSection === 'requests' && organizationId && (
+        <AccessRequestsSettings
+          scope={{ kind: 'workspace', workspaceId: hostContext.workspace.id }}
+          reviewOrganizationId={
+            hostContext.viewer.isHostOrganizationAdmin ? organizationId : undefined
+          }
         />
       )}
       {effectiveSection === 'custom-blocks' && <CustomBlocks />}
       {effectiveSection === 'audit-logs' && organizationId && (
         <AuditLogs organizationId={organizationId} />
       )}
+      {effectiveSection === 'usage' && organizationId && (
+        <UsageMonitoring
+          organizationId={organizationId}
+          eventsHref={`/workspace/${hostContext.workspace.id}/settings/usage/events`}
+          auditLogsHref={`/workspace/${hostContext.workspace.id}/settings/audit-logs`}
+        />
+      )}
       {effectiveSection === 'apikeys' && <ApiKeys scope='combined' />}
-      {isBillingEnabled && effectiveSection === 'billing' && (
+      {billingEnabled && effectiveSection === 'billing' && (
         <Billing
           scope={organizationId ? 'organization' : 'account'}
           organizationId={organizationId ?? undefined}
@@ -151,7 +218,7 @@ export function SettingsPage({ section }: SettingsPageProps) {
         />
       )}
       {effectiveSection === 'teammates' && <Teammates />}
-      {isBillingEnabled && effectiveSection === 'organization' && organizationId && (
+      {effectiveSection === 'organization' && organizationId && (
         <TeamManagement
           organizationId={organizationId}
           billingHref={`/workspace/${hostContext.workspace.id}/settings/billing`}
@@ -164,17 +231,21 @@ export function SettingsPage({ section }: SettingsPageProps) {
       {effectiveSection === 'data-drains' && organizationId && (
         <DataDrainsSettings organizationId={organizationId} />
       )}
+      {effectiveSection === 'security' && organizationId && (
+        <OrganizationSecuritySettings organizationId={organizationId} />
+      )}
       {effectiveSection === 'whitelabeling' && organizationId && (
         <WhitelabelingSettings organizationId={organizationId} />
       )}
       {effectiveSection === 'byok' && <BYOK />}
-      {effectiveSection === 'copilot' && <Copilot />}
+      {effectiveSection === 'sandboxes' && <Sandboxes />}
       {effectiveSection === 'mcp' && <MCP />}
       {effectiveSection === 'forks' && <Forks />}
       {effectiveSection === 'custom-tools' && <CustomTools />}
       {effectiveSection === 'workflow-mcp-servers' && <WorkflowMcpServers />}
       {effectiveSection === 'inbox' && <Inbox />}
       {effectiveSection === 'recently-deleted' && <RecentlyDeleted />}
+      {effectiveSection === 'self-host' && <SelfHost />}
       {effectiveSection === 'admin' && <Admin />}
       {effectiveSection === 'mothership' && <Mothership />}
     </SettingsSectionProvider>

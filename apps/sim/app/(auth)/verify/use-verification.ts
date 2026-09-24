@@ -3,11 +3,42 @@
 import { useEffect, useState } from 'react'
 import { createLogger } from '@sim/logger'
 import { normalizeEmail } from '@sim/utils/string'
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useSearchParams } from 'next/navigation'
 import { client, useSession } from '@/lib/auth/auth-client'
+import { SSO_REQUIRED_ERROR_CODE } from '@/lib/auth/constants'
 import { validateCallbackUrl } from '@/lib/core/security/input-validation'
+import { DEFAULT_POST_AUTH_ROUTE, POST_AUTH_REDIRECT_STORAGE_KEY } from '@/app/(auth)/auth-redirect'
 
 const logger = createLogger('useVerification')
+
+/**
+ * Resolves the post-auth destination at the moment of redirect rather than
+ * caching it in state.
+ *
+ * Both redirect sites run in the same commit as the effect that reads session
+ * storage, so a cached value is still `null` when they fire and the stored
+ * destination is silently replaced by the default entry. Reading here removes that
+ * race. `redirectAfter` wins over the stored URL; anything failing callback
+ * validation is discarded, and an unsafe stored value is evicted.
+ */
+function resolveRedirectUrl(redirectParam: string | null): string | null {
+  let resolved: string | null = null
+
+  const stored = sessionStorage.getItem(POST_AUTH_REDIRECT_STORAGE_KEY)
+  if (stored && validateCallbackUrl(stored)) {
+    resolved = stored
+  } else if (stored) {
+    logger.warn('Ignoring unsafe stored post-auth redirect URL', { url: stored })
+    sessionStorage.removeItem(POST_AUTH_REDIRECT_STORAGE_KEY)
+  }
+
+  if (redirectParam) {
+    if (validateCallbackUrl(redirectParam)) resolved = redirectParam
+    else logger.warn('Ignoring unsafe redirectAfter parameter', { url: redirectParam })
+  }
+
+  return resolved
+}
 
 /**
  * Mutually-exclusive phases of the email-OTP verification machine.
@@ -44,60 +75,20 @@ export function useVerification({
   isProduction,
   isEmailVerificationEnabled,
 }: UseVerificationParams): UseVerificationReturn {
-  const router = useRouter()
   const searchParams = useSearchParams()
-  const { refetch: refetchSession } = useSession()
+  const { data: session, refetch: refetchSession } = useSession()
   const [otp, setOtp] = useState('')
-  const [email, setEmail] = useState('')
+  const [storedEmail, setStoredEmail] = useState('')
   const [status, setStatus] = useState<VerificationStatus>('idle')
   const [isResending, setIsResending] = useState(false)
-  const [isSendingInitialOtp, setIsSendingInitialOtp] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
-  const [redirectUrl, setRedirectUrl] = useState<string | null>(null)
-  const [isInviteFlow, setIsInviteFlow] = useState(false)
 
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const storedEmail = sessionStorage.getItem('verificationEmail')
-      if (storedEmail) {
-        setEmail(storedEmail)
-      }
+    const storedEmail = sessionStorage.getItem('verificationEmail')
+    if (storedEmail) setStoredEmail(storedEmail)
+  }, [])
 
-      const storedRedirectUrl = sessionStorage.getItem('inviteRedirectUrl')
-      if (storedRedirectUrl && validateCallbackUrl(storedRedirectUrl)) {
-        setRedirectUrl(storedRedirectUrl)
-      } else if (storedRedirectUrl) {
-        logger.warn('Ignoring unsafe stored invite redirect URL', { url: storedRedirectUrl })
-        sessionStorage.removeItem('inviteRedirectUrl')
-      }
-
-      const storedIsInviteFlow = sessionStorage.getItem('isInviteFlow')
-      if (storedIsInviteFlow === 'true') {
-        setIsInviteFlow(true)
-      }
-    }
-
-    const redirectParam = searchParams.get('redirectAfter')
-    if (redirectParam) {
-      if (validateCallbackUrl(redirectParam)) {
-        setRedirectUrl(redirectParam)
-      } else {
-        logger.warn('Ignoring unsafe redirectAfter parameter', { url: redirectParam })
-      }
-    }
-
-    const inviteFlowParam = searchParams.get('invite_flow')
-    if (inviteFlowParam === 'true') {
-      setIsInviteFlow(true)
-    }
-  }, [searchParams])
-
-  useEffect(() => {
-    if (email && !isSendingInitialOtp && hasEmailService) {
-      setIsSendingInitialOtp(true)
-    }
-  }, [email, isSendingInitialOtp, hasEmailService])
-
+  const email = session?.user?.email || storedEmail
   const isOtpComplete = otp.length === 6
 
   async function verifyCode() {
@@ -122,25 +113,24 @@ export function useVerification({
           logger.warn('Failed to refetch session after verification', e)
         }
 
-        if (typeof window !== 'undefined') {
-          sessionStorage.removeItem('verificationEmail')
-
-          if (isInviteFlow) {
-            sessionStorage.removeItem('inviteRedirectUrl')
-            sessionStorage.removeItem('isInviteFlow')
-          }
-        }
+        const destination =
+          resolveRedirectUrl(searchParams.get('redirectAfter')) ?? DEFAULT_POST_AUTH_ROUTE
+        sessionStorage.removeItem('verificationEmail')
+        sessionStorage.removeItem(POST_AUTH_REDIRECT_STORAGE_KEY)
 
         setTimeout(() => {
-          if (isInviteFlow && redirectUrl) {
-            window.location.href = redirectUrl
-          } else {
-            window.location.href = '/workspace'
-          }
+          window.location.href = destination
         }, 1000)
       } else {
         logger.info('Setting invalid OTP state - API error response')
-        const message = 'Invalid verification code. Please check and try again.'
+        /**
+         * A refusal by policy — an organization requiring single sign-on — is not a bad code, and
+         * telling the person to re-check their code sends them round a loop they cannot exit.
+         */
+        const message =
+          response?.error?.code === SSO_REQUIRED_ERROR_CODE && response.error.message
+            ? response.error.message
+            : 'Invalid verification code. Please check and try again.'
         setStatus('error')
         setErrorMessage(message)
         logger.info('Error state after API error:', { errorMessage: message })
@@ -217,28 +207,28 @@ export function useVerification({
   }, [otp, email, status, isResending])
 
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      if (!isEmailVerificationEnabled) {
-        setStatus('verified')
+    if (isEmailVerificationEnabled) return
 
-        const handleRedirect = async () => {
-          try {
-            await refetchSession()
-          } catch (error) {
-            logger.warn('Failed to refetch session during verification skip:', error)
-          }
+    setStatus('verified')
 
-          if (isInviteFlow && redirectUrl) {
-            window.location.href = redirectUrl
-          } else {
-            router.push('/workspace')
-          }
-        }
+    const destination = resolveRedirectUrl(searchParams.get('redirectAfter'))
+    // Single-use: consume the stored destination here too, or it survives this
+    // flow and reapplies to a later sign-in in the same tab.
+    sessionStorage.removeItem(POST_AUTH_REDIRECT_STORAGE_KEY)
 
-        handleRedirect()
+    const handleRedirect = async () => {
+      try {
+        await refetchSession()
+      } catch (error) {
+        logger.warn('Failed to refetch session during verification skip:', error)
       }
+
+      /** A document navigation, like signup's, so the workspace shell initializes its own theme store. */
+      window.location.href = destination ?? DEFAULT_POST_AUTH_ROUTE
     }
-  }, [isEmailVerificationEnabled, router, isInviteFlow, redirectUrl])
+
+    handleRedirect()
+  }, [isEmailVerificationEnabled, searchParams])
 
   return {
     otp,

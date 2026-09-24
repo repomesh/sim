@@ -18,7 +18,7 @@ This codebase uses **emcn**, a custom component library built on Radix UI primit
 
 ## Steps
 
-1. Read the emcn public barrel at `apps/sim/components/emcn/index.ts` (re-exports components, Calendar, Table*, and icons) to know what's available; for the full icon set read `apps/sim/components/emcn/icons/index.ts`
+1. Read the emcn public barrel at `packages/emcn/src/index.ts` (re-exports components, Calendar, Table*, and icons) to know what's available; for the full icon set read `packages/emcn/src/icons/index.ts`
 2. Read `apps/sim/app/_styles/globals.css` for CSS variable tokens
 3. Analyze the specified scope against every rule below
 4. If fix=true, apply the fixes. If fix=false, propose the fixes without applying.
@@ -27,9 +27,8 @@ This codebase uses **emcn**, a custom component library built on Radix UI primit
 
 ## Imports
 
-- Import from `@/components/emcn` barrel, never subpaths
-- Icons from `@/components/emcn/icons` or `lucide-react`
-- Use `cn` from `@/lib/core/utils/cn` for conditional classes
+- Components, `cn`, and tokens from the `@sim/emcn` barrel, never component subpaths
+- Icons from `@sim/emcn/icons`
 
 ## Design Tokens
 
@@ -37,15 +36,15 @@ Use CSS variable pattern (`text-[var(--text-primary)]`), never Tailwind semantic
 
 **Text**: `--text-primary`, `--text-secondary`, `--text-tertiary`, `--text-muted`, `--text-body` (canonical value text), `--text-icon`, `--text-placeholder`, `--text-subtle`, `--text-inverse`, `--text-error`
 **Surfaces**: `--bg`, `--surface-1` through `--surface-7`, `--surface-hover`, `--surface-active`
-**Borders**: `--border`, `--border-1`, `--border-muted`
+**Borders**: `--border` (`--border-1`/`--border-muted` are legacy aliases resolving to it — flag new uses)
 **Brand/accent**: `--brand-secondary`, `--brand-accent`
-**Z-Index**: `--z-dropdown` (100), `--z-modal` (200), `--z-popover` (300), `--z-tooltip` (400), `--z-toast` (500)
+**Z-Index**: `--z-dropdown` (100), `--z-toast` (150), `--z-modal` (200), `--z-popover` (300), `--z-tooltip` (400), `--z-takeover` (500), `--z-shell-gate` (600)
 **Shadows**: `shadow-subtle`, `shadow-medium`, `shadow-overlay`, `shadow-card`
 **Badges**: `--badge-*` semantic families (success/error/gray/blue/purple/orange/amber/teal/cyan/pink, each with `-bg`/`-text`)
 
 ## Buttons
 
-Intent-to-variant mapping (read the actual `buttonVariants` in `apps/sim/components/emcn/components/button/button.tsx` for the full variant set — it exposes more than listed here):
+Intent-to-variant mapping (read the actual `buttonVariants` in `packages/emcn/src/components/button/button.tsx` for the full variant set — it exposes more than listed here):
 
 | Action | Variant |
 |--------|---------|
@@ -62,7 +61,7 @@ Intent-to-variant mapping (read the actual `buttonVariants` in `apps/sim/compone
 
 ## Toast
 
-`toast.success()`, `toast.error()`, `toast()` from `@/components/emcn`. Never custom notification UI.
+`toast.success()`, `toast.error()`, `toast()` from `@sim/emcn`. Never custom notification UI.
 
 ## Badges
 

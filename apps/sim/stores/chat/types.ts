@@ -26,6 +26,7 @@ export interface ChatMessage {
  * Output configuration for chat deployments
  */
 export interface OutputConfig {
+  workflowId?: string
   blockId: string
   path: string
 }
@@ -64,7 +65,10 @@ export interface ChatState {
   setSelectedWorkflowOutput: (workflowId: string, outputIds: string[]) => void
   getSelectedWorkflowOutput: (workflowId: string) => string[]
   appendMessageContent: (messageId: string, content: string) => void
+  /** Replaces the message's content (streamed-turn reconciliation). */
+  setMessageContent: (messageId: string, content: string) => void
   finalizeMessageStream: (messageId: string) => void
   getConversationId: (workflowId: string) => string
   generateNewConversationId: (workflowId: string) => string
+  reset: () => void
 }

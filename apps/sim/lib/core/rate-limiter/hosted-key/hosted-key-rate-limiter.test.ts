@@ -1,4 +1,3 @@
-import { sleep } from '@sim/utils/helpers'
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest'
 import type {
   ConsumeResult,
@@ -71,6 +70,7 @@ describe('HostedKeyRateLimiter', () => {
     process.env.EXA_API_KEY_1 = 'test-key-1'
     process.env.EXA_API_KEY_2 = 'test-key-2'
     process.env.EXA_API_KEY_3 = 'test-key-3'
+    process.env.EXA_API_KEY = undefined
   })
 
   afterEach(() => {
@@ -87,6 +87,7 @@ describe('HostedKeyRateLimiter', () => {
       mockAdapter.consumeTokens.mockResolvedValue(allowedResult)
 
       process.env.EXA_API_KEY_COUNT = undefined
+      process.env.EXA_API_KEY = undefined
       process.env.EXA_API_KEY_1 = undefined
       process.env.EXA_API_KEY_2 = undefined
       process.env.EXA_API_KEY_3 = undefined
@@ -100,6 +101,28 @@ describe('HostedKeyRateLimiter', () => {
 
       expect(result.success).toBe(false)
       expect(result.error).toContain('No hosted keys configured')
+    })
+
+    it('uses a singular hosted key when no numbered pool count is configured', async () => {
+      mockAdapter.consumeTokens.mockResolvedValue({
+        allowed: true,
+        tokensRemaining: 9,
+        resetAt: new Date(Date.now() + 60000),
+      } satisfies ConsumeResult)
+      process.env.EXA_API_KEY_COUNT = undefined
+      process.env.EXA_API_KEY = 'singular-test-key'
+
+      const result = await rateLimiter.acquireKey(
+        testProvider,
+        envKeyPrefix,
+        perRequestRateLimit,
+        'workspace-1'
+      )
+
+      expect(result.success).toBe(true)
+      expect(result.key).toBe('singular-test-key')
+      expect(result.envVarName).toBe('EXA_API_KEY')
+      expect(result.keyIndex).toBe(0)
     })
 
     it('should rate limit billing actor when wait exceeds the queue cap', async () => {
@@ -290,17 +313,25 @@ describe('HostedKeyRateLimiter', () => {
         .mockResolvedValueOnce('waiting')
         .mockResolvedValueOnce('head')
 
-      const result = await rateLimiter.acquireKey(
-        testProvider,
-        envKeyPrefix,
-        perRequestRateLimit,
-        'workspace-1'
-      )
+      // Each "waiting" answer sleeps one real poll period; drive those with fake timers.
+      vi.useFakeTimers()
+      try {
+        const pending = rateLimiter.acquireKey(
+          testProvider,
+          envKeyPrefix,
+          perRequestRateLimit,
+          'workspace-1'
+        )
+        await vi.runAllTimersAsync()
+        const result = await pending
 
-      expect(result.success).toBe(true)
-      expect(mockQueue.checkHead).toHaveBeenCalledTimes(3)
-      // Bucket is only consumed once we reach the head.
-      expect(mockAdapter.consumeTokens).toHaveBeenCalledTimes(1)
+        expect(result.success).toBe(true)
+        expect(mockQueue.checkHead).toHaveBeenCalledTimes(3)
+        // Bucket is only consumed once we reach the head.
+        expect(mockAdapter.consumeTokens).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('refreshes the heartbeat while waiting at the head of the queue', async () => {
@@ -404,24 +435,31 @@ describe('HostedKeyRateLimiter', () => {
       }
       mockAdapter.consumeTokens.mockResolvedValue(blocked)
 
-      const controller = new AbortController()
-      const start = Date.now()
-      const promise = rateLimiter.acquireKey(
-        testProvider,
-        envKeyPrefix,
-        perRequestRateLimit,
-        'workspace-1',
-        controller.signal
-      )
-      // Let the first bucket check run and the sleep begin, then abort.
-      await sleep(20)
-      controller.abort()
-      const result = await promise
+      vi.useFakeTimers()
+      try {
+        const controller = new AbortController()
+        const start = Date.now()
+        const promise = rateLimiter.acquireKey(
+          testProvider,
+          envKeyPrefix,
+          perRequestRateLimit,
+          'workspace-1',
+          controller.signal
+        )
+        // Let the first bucket check run and the sleep begin, then abort. No timer
+        // advances after the abort, so the wait can only settle by waking on it —
+        // a sleep that ran to its cap would leave the promise pending.
+        await vi.advanceTimersByTimeAsync(20)
+        controller.abort()
+        const result = await promise
 
-      expect(result.success).toBe(false)
-      expect(result.billingActorRateLimited).toBe(true)
-      // Resolved well before the 10s capped sleep would otherwise have elapsed.
-      expect(Date.now() - start).toBeLessThan(2000)
+        expect(result.success).toBe(false)
+        expect(result.billingActorRateLimited).toBe(true)
+        // Resolved well before the 10s capped sleep would otherwise have elapsed.
+        expect(Date.now() - start).toBeLessThan(HEARTBEAT_REFRESH_INTERVAL_MS)
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('keeps waiting past the no-signal fallback cap while the signal is live', async () => {

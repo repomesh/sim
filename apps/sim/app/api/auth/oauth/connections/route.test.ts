@@ -8,11 +8,14 @@ import {
   createMockRequest,
   dbChainMock,
   dbChainMockFns,
+  permissionGroupScopeMock,
   resetDbChainMock,
+  resetPermissionGroupScopeMock,
 } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockParseProvider, mockDecodeJwt, mockEq } = vi.hoisted(() => ({
+const { mockParseProvider, mockDecodeJwt, mockEq, mockGetUserOrganization } = vi.hoisted(() => ({
+  mockGetUserOrganization: vi.fn(),
   mockParseProvider: vi.fn(),
   mockDecodeJwt: vi.fn(),
   mockEq: vi.fn((field: unknown, value: unknown) => ({ field, value, type: 'eq' })),
@@ -25,9 +28,7 @@ vi.mock('@sim/db', () => ({
   eq: mockEq,
 }))
 
-vi.mock('drizzle-orm', () => ({
-  eq: mockEq,
-}))
+vi.mock('@/lib/permission-groups/config-scope.server', () => permissionGroupScopeMock)
 
 vi.mock('jose', () => ({
   decodeJwt: mockDecodeJwt,
@@ -37,12 +38,18 @@ vi.mock('@/lib/oauth/utils', () => ({
   parseProvider: mockParseProvider,
 }))
 
+vi.mock('@/lib/billing/organizations/membership', () => ({
+  getUserOrganization: mockGetUserOrganization,
+}))
+
 import { GET } from '@/app/api/auth/oauth/connections/route'
 
 describe('OAuth Connections API Route', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetDbChainMock()
+    resetPermissionGroupScopeMock()
+    mockGetUserOrganization.mockResolvedValue(null)
 
     mockParseProvider.mockImplementation((providerId: string) => ({
       baseProvider: providerId.split('-')[0] || providerId,
@@ -53,6 +60,7 @@ describe('OAuth Connections API Route', () => {
   it('should return connections successfully', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     const mockAccounts = [
@@ -109,12 +117,13 @@ describe('OAuth Connections API Route', () => {
     const data = await response.json()
 
     expect(response.status).toBe(401)
-    expect(data.error).toBe('User not authenticated')
+    expect(data.error).toBe('Unauthorized')
   })
 
   it('should handle user with no connections', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     dbChainMockFns.where.mockResolvedValueOnce([])
@@ -132,6 +141,7 @@ describe('OAuth Connections API Route', () => {
   it('should handle database error', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     dbChainMockFns.where.mockRejectedValueOnce(new Error('Database error'))
@@ -148,6 +158,7 @@ describe('OAuth Connections API Route', () => {
   it('should decode ID token for display name', async () => {
     authMockFns.mockGetSession.mockResolvedValueOnce({
       user: { id: 'user-123' },
+      session: { id: 'session-1' },
     })
 
     const mockAccounts = [

@@ -10,6 +10,7 @@ export const gitlabApproveMergeRequestTool: ToolConfig<
   GitLabApproveMergeRequestResponse
 > = {
   id: 'gitlab_approve_merge_request',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Approve Merge Request',
   description: 'Approve a GitLab merge request',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabApproveMergeRequestTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     mergeRequestIid: {
       type: 'number',

@@ -152,7 +152,15 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     })
 
     // Save using existing persistence logic
-    const saveResult = await saveWorkflowToNormalizedTables(newWorkflowId, importedData)
+    const saveResult = await saveWorkflowToNormalizedTables(newWorkflowId, importedData, {
+      /**
+       * Actorless. The superuser debug import is a platform-operator tool for
+       * reproducing a customer's workflow, not a member authoring one, so no
+       * workspace permission group governs it.
+       */
+      workspaceId: null,
+      subjectUserId: null,
+    })
 
     if (!saveResult.success) {
       // Clean up the workflow record if save failed
@@ -170,7 +178,6 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         title: copilotChats.title,
         model: copilotChats.model,
         previewYaml: copilotChats.previewYaml,
-        planArtifact: copilotChats.planArtifact,
         config: copilotChats.config,
       })
       .from(copilotChats)
@@ -190,7 +197,6 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
             model: chat.model,
             conversationId: null, // Don't copy conversation ID
             previewYaml: chat.previewYaml,
-            planArtifact: chat.planArtifact,
             config: chat.config,
             createdAt: new Date(),
             updatedAt: new Date(),

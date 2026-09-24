@@ -18,19 +18,25 @@ import {
   LogOut,
   Mail,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
   SquareArrowUpRight,
   Trash,
   Unlock,
+  X,
 } from '@sim/emcn/icons'
-import { Pin, PinOff } from 'lucide-react'
+import { selectionActionLabel } from '@/app/workspace/[workspaceId]/components/resource/selection-label'
 
 interface ContextMenuProps {
   isOpen: boolean
   position: { x: number; y: number }
   menuRef: React.RefObject<HTMLDivElement | null>
   onClose: () => void
+  onCopyLink?: () => void
   onOpenInNewTab?: () => void
+  openInNewTabLabel?: string
+  openInNewTabPosition?: 'first' | 'last'
   onMarkAsRead?: () => void
   onMarkAsUnread?: () => void
   onTogglePin?: () => void
@@ -51,7 +57,15 @@ interface ContextMenuProps {
   onCreateFolder?: () => void
   onDuplicate?: () => void
   onExport?: () => void
-  onDelete: () => void
+  onDelete?: () => void
+  /**
+   * Closes the item rather than deleting it — for tabs, where the destructive
+   * action is "close this one", not "delete it forever". Named for the item so
+   * it cannot be confused with `onClose`, which dismisses this menu.
+   */
+  onCloseTab?: () => void
+  onCloseOtherTabs?: () => void
+  onCloseTabsToRight?: () => void
   showOpenInNewTab?: boolean
   showMarkAsRead?: boolean
   showMarkAsUnread?: boolean
@@ -78,21 +92,37 @@ interface ContextMenuProps {
   disableLock?: boolean
   isLocked?: boolean
   showDelete?: boolean
+  showCloseTab?: boolean
+  disableCloseOtherTabs?: boolean
+  disableCloseTabsToRight?: boolean
   onUploadLogo?: () => void
   showUploadLogo?: boolean
   disableUploadLogo?: boolean
+  selectedCount?: number
 }
 
 /**
  * Context menu component for workflow, folder, and workspace items.
  * Uses DropdownMenu for accessible, hover-expandable submenus.
+ *
+ * A non-modal Radix menu dismisses itself whenever focus lands outside it, and this
+ * menu is routinely opened on top of another Radix menu — the collapsed sidebar's
+ * chat flyout. Radix menu rows call `focus()` on `pointermove` and a menu refocuses
+ * its own content when the pointer leaves a row, so the first mouse movement after a
+ * right-click inside the flyout pulled focus back into the flyout and closed this
+ * menu before the cursor could reach it. `onFocusOutside` therefore ignores focus
+ * that lands in a surrounding menu; focus leaving to anything else (tabbing away)
+ * still dismisses, as do pointer-down outside, Escape, and selecting an item.
  */
 export function ContextMenu({
   isOpen,
   position,
   menuRef,
   onClose,
+  onCopyLink,
   onOpenInNewTab,
+  openInNewTabLabel = 'Open in new tab',
+  openInNewTabPosition = 'first',
   onMarkAsRead,
   onMarkAsUnread,
   onTogglePin,
@@ -103,6 +133,9 @@ export function ContextMenu({
   onDuplicate,
   onExport,
   onDelete,
+  onCloseTab,
+  onCloseOtherTabs,
+  onCloseTabsToRight,
   showOpenInNewTab = false,
   showMarkAsRead = false,
   showMarkAsUnread = false,
@@ -129,22 +162,33 @@ export function ContextMenu({
   disableLock = false,
   isLocked = false,
   showDelete = true,
+  showCloseTab = false,
+  disableCloseOtherTabs = false,
+  disableCloseTabsToRight = false,
   onUploadLogo,
   showUploadLogo = false,
   disableUploadLogo = false,
+  selectedCount = 1,
 }: ContextMenuProps) {
-  const hasNavigationSection = showOpenInNewTab && onOpenInNewTab
-  const hasStatusSection =
+  const hasActionsAboveDestructive =
+    onCopyLink ||
+    (showOpenInNewTab && onOpenInNewTab) ||
     (showMarkAsRead && onMarkAsRead) ||
     (showMarkAsUnread && onMarkAsUnread) ||
-    (showPin && onTogglePin)
-  const hasEditSection =
+    (showPin && onTogglePin) ||
     (showRename && onRename) ||
     (showCreate && onCreate) ||
     (showCreateFolder && onCreateFolder) ||
     (showLock && onToggleLock) ||
-    (showUploadLogo && onUploadLogo)
-  const hasCopySection = (showDuplicate && onDuplicate) || (showExport && onExport)
+    (showUploadLogo && onUploadLogo) ||
+    (showDuplicate && onDuplicate) ||
+    (showExport && onExport)
+  const hasDestructiveSection =
+    (showLeave && onLeave) ||
+    (showDelete && onDelete) ||
+    (showCloseTab && onCloseTab) ||
+    onCloseOtherTabs ||
+    onCloseTabsToRight
 
   /**
    * Only the "Rename" item should trigger the `onCloseAutoFocus` refocus below —
@@ -173,6 +217,13 @@ export function ContextMenu({
         side='bottom'
         sideOffset={4}
         className='max-h-[var(--radix-dropdown-menu-content-available-height,400px)]'
+        inert={!isOpen}
+        onFocusOutside={(e) => {
+          const target = e.target
+          if (target instanceof Element && target.closest('[role="menu"]')) {
+            e.preventDefault()
+          }
+        }}
         onCloseAutoFocus={(e) => {
           e.preventDefault()
           const shouldFocusRenameInput = justSelectedRenameRef.current
@@ -184,7 +235,7 @@ export function ContextMenu({
           }
         }}
       >
-        {showOpenInNewTab && onOpenInNewTab && (
+        {openInNewTabPosition === 'first' && showOpenInNewTab && onOpenInNewTab && (
           <DropdownMenuItem
             onSelect={() => {
               onOpenInNewTab()
@@ -192,13 +243,20 @@ export function ContextMenu({
             }}
           >
             <SquareArrowUpRight />
-            Open in new tab
+            {openInNewTabLabel}
           </DropdownMenuItem>
         )}
-        {hasNavigationSection && (hasStatusSection || hasEditSection || hasCopySection) && (
-          <DropdownMenuSeparator />
+        {onCopyLink && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onCopyLink()
+              onClose()
+            }}
+          >
+            <Duplicate />
+            Copy link
+          </DropdownMenuItem>
         )}
-
         {showMarkAsRead && onMarkAsRead && (
           <DropdownMenuItem
             disabled={disableMarkAsRead}
@@ -234,8 +292,6 @@ export function ContextMenu({
             {isPinned ? 'Unpin' : 'Pin'}
           </DropdownMenuItem>
         )}
-        {hasStatusSection && (hasEditSection || hasCopySection) && <DropdownMenuSeparator />}
-
         {showRename && onRename && (
           <DropdownMenuItem
             disabled={disableRename}
@@ -298,7 +354,6 @@ export function ContextMenu({
           </DropdownMenuItem>
         )}
 
-        {hasEditSection && hasCopySection && <DropdownMenuSeparator />}
         {showDuplicate && onDuplicate && (
           <DropdownMenuItem
             disabled={disableDuplicate}
@@ -308,7 +363,7 @@ export function ContextMenu({
             }}
           >
             <Duplicate />
-            Duplicate
+            {selectionActionLabel('Duplicate', selectedCount)}
           </DropdownMenuItem>
         )}
         {showExport && onExport && (
@@ -320,12 +375,22 @@ export function ContextMenu({
             }}
           >
             <Download />
-            Export
+            {selectionActionLabel('Export', selectedCount)}
+          </DropdownMenuItem>
+        )}
+        {openInNewTabPosition === 'last' && showOpenInNewTab && onOpenInNewTab && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onOpenInNewTab()
+              onClose()
+            }}
+          >
+            <SquareArrowUpRight />
+            {openInNewTabLabel}
           </DropdownMenuItem>
         )}
 
-        {(hasNavigationSection || hasStatusSection || hasEditSection || hasCopySection) &&
-          (showLeave || showDelete) && <DropdownMenuSeparator />}
+        {hasActionsAboveDestructive && hasDestructiveSection && <DropdownMenuSeparator />}
         {showLeave && onLeave && (
           <DropdownMenuItem
             disabled={disableLeave}
@@ -338,7 +403,7 @@ export function ContextMenu({
             Leave
           </DropdownMenuItem>
         )}
-        {showDelete && (
+        {showDelete && onDelete && (
           <DropdownMenuItem
             disabled={disableDelete}
             onSelect={() => {
@@ -347,7 +412,42 @@ export function ContextMenu({
             }}
           >
             <Trash />
-            Delete
+            {selectionActionLabel('Delete', selectedCount)}
+          </DropdownMenuItem>
+        )}
+        {showCloseTab && onCloseTab && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onCloseTab()
+              onClose()
+            }}
+          >
+            <X />
+            Close
+          </DropdownMenuItem>
+        )}
+        {onCloseOtherTabs && (
+          <DropdownMenuItem
+            disabled={disableCloseOtherTabs}
+            onSelect={() => {
+              onCloseOtherTabs()
+              onClose()
+            }}
+          >
+            <X />
+            Close Others
+          </DropdownMenuItem>
+        )}
+        {onCloseTabsToRight && (
+          <DropdownMenuItem
+            disabled={disableCloseTabsToRight}
+            onSelect={() => {
+              onCloseTabsToRight()
+              onClose()
+            }}
+          >
+            <X />
+            Close Tabs to the Right
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

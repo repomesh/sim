@@ -156,7 +156,7 @@ Built-in table creation and management:
 - [GitHub](https://github.com/simstudioai/sim): Open-source codebase
 - [Slack](https://join.slack.com/t/sim-ott9864/shared_invite/zt-43lp8tc5v-0qrrqHGBKUsvQlpoouH~TA): Community workspace
 - [X/Twitter](https://x.com/simdotai): Announcements and updates
-- [LinkedIn](https://linkedin.com/company/simstudioai): Company page
+- [LinkedIn](https://linkedin.com/company/simdotai): Company page
 
 ## Support
 
@@ -169,6 +169,7 @@ Built-in table creation and management:
 
 - [Terms of Service](${baseUrl}/terms): Legal terms
 - [Privacy Policy](${baseUrl}/privacy): Data handling practices
+- [Cookie Policy](${baseUrl}/cookie-policy): Cookies Sim sets, why, and how to change your choice
 - [Security](${baseUrl}/.well-known/security.txt): Vulnerability disclosure policy
 `
 

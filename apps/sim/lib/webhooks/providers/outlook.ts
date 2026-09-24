@@ -2,13 +2,13 @@ import { db } from '@sim/db'
 import { account, webhook } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { eq } from 'drizzle-orm'
+import { refreshAccessTokenIfNeeded, resolveOAuthAccountId } from '@/lib/oauth/credential-service'
 import type {
   FormatInputContext,
   FormatInputResult,
   PollingConfigContext,
   WebhookProviderHandler,
 } from '@/lib/webhooks/providers/types'
-import { refreshAccessTokenIfNeeded, resolveOAuthAccountId } from '@/app/api/auth/oauth/utils'
 
 const logger = createLogger('WebhookProvider:Outlook')
 
@@ -21,7 +21,11 @@ export const outlookHandler: WebhookProviderHandler = {
     return { input: b }
   },
 
-  async configurePolling({ webhook: webhookData, requestId }: PollingConfigContext) {
+  async configurePolling({
+    webhook: webhookData,
+    requestId,
+    persistProviderConfig,
+  }: PollingConfigContext) {
     logger.info(`[${requestId}] Setting up Outlook polling for webhook ${webhookData.id}`)
 
     try {
@@ -69,32 +73,33 @@ export const outlookHandler: WebhookProviderHandler = {
 
       const now = new Date()
 
-      await db
-        .update(webhook)
-        .set({
-          providerConfig: {
-            ...providerConfig,
-            userId: effectiveUserId,
-            credentialId,
-            maxEmailsPerPoll:
-              typeof providerConfig.maxEmailsPerPoll === 'string'
-                ? Number.parseInt(providerConfig.maxEmailsPerPoll, 10) || 25
-                : (providerConfig.maxEmailsPerPoll as number) || 25,
-            pollingInterval:
-              typeof providerConfig.pollingInterval === 'string'
-                ? Number.parseInt(providerConfig.pollingInterval, 10) || 5
-                : (providerConfig.pollingInterval as number) || 5,
-            markAsRead: providerConfig.markAsRead || false,
-            includeRawEmail: providerConfig.includeRawEmail || false,
-            folderIds: providerConfig.folderIds || ['inbox'],
-            folderFilterBehavior: providerConfig.folderFilterBehavior || 'INCLUDE',
-            lastCheckedTimestamp:
-              (providerConfig.lastCheckedTimestamp as string) || now.toISOString(),
-            setupCompleted: true,
-          },
-          updatedAt: now,
-        })
-        .where(eq(webhook.id, webhookData.id as string))
+      const configuredProviderConfig = {
+        ...providerConfig,
+        userId: effectiveUserId,
+        credentialId,
+        maxEmailsPerPoll:
+          typeof providerConfig.maxEmailsPerPoll === 'string'
+            ? Number.parseInt(providerConfig.maxEmailsPerPoll, 10) || 25
+            : (providerConfig.maxEmailsPerPoll as number) || 25,
+        pollingInterval:
+          typeof providerConfig.pollingInterval === 'string'
+            ? Number.parseInt(providerConfig.pollingInterval, 10) || 5
+            : (providerConfig.pollingInterval as number) || 5,
+        markAsRead: providerConfig.markAsRead || false,
+        includeRawEmail: providerConfig.includeRawEmail || false,
+        folderIds: providerConfig.folderIds || ['inbox'],
+        folderFilterBehavior: providerConfig.folderFilterBehavior || 'INCLUDE',
+        lastCheckedTimestamp: (providerConfig.lastCheckedTimestamp as string) || now.toISOString(),
+        setupCompleted: true,
+      }
+      if (persistProviderConfig) {
+        await persistProviderConfig(configuredProviderConfig)
+      } else {
+        await db
+          .update(webhook)
+          .set({ providerConfig: configuredProviderConfig, updatedAt: now })
+          .where(eq(webhook.id, webhookData.id as string))
+      }
 
       logger.info(
         `[${requestId}] Successfully configured Outlook polling for webhook ${webhookData.id}`

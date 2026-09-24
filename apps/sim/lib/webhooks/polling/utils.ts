@@ -2,12 +2,14 @@ import { db } from '@sim/db'
 import { account, webhook, workflow, workflowDeploymentVersion } from '@sim/db/schema'
 import type { Logger } from '@sim/logger'
 import { and, eq, isNull, ne, or, sql } from 'drizzle-orm'
-import type { WebhookRecord, WorkflowRecord } from '@/lib/webhooks/polling/types'
 import {
   getOAuthToken,
   refreshAccessTokenIfNeeded,
   resolveOAuthAccountId,
-} from '@/app/api/auth/oauth/utils'
+  resolveServiceAccountToken,
+} from '@/lib/oauth/credential-service'
+import { deliverableWebhookPredicate } from '@/lib/webhooks/delivery-predicate'
+import type { WebhookRecord, WorkflowRecord } from '@/lib/webhooks/polling/types'
 import { MAX_CONSECUTIVE_FAILURES } from '@/triggers/constants'
 
 /** Concurrency limit for parallel webhook processing. Standardized across all providers. */
@@ -80,8 +82,7 @@ export async function fetchActiveWebhooks(
     .where(
       and(
         eq(webhook.provider, provider),
-        eq(webhook.isActive, true),
-        isNull(webhook.archivedAt),
+        deliverableWebhookPredicate(webhook),
         eq(workflow.isDeployed, true),
         isNull(workflow.archivedAt),
         or(
@@ -163,7 +164,13 @@ export async function updateWebhookProviderConfig(
     }
 
     const merged = sql`COALESCE(${webhook.providerConfig}::jsonb, '{}'::jsonb) || ${JSON.stringify(defined)}::jsonb`
-    const nextConfig = removedKeys.length > 0 ? sql`(${merged}) - ${removedKeys}::text[]` : merged
+    const nextConfig =
+      removedKeys.length > 0
+        ? sql`(${merged}) - ARRAY[${sql.join(
+            removedKeys.map((key) => sql`${key}`),
+            sql`, `
+          )}]::text[]`
+        : merged
 
     await db
       .update(webhook)
@@ -202,6 +209,13 @@ export async function resolveOAuthCredential(
       throw new Error(
         `Failed to resolve OAuth account for credential ${credentialId}, webhook ${webhookData.id}`
       )
+    }
+    if (resolved.credentialType === 'service_account' && resolved.credentialId) {
+      const { accessToken: serviceAccountToken } = await resolveServiceAccountToken(
+        resolved.credentialId,
+        resolved.providerId
+      )
+      return serviceAccountToken
     }
     const rows = await db.select().from(account).where(eq(account.id, resolved.accountId)).limit(1)
     if (!rows.length) {

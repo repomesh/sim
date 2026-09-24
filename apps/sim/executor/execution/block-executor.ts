@@ -1,5 +1,9 @@
 import { createLogger, type Logger } from '@sim/logger'
-import { toError } from '@sim/utils/errors'
+import { describeError } from '@sim/utils/errors'
+import { sleep } from '@sim/utils/helpers'
+import { isRecordLike, toRecord } from '@sim/utils/object'
+import { DrizzleQueryError } from 'drizzle-orm/errors'
+import { isTimeoutAbortReason } from '@/lib/core/execution-limits/types'
 import { redactApiKeys } from '@/lib/core/security/redaction'
 import { normalizeStringArray } from '@/lib/core/utils/arrays'
 import { getBaseUrl } from '@/lib/core/utils/urls'
@@ -17,12 +21,17 @@ import {
   BlockType,
   buildResumeApiUrl,
   buildResumeUiUrl,
+  CHILD_EXECUTION_ID_OUTPUT_KEY,
+  CHILD_TRACE_DISABLED_OUTPUT_KEY,
   DEFAULTS,
   EDGE,
+  isHumanInTheLoopBlock,
   isSentinelBlockType,
+  isWorkflowBlockType,
 } from '@/executor/constants'
 import type { DAGNode } from '@/executor/dag/builder'
 import { ChildWorkflowError } from '@/executor/errors/child-workflow-error'
+import { isRetryableBlockError, resolveBlockRetryPolicy } from '@/executor/execution/block-retry'
 import type {
   BlockStateWriter,
   ContextExtensions,
@@ -35,6 +44,7 @@ import {
 import {
   type BlockHandler,
   type BlockLog,
+  type BlockRetryAttempt,
   type BlockState,
   type ExecutionContext,
   getNextExecutionOrder,
@@ -42,13 +52,24 @@ import {
   type StreamingExecution,
 } from '@/executor/types'
 import { streamingResponseFormatProcessor } from '@/executor/utils'
-import { buildBlockExecutionError, normalizeError } from '@/executor/utils/errors'
+import {
+  attachTrustedExecutionCost,
+  buildBlockExecutionError,
+  normalizeError,
+  readTrustedExecutionCost,
+  type TrustedExecutionCost,
+} from '@/executor/utils/errors'
 import {
   buildUnifiedParentIterations,
   getIterationContext,
 } from '@/executor/utils/iteration-context'
 import { isJSONString } from '@/executor/utils/json'
 import { filterOutputForLog } from '@/executor/utils/output-filter'
+import { projectResolvedSecretDiagnosticError } from '@/executor/utils/resolved-secret-content-projection'
+import type {
+  ResolvedSecretTraceProvenanceV1,
+  ResolvedSecretTraceRegistry,
+} from '@/executor/utils/resolved-secret-trace-registry'
 import {
   buildBranchNodeId,
   buildOuterBranchScopedId,
@@ -59,10 +80,29 @@ import {
   FUNCTION_BLOCK_DISPLAY_CODE_KEY,
   type VariableResolver,
 } from '@/executor/variables/resolver'
+import { createAgentStreamPump } from '@/providers/stream-pump'
 import type { SerializedBlock } from '@/serializer/types'
 import { SYSTEM_SUBBLOCK_IDS } from '@/triggers/constants'
 
 const logger = createLogger('BlockExecutor')
+
+function addTrustedExecutionCosts(
+  accumulated: TrustedExecutionCost | undefined,
+  current: TrustedExecutionCost | undefined
+): TrustedExecutionCost | undefined {
+  if (!accumulated) return current
+  if (!current) return accumulated
+
+  return {
+    input: accumulated.input + current.input,
+    output: accumulated.output + current.output,
+    total: accumulated.total + current.total,
+  }
+}
+
+/** Replaces a database query failure's message, which carries SQL text and bound parameters. */
+const INTERNAL_DATABASE_ERROR_MESSAGE =
+  'An internal error occurred while executing the block. Please try again.'
 
 export class BlockExecutor {
   private execLogger: Logger
@@ -96,6 +136,30 @@ export class BlockExecutor {
       })
     }
 
+    const parentResolvedSecretTraceRegistry = ctx.resolvedSecretTraceRegistry
+    const blockResolvedSecretTraceRegistry = parentResolvedSecretTraceRegistry?.forkForInputPaths(
+      []
+    )
+    const inputDisplayRegistry = blockResolvedSecretTraceRegistry
+    const blockCtx: ExecutionContext = {
+      ...ctx,
+      mcpBlockId: block.id,
+      ...(blockResolvedSecretTraceRegistry
+        ? { resolvedSecretTraceRegistry: blockResolvedSecretTraceRegistry }
+        : {}),
+    }
+    let registryCommitted = false
+    const commitBlockRegistry = () => {
+      const settledBlockRegistry = blockCtx.resolvedSecretTraceRegistry
+      if (registryCommitted || !parentResolvedSecretTraceRegistry || !settledBlockRegistry) {
+        return
+      }
+      registryCommitted = true
+      if (settledBlockRegistry.isComplete()) {
+        parentResolvedSecretTraceRegistry.mergeToolCallRegistry(settledBlockRegistry)
+      }
+    }
+
     const blockType = block.metadata?.id ?? ''
     const isSentinel = isSentinelBlockType(blockType)
 
@@ -108,9 +172,14 @@ export class BlockExecutor {
     let blockLog: BlockLog | undefined
     let blockStartPromise: Promise<void> | undefined
     if (!isSentinel) {
-      blockLog = this.createBlockLog(ctx, node.id, block, node, startedAt)
-      ctx.blockLogs.push(blockLog)
-      blockStartPromise = this.fireBlockStartCallback(ctx, node, block, blockLog.executionOrder)
+      blockLog = this.createBlockLog(blockCtx, node.id, block, node, startedAt)
+      blockCtx.blockLogs.push(blockLog)
+      blockStartPromise = this.fireBlockStartCallback(
+        blockCtx,
+        node,
+        block,
+        blockLog.executionOrder
+      )
       await blockStartPromise
     }
 
@@ -123,13 +192,18 @@ export class BlockExecutor {
     }
     let cleanupSelfReference: (() => void) | undefined
 
-    if (block.metadata?.id === BlockType.HUMAN_IN_THE_LOOP) {
-      cleanupSelfReference = this.preparePauseResumeSelfReference(ctx, node, block, nodeMetadata)
+    if (isHumanInTheLoopBlock(block.metadata?.id)) {
+      cleanupSelfReference = this.preparePauseResumeSelfReference(
+        blockCtx,
+        node,
+        block,
+        nodeMetadata
+      )
     }
 
     try {
       if (!isSentinel && blockType) {
-        await validateBlockType(ctx.userId, ctx.workspaceId, blockType, ctx)
+        await validateBlockType(blockCtx.userId, blockCtx.workspaceId, blockType, blockCtx)
       }
 
       if (block.metadata?.id === BlockType.FUNCTION) {
@@ -138,7 +212,7 @@ export class BlockExecutor {
           displayInputs,
           contextVariables,
         } = await this.resolver.resolveInputsForFunctionBlock(
-          ctx,
+          blockCtx,
           node.id,
           block.config.params,
           block
@@ -152,34 +226,66 @@ export class BlockExecutor {
         }
         inputsForLog = displayInputs
       } else {
-        resolvedInputs = await this.resolver.resolveInputs(ctx, node.id, block.config.params, block)
+        resolvedInputs = await this.resolver.resolveInputs(
+          blockCtx,
+          node.id,
+          block.config.params,
+          block
+        )
         inputsForLog = resolvedInputs
       }
 
       if (blockLog) {
-        blockLog.input = this.sanitizeInputsForLog(inputsForLog, block.metadata?.id)
+        blockLog.input = this.projectInputsForDisplay(inputsForLog, block, inputDisplayRegistry)
       }
     } catch (error) {
       cleanupSelfReference?.()
-      return await this.handleBlockError(
-        error,
-        ctx,
-        node,
-        block,
-        blockStartPromise,
-        startTime,
-        blockLog,
-        inputsForLog,
-        isSentinel,
-        'input_resolution'
-      )
+      try {
+        return await this.handleBlockError(
+          error,
+          blockCtx,
+          node,
+          block,
+          blockStartPromise,
+          startTime,
+          blockLog,
+          inputsForLog,
+          inputDisplayRegistry,
+          isSentinel,
+          'input_resolution'
+        )
+      } finally {
+        commitBlockRegistry()
+      }
     }
     cleanupSelfReference?.()
 
+    let streamingPartialOutput: Record<string, any> | undefined
+    /**
+     * Cost of a handler that already finished, kept for the catch below.
+     *
+     * A Function block's sandbox is paid for the moment it completes, but the
+     * steps after the handler returns — base64 hydration, and large-value
+     * redaction that deliberately throws rather than emit unredacted data — can
+     * still fail the block. The error those raise carries no cost of its own, so
+     * without holding it here the completed sandbox would go unbilled. Hoisted
+     * for the same reason `streamingPartialOutput` above is.
+     */
+    let completedHandlerCost: TrustedExecutionCost | undefined
     try {
-      const output = handler.executeWithNode
-        ? await handler.executeWithNode(ctx, block, resolvedInputs, nodeMetadata)
-        : await handler.execute(ctx, block, resolvedInputs)
+      /**
+       * Only the handler call is retried. A streaming handler returns before any
+       * token is drained, so a replay cannot duplicate output the client has
+       * already seen.
+       */
+      const output = await this.runHandlerWithRetry(blockCtx, block, blockLog, (retry) => {
+        const invocationMetadata = retry ? { ...nodeMetadata, retry } : nodeMetadata
+        return handler.executeWithNode
+          ? handler.executeWithNode(blockCtx, block, resolvedInputs, invocationMetadata)
+          : handler.execute(blockCtx, block, resolvedInputs, invocationMetadata)
+      })
+
+      completedHandlerCost = readTrustedExecutionCost(output)
 
       const isStreamingExecution =
         output && typeof output === 'object' && 'stream' in output && 'execution' in output
@@ -188,21 +294,35 @@ export class BlockExecutor {
       if (isStreamingExecution) {
         const streamingExec = output as StreamingExecution
 
-        // The stream must still be drained to populate `execution.output`, but
-        // forwarding raw chunks to the client (or persisting them to memory)
-        // before redaction would leak PII. When block-output redaction is on we
-        // drain in buffer-only mode (no `onStream`, content masked before it's
-        // stored); the masked final output reaches the client via block-complete.
-        if (ctx.onStream) {
+        // Always drain via the agent stream pump (tokens/cost/timing callbacks),
+        // even with no `onStream`. When block-output redaction is on we do not
+        // live-forward chunks; content is masked before persist and the masked
+        // final output reaches the client via block-complete.
+        try {
           await this.handleStreamingExecution(
-            ctx,
+            blockCtx,
             node,
             block,
             streamingExec,
             resolvedInputs,
-            normalizeStringArray(ctx.selectedOutputs),
-            !ctx.piiBlockOutputRedaction?.enabled
+            normalizeStringArray(blockCtx.selectedOutputs),
+            blockLog?.executionOrder
           )
+        } catch (streamError) {
+          const resultRegistry = blockCtx.resolvedSecretTraceRegistry
+          const diagnosticRegistry = streamingExec.diagnosticResolvedSecretTraceRegistry
+          const errorRegistry = diagnosticRegistry
+            ? diagnosticRegistry.forkForToolCall()
+            : resultRegistry?.forkForToolCall()
+          if (errorRegistry && resultRegistry && resultRegistry !== diagnosticRegistry) {
+            errorRegistry.mergeToolCallRegistry(resultRegistry)
+          }
+          blockCtx.errorResolvedSecretTraceRegistry = errorRegistry
+          blockCtx.resolvedSecretTraceRegistry = resultRegistry?.forkForPropagatedEntries()
+          // Timeout / drain failures may still have projected answer text — keep it
+          // for the failed block output so logs match what the client already saw.
+          streamingPartialOutput = streamingExec.execution?.output
+          throw streamError
         }
 
         normalizedOutput = this.normalizeOutput(
@@ -212,30 +332,32 @@ export class BlockExecutor {
         normalizedOutput = this.normalizeOutput(output)
       }
 
-      if (ctx.includeFileBase64 === true && containsUserFileWithMetadata(normalizedOutput)) {
+      if (blockCtx.includeFileBase64 === true && containsUserFileWithMetadata(normalizedOutput)) {
         normalizedOutput = (await hydrateUserFilesWithBase64(normalizedOutput, {
-          requestId: ctx.metadata.requestId,
-          workspaceId: ctx.workspaceId,
-          workflowId: ctx.workflowId,
-          executionId: ctx.executionId,
-          largeValueExecutionIds: ctx.largeValueExecutionIds,
-          largeValueKeys: ctx.largeValueKeys,
-          fileKeys: ctx.fileKeys,
-          allowLargeValueWorkflowScope: ctx.allowLargeValueWorkflowScope,
-          userId: ctx.userId,
-          maxBytes: ctx.base64MaxBytes,
+          requestId: blockCtx.metadata.requestId,
+          workspaceId: blockCtx.workspaceId,
+          workflowId: blockCtx.workflowId,
+          executionId: blockCtx.executionId,
+          largeValueExecutionIds: blockCtx.largeValueExecutionIds,
+          largeValueKeys: blockCtx.largeValueKeys,
+          fileKeys: blockCtx.fileKeys,
+          allowLargeValueWorkflowScope: blockCtx.allowLargeValueWorkflowScope,
+          userId: blockCtx.userId,
+          principal: blockCtx.principal,
+          maxBytes: blockCtx.base64MaxBytes,
           preserveLargeValueMetadata: true,
         })) as NormalizedBlockOutput
       }
 
-      if (ctx.piiBlockOutputRedaction?.enabled) {
+      if (blockCtx.piiBlockOutputRedaction?.enabled) {
         // In-flight redaction before the log/state split below, so both the
         // downstream state copy and the persisted log copy are masked.
         // `onFailure: 'throw'` aborts the run rather than feeding corrupted/leaked
         // data downstream.
         const redactionOptions = {
-          entityTypes: ctx.piiBlockOutputRedaction.entityTypes,
-          language: ctx.piiBlockOutputRedaction.language,
+          entityTypes: blockCtx.piiBlockOutputRedaction.entityTypes,
+          language: blockCtx.piiBlockOutputRedaction.language,
+          customPatterns: blockCtx.piiBlockOutputRedaction.customPatterns,
           onFailure: 'throw' as const,
         }
         // Tools like the function executor offload large outputs to large-value
@@ -245,21 +367,24 @@ export class BlockExecutor {
         normalizedOutput = await redactLargeValueRefsInValue(normalizedOutput, {
           ...redactionOptions,
           store: {
-            workspaceId: ctx.workspaceId,
-            workflowId: ctx.workflowId,
-            executionId: ctx.executionId,
-            userId: ctx.userId,
+            workspaceId: blockCtx.workspaceId,
+            workflowId: blockCtx.workflowId,
+            executionId: blockCtx.executionId,
+            largeValueExecutionIds: blockCtx.largeValueExecutionIds,
+            largeValueKeys: blockCtx.largeValueKeys,
+            allowLargeValueWorkflowScope: blockCtx.allowLargeValueWorkflowScope,
+            userId: blockCtx.userId,
           },
         })
         normalizedOutput = await redactObjectStrings(normalizedOutput, redactionOptions)
       }
 
       normalizedOutput = (await compactExecutionPayload(normalizedOutput, {
-        workspaceId: ctx.workspaceId,
-        workflowId: ctx.workflowId,
-        executionId: ctx.executionId,
-        userId: ctx.userId,
-        preserveUserFileBase64: ctx.includeFileBase64 === true,
+        workspaceId: blockCtx.workspaceId,
+        workflowId: blockCtx.workflowId,
+        executionId: blockCtx.executionId,
+        userId: blockCtx.userId,
+        preserveUserFileBase64: blockCtx.includeFileBase64 === true,
         requireDurable: true,
       })) as NormalizedBlockOutput
 
@@ -274,10 +399,25 @@ export class BlockExecutor {
         if (normalizedOutput.childTraceSpans && Array.isArray(normalizedOutput.childTraceSpans)) {
           blockLog.childTraceSpans = normalizedOutput.childTraceSpans
         }
+        const childExecutionId = normalizedOutput[CHILD_EXECUTION_ID_OUTPUT_KEY]
+        if (typeof childExecutionId === 'string' && childExecutionId) {
+          blockLog.childExecution = { executionId: childExecutionId }
+        }
+        if (normalizedOutput[CHILD_TRACE_DISABLED_OUTPUT_KEY] === true) {
+          blockLog.childTraceDisabled = true
+        }
       }
 
-      const { childTraceSpans: _traces, ...outputForState } = normalizedOutput
-      this.setNodeOutput(node, outputForState as NormalizedBlockOutput, duration)
+      const {
+        childTraceSpans: _traces,
+        [CHILD_EXECUTION_ID_OUTPUT_KEY]: _childExecutionId,
+        [CHILD_TRACE_DISABLED_OUTPUT_KEY]: _childTraceDisabled,
+        ...outputForState
+      } = normalizedOutput
+      const stateOutput = outputForState as NormalizedBlockOutput
+      const settledBlockRegistry = blockCtx.resolvedSecretTraceRegistry
+      const stateProvenance = settledBlockRegistry?.exportCommittedProvenanceForValue(stateOutput)
+      this.setNodeOutput(node, stateOutput, duration, stateProvenance)
 
       if (!isSentinel && blockLog) {
         const childWorkflowInstanceId =
@@ -287,35 +427,52 @@ export class BlockExecutor {
         const displayOutput = filterOutputForLog(block.metadata?.id || '', normalizedOutput, {
           block,
         })
+        const displayInput = this.projectInputsForDisplay(inputsForLog, block, inputDisplayRegistry)
+        blockLog.input = displayInput
+        const displayProvenance = settledBlockRegistry?.exportCommittedProvenanceForValue({
+          input: displayInput,
+          output: displayOutput,
+        })
+        this.setBlockLogDisplayProvenance(blockLog, displayProvenance)
         this.fireBlockCompleteCallback(
           blockStartPromise,
-          ctx,
+          blockCtx,
           node,
           block,
-          this.sanitizeInputsForLog(inputsForLog, block.metadata?.id),
+          displayInput,
           displayOutput,
           duration,
           blockLog.startedAt,
           blockLog.executionOrder,
           blockLog.endedAt,
-          childWorkflowInstanceId
+          childWorkflowInstanceId,
+          stateProvenance,
+          displayProvenance
         )
       }
 
-      return outputForState as NormalizedBlockOutput
+      commitBlockRegistry()
+      return stateOutput
     } catch (error) {
-      return await this.handleBlockError(
-        error,
-        ctx,
-        node,
-        block,
-        blockStartPromise,
-        startTime,
-        blockLog,
-        inputsForLog,
-        isSentinel,
-        'execution'
-      )
+      try {
+        return await this.handleBlockError(
+          error,
+          blockCtx,
+          node,
+          block,
+          blockStartPromise,
+          startTime,
+          blockLog,
+          inputsForLog,
+          inputDisplayRegistry,
+          isSentinel,
+          'execution',
+          streamingPartialOutput,
+          completedHandlerCost
+        )
+      } finally {
+        commitBlockRegistry()
+      }
     }
   }
 
@@ -334,8 +491,13 @@ export class BlockExecutor {
     }
   }
 
-  private setNodeOutput(node: DAGNode, output: NormalizedBlockOutput, duration = 0): void {
-    this.state.setBlockOutput(node.id, output, duration)
+  private setNodeOutput(
+    node: DAGNode,
+    output: NormalizedBlockOutput,
+    duration = 0,
+    resolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
+  ): void {
+    this.state.setBlockOutput(node.id, output, duration, resolvedSecretTraceProvenance)
 
     const originalBlockId = node.metadata.originalBlockId
     const branchIndex = node.metadata.branchIndex
@@ -347,18 +509,116 @@ export class BlockExecutor {
     ) {
       const globalBranchNodeId = buildBranchNodeId(originalBlockId, branchIndex)
       if (globalBranchNodeId !== node.id) {
-        this.state.setBlockOutput(globalBranchNodeId, output, duration)
+        this.state.setBlockOutput(
+          globalBranchNodeId,
+          output,
+          duration,
+          resolvedSecretTraceProvenance
+        )
       }
       this.state.setBlockOutput(
         buildOuterBranchScopedId(originalBlockId, branchIndex),
         output,
-        duration
+        duration,
+        resolvedSecretTraceProvenance
       )
     }
   }
 
+  private setBlockLogDisplayProvenance(
+    blockLog: BlockLog,
+    provenance: ResolvedSecretTraceProvenanceV1 | undefined
+  ): void {
+    if (!provenance) return
+    Object.defineProperty(blockLog, 'displayResolvedSecretTraceProvenance', {
+      value: provenance,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    })
+  }
+
   private findHandler(block: SerializedBlock): BlockHandler | undefined {
     return this.blockHandlers.find((h) => h.canHandle(block))
+  }
+
+  /**
+   * Runs the block handler, replaying it on failure while tries remain.
+   *
+   * Rethrows the final try's error so the caller's catch — and with it the error
+   * port — behaves exactly as it does for a block that never retried. Retrying
+   * only ever delays the existing outcome; it never changes it.
+   *
+   * Each try is told where it sits in the policy (`BlockRetryAttempt`). The
+   * policy stays here: a handler cannot ask for another try or skip the wait,
+   * it can only hold work for the try after which no other follows, the way the
+   * Agent block keeps its fallback models for the final try.
+   */
+  private async runHandlerWithRetry<T>(
+    ctx: ExecutionContext,
+    block: SerializedBlock,
+    blockLog: BlockLog | undefined,
+    invoke: (retry: BlockRetryAttempt | undefined) => Promise<T>
+  ): Promise<T> {
+    const policy = resolveBlockRetryPolicy(block)
+    if (!policy) return invoke(undefined)
+
+    const shouldAccumulateFunctionCost = block.metadata?.id === BlockType.FUNCTION
+    let accumulatedFunctionCost: TrustedExecutionCost | undefined
+    let tries = 0
+    try {
+      for (;;) {
+        tries++
+        const isFinalTry = tries >= policy.maxTries
+        try {
+          const output = await invoke({ attempt: tries, maxTries: policy.maxTries, isFinalTry })
+          if (!shouldAccumulateFunctionCost || !accumulatedFunctionCost || !isRecordLike(output)) {
+            return output
+          }
+
+          const totalCost = addTrustedExecutionCosts(
+            accumulatedFunctionCost,
+            readTrustedExecutionCost(output)
+          )
+          if (!totalCost) return output
+
+          const outputWithCost = { ...output, cost: totalCost }
+          attachTrustedExecutionCost(outputWithCost, totalCost)
+          return outputWithCost as T
+        } catch (error) {
+          if (shouldAccumulateFunctionCost) {
+            accumulatedFunctionCost = addTrustedExecutionCosts(
+              accumulatedFunctionCost,
+              readTrustedExecutionCost(error)
+            )
+          }
+
+          if (isFinalTry || ctx.abortSignal?.aborted || !isRetryableBlockError(error)) {
+            attachTrustedExecutionCost(error, accumulatedFunctionCost)
+            throw error
+          }
+
+          this.execLogger.warn('Block failed; retrying', {
+            blockId: block.id,
+            blockType: block.metadata?.id,
+            tries,
+            maxTries: policy.maxTries,
+            waitBetweenTriesMs: policy.waitBetweenTriesMs,
+            error: normalizeError(error),
+          })
+
+          if (policy.waitBetweenTriesMs > 0) await sleep(policy.waitBetweenTriesMs)
+
+          /** `sleep` is not abort-aware, so a run stopped mid-wait must not start another try. */
+          if (ctx.abortSignal?.aborted) {
+            attachTrustedExecutionCost(error, accumulatedFunctionCost)
+            throw error
+          }
+        }
+      }
+    } finally {
+      if (blockLog && tries > 1) blockLog.tries = tries
+    }
   }
 
   private async handleBlockError(
@@ -370,50 +630,167 @@ export class BlockExecutor {
     startTime: number,
     blockLog: BlockLog | undefined,
     inputsForLog: Record<string, any>,
+    inputDisplayRegistry: ResolvedSecretTraceRegistry | undefined,
     isSentinel: boolean,
-    phase: 'input_resolution' | 'execution'
+    phase: 'input_resolution' | 'execution',
+    streamingPartialOutput?: Record<string, any>,
+    completedHandlerCost?: TrustedExecutionCost
   ): Promise<NormalizedBlockOutput> {
     const endedAt = new Date().toISOString()
     const duration = performance.now() - startTime
-    const errorMessage = normalizeError(error)
+    const isDatabaseError = error instanceof DrizzleQueryError
+    const errorMessage = isDatabaseError ? INTERNAL_DATABASE_ERROR_MESSAGE : normalizeError(error)
     const hasLogInputs =
       inputsForLog && typeof inputsForLog === 'object' && Object.keys(inputsForLog).length > 0
     const input = hasLogInputs
       ? inputsForLog
       : ((block.config?.params as Record<string, any> | undefined) ?? {})
 
-    const errorOutput: NormalizedBlockOutput = {
-      error: errorMessage,
+    // Routine user Stop on Agent streams: don't paint a failed agent block
+    // (workflow is already cancelled). Timeouts abort with reason `'timeout'`.
+    // Non-agent blocks (HTTP, Function, etc.) still fail normally on AbortError
+    // so logs don't show a green empty success.
+    const isAbort =
+      (error instanceof DOMException && error.name === 'AbortError') ||
+      (error instanceof Error && error.name === 'AbortError')
+    const isTimeout = isTimeoutAbortReason(ctx.abortSignal?.reason)
+    const isAgentBlock = block.metadata?.id === BlockType.AGENT
+    if (isAbort && !isTimeout && ctx.abortSignal?.aborted && isAgentBlock) {
+      const softOutput: NormalizedBlockOutput = {
+        content: '',
+      }
+      const softOutputProvenance =
+        ctx.resolvedSecretTraceRegistry?.exportCommittedProvenanceForValue(softOutput)
+
+      this.setNodeOutput(node, softOutput, duration, softOutputProvenance)
+
+      if (blockLog) {
+        blockLog.endedAt = endedAt
+        blockLog.durationMs = duration
+        blockLog.success = true
+        blockLog.error = undefined
+        blockLog.input = this.projectInputsForDisplay(input, block, inputDisplayRegistry)
+        blockLog.output = filterOutputForLog(block.metadata?.id || '', softOutput, { block })
+      }
+
+      this.execLogger.info('Block stream aborted by client; soft-completing', {
+        blockId: node.id,
+        blockType: block.metadata?.id,
+      })
+
+      if (!isSentinel && blockLog) {
+        const displayInput = this.projectInputsForDisplay(input, block, inputDisplayRegistry)
+        const displayOutput = filterOutputForLog(block.metadata?.id || '', softOutput, { block })
+        const displayProvenance =
+          ctx.resolvedSecretTraceRegistry?.exportCommittedProvenanceForValue({
+            input: displayInput,
+            output: displayOutput,
+          })
+        this.setBlockLogDisplayProvenance(blockLog, displayProvenance)
+        this.fireBlockCompleteCallback(
+          blockStartPromise,
+          ctx,
+          node,
+          block,
+          displayInput,
+          displayOutput,
+          duration,
+          blockLog.startedAt,
+          blockLog.executionOrder,
+          blockLog.endedAt,
+          undefined,
+          softOutputProvenance,
+          displayProvenance
+        )
+      }
+
+      return softOutput
     }
 
+    const trustedExecutionCost = readTrustedExecutionCost(error) ?? completedHandlerCost
+    const errorOutput: NormalizedBlockOutput = {
+      error: errorMessage,
+      ...(trustedExecutionCost ? { cost: trustedExecutionCost } : {}),
+    }
+
+    // Keep any answer text already drained before timeout/failure so logs match
+    // what was projected to the client.
+    const partialContent = streamingPartialOutput?.content
+    if (typeof partialContent === 'string' && partialContent) {
+      errorOutput.content = partialContent
+    }
+
+    // Only real workflow blocks surface a child workflow name. A custom block's
+    // source workflow is never named to its consumer — and before the handler
+    // resolves the real name this field still holds the source workflow id, so
+    // an early throw (e.g. the call-chain depth limit) would leak it outright.
     if (ChildWorkflowError.isChildWorkflowError(error)) {
-      errorOutput.childWorkflowName = error.childWorkflowName
-      if (error.childWorkflowSnapshotId) {
-        errorOutput.childWorkflowSnapshotId = error.childWorkflowSnapshotId
+      if (isWorkflowBlockType(block.metadata?.id)) {
+        errorOutput.childWorkflowName = error.childWorkflowName
+        if (error.childWorkflowSnapshotId) {
+          errorOutput.childWorkflowSnapshotId = error.childWorkflowSnapshotId
+        }
+      }
+      // A custom block's consumer gets a machine-readable failure class and an
+      // opaque handle to the failed run — enough to branch on and to quote in a
+      // support request, without naming anything inside the source workflow.
+      if (error.consumerFacing) {
+        errorOutput.errorType = error.consumerFacing.errorType
+        if (error.consumerFacing.ref) {
+          errorOutput.errorRef = error.consumerFacing.ref
+        }
       }
     }
 
-    this.setNodeOutput(node, errorOutput, duration)
+    const errorRegistry = ctx.errorResolvedSecretTraceRegistry ?? ctx.resolvedSecretTraceRegistry
+    const errorOutputProvenance = errorRegistry?.exportCommittedProvenanceForValue(errorOutput)
+    this.setNodeOutput(node, errorOutput, duration, errorOutputProvenance)
 
     if (blockLog) {
       blockLog.endedAt = endedAt
       blockLog.durationMs = duration
       blockLog.success = false
       blockLog.error = errorMessage
-      blockLog.input = this.sanitizeInputsForLog(input, block.metadata?.id)
+      blockLog.input = this.projectInputsForDisplay(input, block, inputDisplayRegistry)
       blockLog.output = filterOutputForLog(block.metadata?.id || '', errorOutput, { block })
 
       if (ChildWorkflowError.isChildWorkflowError(error) && error.childTraceSpans.length > 0) {
         blockLog.childTraceSpans = error.childTraceSpans
       }
+      // A failed custom block still has its own child run to join at read time —
+      // unless the instance opted out, which leaves only the marker.
+      if (ChildWorkflowError.isChildWorkflowError(error) && error.childExecutionId) {
+        blockLog.childExecution = { executionId: error.childExecutionId }
+      }
+      if (ChildWorkflowError.isChildWorkflowError(error) && error.childTraceDisabled) {
+        blockLog.childTraceDisabled = true
+      }
     }
+
+    const diagnosticRegistry = ctx.errorResolvedSecretTraceRegistry
+      ? ctx.errorResolvedSecretTraceRegistry
+      : inputDisplayRegistry?.forkForToolCall()
+    if (
+      !ctx.errorResolvedSecretTraceRegistry &&
+      diagnosticRegistry &&
+      ctx.resolvedSecretTraceRegistry &&
+      ctx.resolvedSecretTraceRegistry !== inputDisplayRegistry
+    ) {
+      diagnosticRegistry.mergeToolCallRegistry(ctx.resolvedSecretTraceRegistry)
+    }
+    const errorDiagnostic = isDatabaseError
+      ? { cause: describeError(error) }
+      : projectResolvedSecretDiagnosticError(
+          error,
+          diagnosticRegistry ?? ctx.resolvedSecretTraceRegistry
+        )
 
     this.execLogger.error(
       phase === 'input_resolution' ? 'Failed to resolve block inputs' : 'Block execution failed',
       {
         blockId: node.id,
         blockType: block.metadata?.id,
-        error: errorMessage,
+        ...errorDiagnostic,
       }
     )
 
@@ -422,18 +799,26 @@ export class BlockExecutor {
         ? error.childWorkflowInstanceId
         : undefined
       const displayOutput = filterOutputForLog(block.metadata?.id || '', errorOutput, { block })
+      const displayInput = this.projectInputsForDisplay(input, block, inputDisplayRegistry)
+      const displayProvenance = errorRegistry?.exportCommittedProvenanceForValue({
+        input: displayInput,
+        output: displayOutput,
+      })
+      this.setBlockLogDisplayProvenance(blockLog, displayProvenance)
       this.fireBlockCompleteCallback(
         blockStartPromise,
         ctx,
         node,
         block,
-        this.sanitizeInputsForLog(input, block.metadata?.id),
+        displayInput,
         displayOutput,
         duration,
         blockLog.startedAt,
         blockLog.executionOrder,
         blockLog.endedAt,
-        childWorkflowInstanceId
+        childWorkflowInstanceId,
+        errorOutputProvenance,
+        displayProvenance
       )
     }
 
@@ -444,12 +829,16 @@ export class BlockExecutor {
       }
       this.execLogger.info('Block has error port - returning error output instead of throwing', {
         blockId: node.id,
-        error: errorMessage,
+        ...errorDiagnostic,
       })
       return errorOutput
     }
 
-    const errorToThrow = error instanceof Error ? error : new Error(errorMessage)
+    const errorToThrow = isDatabaseError
+      ? new Error(errorMessage, { cause: error })
+      : error instanceof Error
+        ? error
+        : new Error(errorMessage)
 
     throw buildBlockExecutionError({
       block,
@@ -541,6 +930,17 @@ export class BlockExecutor {
     return { result: output }
   }
 
+  /** Builds the log-facing input copy from resolver-recorded projections only. */
+  private projectInputsForDisplay(
+    inputs: Record<string, any>,
+    block: SerializedBlock | undefined,
+    registry: ResolvedSecretTraceRegistry | undefined
+  ): Record<string, any> {
+    const projection = registry?.projectResolvedInputSelection(inputs)
+    if (projection && !projection.complete) return {}
+    return this.sanitizeInputsForLog(projection?.value ?? inputs, block)
+  }
+
   /**
    * Sanitizes inputs for log display.
    * - Filters out system fields (UI-only, readonly, internal flags)
@@ -551,8 +951,10 @@ export class BlockExecutor {
    */
   private sanitizeInputsForLog(
     inputs: Record<string, any>,
-    blockType?: string
+    block?: SerializedBlock
   ): Record<string, any> {
+    const blockType = block?.metadata?.id
+    const privateInputIds = new Set(block?.privateInputIds ?? [])
     // Custom (deploy-as-block) blocks run via an internal `workflow_executor`; the
     // baked `workflowId`/`inputMapping` wrapper is plumbing. Log the mapped input
     // field values (the inputMapping contents) instead.
@@ -568,7 +970,7 @@ export class BlockExecutor {
               }
             })()
           : mapping
-      inputs = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+      inputs = toRecord(parsed)
     }
 
     const result: Record<string, any> = {}
@@ -578,7 +980,8 @@ export class BlockExecutor {
         SYSTEM_SUBBLOCK_IDS.includes(key) ||
         key === 'triggerMode' ||
         key === FUNCTION_BLOCK_CONTEXT_VARS_KEY ||
-        key === FUNCTION_BLOCK_DISPLAY_CODE_KEY
+        key === FUNCTION_BLOCK_DISPLAY_CODE_KEY ||
+        privateInputIds.has(key)
       ) {
         continue
       }
@@ -640,7 +1043,7 @@ export class BlockExecutor {
         this.execLogger.warn('Block start callback failed', {
           blockId,
           blockType,
-          error: toError(error).message,
+          ...projectResolvedSecretDiagnosticError(error, ctx.resolvedSecretTraceRegistry),
         })
       })
   }
@@ -661,7 +1064,9 @@ export class BlockExecutor {
     startedAt: string,
     executionOrder: number,
     endedAt: string,
-    childWorkflowInstanceId?: string
+    childWorkflowInstanceId?: string,
+    resolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1,
+    displayResolvedSecretTraceProvenance?: ResolvedSecretTraceProvenanceV1
   ): void {
     if (!this.contextExtensions.onBlockComplete) return
 
@@ -679,6 +1084,8 @@ export class BlockExecutor {
         {
           input,
           output,
+          ...(resolvedSecretTraceProvenance ? { resolvedSecretTraceProvenance } : {}),
+          ...(displayResolvedSecretTraceProvenance ? { displayResolvedSecretTraceProvenance } : {}),
           executionTime: duration,
           startedAt,
           executionOrder,
@@ -692,7 +1099,7 @@ export class BlockExecutor {
       this.execLogger.warn('Block completion callback failed', {
         blockId,
         blockType,
-        error: toError(error).message,
+        ...projectResolvedSecretDiagnosticError(error, ctx.resolvedSecretTraceRegistry),
       })
     })
   }
@@ -774,121 +1181,153 @@ export class BlockExecutor {
     streamingExec: StreamingExecution,
     resolvedInputs: Record<string, any>,
     selectedOutputs: string[],
-    forwardToClient = true
+    executionOrder?: number
   ): Promise<void> {
-    const blockId = node.id
+    const blockId = node.metadata?.originalBlockId ?? node.id
+    const piiEnabled = Boolean(ctx.piiBlockOutputRedaction?.enabled)
+    // Live-forward only when a client stream exists and PII redaction is off.
+    const forwardToClient = Boolean(ctx.onStream) && !piiEnabled
+    const projectStreamDiagnosticError = (error: unknown): Record<string, unknown> => {
+      const sourceRegistry = streamingExec.diagnosticResolvedSecretTraceRegistry
+      const resultRegistry = ctx.resolvedSecretTraceRegistry
+      if (!sourceRegistry || sourceRegistry === resultRegistry) {
+        return projectResolvedSecretDiagnosticError(error, resultRegistry)
+      }
+      const diagnosticRegistry = sourceRegistry.forkForToolCall()
+      if (resultRegistry) diagnosticRegistry.mergeToolCallRegistry(resultRegistry)
+      return projectResolvedSecretDiagnosticError(error, diagnosticRegistry)
+    }
 
     const responseFormat =
       resolvedInputs?.responseFormat ??
       (block.config?.params as Record<string, any> | undefined)?.responseFormat ??
       (block.config as Record<string, any> | undefined)?.responseFormat
 
-    const sourceReader = streamingExec.stream.getReader()
-    const decoder = new TextDecoder()
-    const accumulated: string[] = []
-    let drainError: unknown
-    let sourceFullyDrained = false
+    const streamFormat = streamingExec.streamFormat ?? 'text'
+    const pump = createAgentStreamPump({
+      source: streamingExec.stream,
+      streamFormat,
+      // No live consumer → sink-mode so we never buffer into an unread text stream.
+      sinkMode: !forwardToClient,
+      abortSignal: ctx.abortSignal,
+    })
 
-    if (forwardToClient) {
-      const clientSource = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          try {
-            const { done, value } = await sourceReader.read()
-            if (done) {
-              const tail = decoder.decode()
-              if (tail) accumulated.push(tail)
-              sourceFullyDrained = true
-              controller.close()
-              return
-            }
-            accumulated.push(decoder.decode(value, { stream: true }))
-            controller.enqueue(value)
-          } catch (error) {
-            drainError = error
-            controller.error(error)
-          }
-        },
-        async cancel(reason) {
-          try {
-            await sourceReader.cancel(reason)
-          } catch {}
-        },
-      })
+    let onStreamPromise: Promise<void> | undefined
+    let processedClientStream: ReadableStream<Uint8Array> | undefined
 
-      const processedClientStream = streamingResponseFormatProcessor.processStream(
-        clientSource,
+    if (forwardToClient && ctx.onStream && pump.textStream) {
+      const {
+        diagnosticResolvedSecretTraceRegistry: _diagnosticRegistry,
+        ...streamingExecutionForConsumer
+      } = streamingExec
+      processedClientStream = streamingResponseFormatProcessor.processStream(
+        pump.textStream,
         blockId,
         selectedOutputs,
         responseFormat
       )
 
-      try {
-        await ctx.onStream?.({
+      // Start onStream without awaiting so a sync `subscribe(sink)` can run before
+      // the first provider pull, then read the projected text stream concurrently
+      // with `pump.run()`.
+      onStreamPromise = ctx
+        .onStream({
+          ...streamingExecutionForConsumer,
+          blockId,
+          ...(executionOrder !== undefined ? { executionOrder } : {}),
           stream: processedClientStream,
-          execution: streamingExec.execution,
+          streamFormat: 'text',
+          subscribe: pump.subscribe,
+          // processStream returns the input stream identity when no
+          // response-format extraction applies.
+          clientStreamTransformed: processedClientStream !== pump.textStream,
+          displayResolvedSecretTraceProvenance:
+            ctx.resolvedSecretTraceRegistry?.exportCommittedProvenanceForValue(resolvedInputs),
         })
-      } catch (error) {
-        this.execLogger.error('Error in onStream callback', { blockId, error })
-        await processedClientStream.cancel().catch(() => {})
-      } finally {
-        try {
-          sourceReader.releaseLock()
-        } catch {}
-      }
-    } else {
-      // Buffer-only drain: consume the source so `execution.output` is complete,
-      // but never forward raw chunks to the client (block-output redaction is on).
-      try {
-        while (true) {
-          const { done, value } = await sourceReader.read()
-          if (done) {
-            const tail = decoder.decode()
-            if (tail) accumulated.push(tail)
-            sourceFullyDrained = true
-            break
-          }
-          accumulated.push(decoder.decode(value, { stream: true }))
-        }
-      } catch (error) {
-        drainError = error
-      } finally {
-        try {
-          sourceReader.releaseLock()
-        } catch {}
-      }
+        .catch(async (error) => {
+          this.execLogger.error('Error in onStream callback', {
+            blockId,
+            ...projectStreamDiagnosticError(error),
+          })
+          await processedClientStream?.cancel().catch(() => {})
+        })
     }
 
-    if (drainError) {
-      this.execLogger.error('Error reading stream for block', { blockId, error: drainError })
+    let pumpResult
+    try {
+      pumpResult = await pump.run()
+    } catch (error) {
+      this.execLogger.error('Error reading stream for block', {
+        blockId,
+        ...projectStreamDiagnosticError(error),
+      })
+      if (onStreamPromise) {
+        await onStreamPromise.catch(() => {})
+      }
+      throw error instanceof Error ? error : new Error(String(error))
+    }
+
+    if (onStreamPromise) {
+      await onStreamPromise
+    }
+
+    // Timeout still fails the block, but keep any drained answer text so logs
+    // match what was already projected to the client before the deadline.
+    // User Stop soft-completes below so logs don't show a scary red agent block
+    // for a routine cancel (workflow status remains `cancelled` via abort).
+    if (pumpResult.cancelled && pumpResult.cancelReason === 'timeout') {
+      const truncated = pumpResult.answerText
+      if (truncated && streamingExec.execution?.output) {
+        streamingExec.execution.output.content = truncated
+      }
+      this.execLogger.warn('Stream timed out; persisting drained answer before failing block', {
+        blockId,
+        hasContent: Boolean(truncated),
+      })
+      throw new DOMException('Provider request timed out', 'AbortError')
+    }
+
+    // Provider onComplete may have attached thinking to timing segments during drain.
+    // Under PII redaction, never retain raw thinking in traces.
+    if (piiEnabled) {
+      stripThinkingContentFromOutput(streamingExec.execution?.output)
+    }
+
+    // User/unknown cancel: persist truncated answer when present, then return.
+    if (pumpResult.cancelled) {
+      const truncated = pumpResult.answerText
+      if (truncated && streamingExec.execution?.output) {
+        streamingExec.execution.output.content = truncated
+      }
+      this.execLogger.info('Stream cancelled by client; soft-completing agent block', {
+        blockId,
+        cancelReason: pumpResult.cancelReason,
+        hasContent: Boolean(truncated),
+      })
       return
     }
 
-    // If the onStream consumer exited before the source drained (e.g. it caught
-    // an internal error and returned normally), `accumulated` holds a truncated
-    // response. Persisting that to memory or setting it as the block output
-    // would corrupt downstream state — skip and log instead.
-    if (!sourceFullyDrained) {
+    // If the pump did not fully drain (should be rare when not cancelled), skip
+    // persistence of potentially truncated answer text.
+    if (!pumpResult.fullyDrained) {
       this.execLogger.warn(
         'Stream consumer exited before source drained; skipping content persistence',
-        {
-          blockId,
-        }
+        { blockId }
       )
       return
     }
 
-    let fullContent = accumulated.join('')
+    let fullContent = pumpResult.answerText
     if (!fullContent) {
       return
     }
 
-    if (!forwardToClient && ctx.piiBlockOutputRedaction?.enabled) {
-      // Mask before the content is written to `execution.output` or persisted to
-      // memory via `onFullContent`, so the streamed agent response can't leak PII
-      // through either path. The block-output redaction below is then idempotent.
+    if (piiEnabled && ctx.piiBlockOutputRedaction) {
+      // Mask before writing to `execution.output` or `onFullContent`.
       fullContent = await redactObjectStrings(fullContent, {
         entityTypes: ctx.piiBlockOutputRedaction.entityTypes,
         language: ctx.piiBlockOutputRedaction.language,
+        customPatterns: ctx.piiBlockOutputRedaction.customPatterns,
         onFailure: 'throw',
       })
     }
@@ -911,7 +1350,7 @@ export class BlockExecutor {
         } catch (error) {
           this.execLogger.warn('Failed to parse streamed content for response format', {
             blockId,
-            error,
+            ...projectStreamDiagnosticError(error),
           })
         }
       }
@@ -924,8 +1363,24 @@ export class BlockExecutor {
       try {
         await streamingExec.onFullContent(fullContent)
       } catch (error) {
-        this.execLogger.error('onFullContent callback failed', { blockId, error })
+        this.execLogger.error('onFullContent callback failed', {
+          blockId,
+          ...projectStreamDiagnosticError(error),
+        })
       }
+    }
+  }
+}
+
+/** Removes retained thinking from provider timing segments (PII safe default). */
+function stripThinkingContentFromOutput(output: unknown): void {
+  if (!output || typeof output !== 'object') return
+  const providerTiming = (output as { providerTiming?: { timeSegments?: unknown } }).providerTiming
+  const segments = providerTiming?.timeSegments
+  if (!Array.isArray(segments)) return
+  for (const segment of segments) {
+    if (segment && typeof segment === 'object' && 'thinkingContent' in segment) {
+      ;(segment as { thinkingContent?: string }).thinkingContent = undefined
     }
   }
 }

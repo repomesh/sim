@@ -5,6 +5,7 @@ import type { ToolConfig } from '@/tools/types'
 export const gitlabDeleteIssueTool: ToolConfig<GitLabDeleteIssueParams, GitLabDeleteIssueResponse> =
   {
     id: 'gitlab_delete_issue',
+    personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
     name: 'GitLab Delete Issue',
     description: 'Delete an issue from a GitLab project',
     version: '1.0.0',
@@ -26,7 +27,7 @@ export const gitlabDeleteIssueTool: ToolConfig<GitLabDeleteIssueParams, GitLabDe
         type: 'string',
         required: true,
         visibility: 'user-or-llm',
-        description: 'Project ID or URL-encoded path',
+        description: 'Project ID or path (e.g. mygroup/myproject)',
       },
       issueIid: {
         type: 'number',

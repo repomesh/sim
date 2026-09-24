@@ -5,6 +5,7 @@ import type { ToolConfig } from '@/tools/types'
 export const gitlabUpdateIssueTool: ToolConfig<GitLabUpdateIssueParams, GitLabUpdateIssueResponse> =
   {
     id: 'gitlab_update_issue',
+    personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
     name: 'GitLab Update Issue',
     description: 'Update an existing issue in a GitLab project',
     version: '1.0.0',
@@ -26,7 +27,7 @@ export const gitlabUpdateIssueTool: ToolConfig<GitLabUpdateIssueParams, GitLabUp
         type: 'string',
         required: true,
         visibility: 'user-or-llm',
-        description: 'Project ID or URL-encoded path',
+        description: 'Project ID or path (e.g. mygroup/myproject)',
       },
       issueIid: {
         type: 'number',

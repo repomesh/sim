@@ -1,26 +1,29 @@
 /**
  * @vitest-environment node
  */
-import { createMockRequest } from '@sim/testing'
+import { authMockFns, createMockRequest } from '@sim/testing'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   mockFilterBlacklistedModels,
   mockIsProviderBlacklisted,
   mockGetBYOKKey,
-  mockGetSession,
   mockGetUserEntityPermissions,
   mockFetch,
 } = vi.hoisted(() => ({
   mockFilterBlacklistedModels: vi.fn(),
   mockIsProviderBlacklisted: vi.fn(),
   mockGetBYOKKey: vi.fn(),
-  mockGetSession: vi.fn(),
   mockGetUserEntityPermissions: vi.fn(),
   mockFetch: vi.fn(),
 }))
 
 vi.mock('@/providers/utils', () => ({
+  isFunctionToolCall: (toolCall: unknown) =>
+    typeof toolCall === 'object' &&
+    toolCall !== null &&
+    'function' in toolCall &&
+    (toolCall as { function?: unknown }).function != null,
   filterBlacklistedModels: mockFilterBlacklistedModels,
   isProviderBlacklisted: mockIsProviderBlacklisted,
 }))
@@ -29,15 +32,13 @@ vi.mock('@/lib/api-key/byok', () => ({
   getBYOKKey: mockGetBYOKKey,
 }))
 
-vi.mock('@/lib/auth', () => ({
-  getSession: mockGetSession,
-}))
-
 vi.mock('@/lib/workspaces/permissions/utils', () => ({
   getUserEntityPermissions: mockGetUserEntityPermissions,
 }))
 
 import { GET } from '@/app/api/providers/ollama-cloud/models/route'
+
+const mockGetSession = authMockFns.mockGetSession
 
 const OLLAMA_CLOUD_TAGS_URL = 'https://ollama.com/api/tags'
 
@@ -141,6 +142,29 @@ describe('GET /api/providers/ollama-cloud/models', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1)
     expect(mockFetch.mock.calls[0][0]).toBe(OLLAMA_CLOUD_TAGS_URL)
     expect(fetchAuthHeader()).toBe('Bearer byok-ollama-key')
+  })
+
+  it('discovers newly available models on subsequent requests without a static catalog update', async () => {
+    grantWorkspaceAccess()
+    mockGetBYOKKey.mockResolvedValue({ apiKey: 'byok-ollama-key' })
+    mockFetch
+      .mockResolvedValueOnce(okResponse({ models: [{ name: 'kimi-k3' }] }))
+      .mockResolvedValueOnce(
+        okResponse({
+          models: [{ name: 'kimi-k3' }, { name: 'deepseek-v4.1-flash' }, { name: 'glm-5.3' }],
+        })
+      )
+
+    const first = await GET(requestWithWorkspace('ws-1'))
+    expect(await first.json()).toEqual({ models: ['ollama-cloud/kimi-k3'] })
+    const refreshed = await GET(requestWithWorkspace('ws-1'))
+    expect(await refreshed.json()).toEqual({
+      models: ['ollama-cloud/kimi-k3', 'ollama-cloud/deepseek-v4.1-flash', 'ollama-cloud/glm-5.3'],
+    })
+    expect(mockFetch).toHaveBeenLastCalledWith(
+      OLLAMA_CLOUD_TAGS_URL,
+      expect.objectContaining({ cache: 'no-store' })
+    )
   })
 
   it('does not call getBYOKKey when there is a workspaceId but no session', async () => {

@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { workspaceIdSchema } from '@/lib/api/contracts/primitives'
 import { defineRouteContract } from '@/lib/api/contracts/types'
+import { INTERNAL_CHAT_BILLING_SOURCES } from '@/lib/billing/usage-sources'
 import {
   BILLING_ACCOUNT_DECISION_HEADER,
   BILLING_ACCOUNT_DECISION_HEADER_MAX_BYTES,
@@ -20,26 +21,29 @@ const booleanQueryParamSchema = z
   .optional()
   .default(false)
 
-export const billingUpdateCostBodySchema = z.object({
-  userId: z.string().min(1, 'User ID is required'),
-  cost: z.number().min(0, 'Cost must be a non-negative number'),
-  model: z.string().min(1, 'Model is required'),
-  inputTokens: z.number().min(0).default(0),
-  outputTokens: z.number().min(0).default(0),
-  source: z
-    .enum(['copilot', 'workspace-chat', 'mcp_copilot', 'mothership_block'])
-    .default('copilot'),
-  idempotencyKey: z.string().min(1, 'Idempotency key is required'),
-  /**
-   * Originating workspace, used for org-workspace cost attribution on hosted
-   * Sim. The value remains optional because self-hosted/headless callers may
-   * supply an ID from another deployment or omit it. Modern protocols bind a
-   * locally known workspace to their immutable envelope. Markerless legacy-v0
-   * callbacks re-resolve current workspace payer state because old Go cannot
-   * return admission material; unknown workspaces remain account-only.
-   */
-  workspaceId: z.string().min(1).optional(),
-})
+export const billingUpdateCostBodySchema = z
+  .object({
+    userId: z.string().min(1, 'User ID is required'),
+    cost: z.number().min(0, 'Cost must be a non-negative number'),
+    model: z.string().min(1, 'Model is required'),
+    inputTokens: z.number().min(0).default(0),
+    outputTokens: z.number().min(0).default(0),
+    source: z.enum(INTERNAL_CHAT_BILLING_SOURCES).default('copilot'),
+    idempotencyKey: z.string().min(1, 'Idempotency key is required'),
+    /**
+     * Originating workspace, used for org-workspace cost attribution on hosted
+     * Sim. The value remains optional because self-hosted/headless callers may
+     * supply an ID from another deployment or omit it. Modern protocols bind a
+     * locally known workspace to their immutable envelope. Markerless local
+     * self-hosted callbacks re-resolve current workspace payer state; unknown
+     * workspaces remain account-only.
+     */
+    workspaceId: z.string().min(1).optional(),
+    organizationId: z.string().min(1).max(200).optional(),
+  })
+  .refine((body) => !(body.workspaceId && body.organizationId), {
+    message: 'workspaceId and organizationId are mutually exclusive',
+  })
 export type BillingUpdateCostBody = z.input<typeof billingUpdateCostBodySchema>
 
 export const billingUpdateCostHeadersSchema = z.object({
@@ -64,6 +68,8 @@ export const billingQuerySchema = z.object({
   context: z.enum(['user', 'organization']).optional().default('user'),
   id: z.string().min(1).optional(),
   includeOrg: booleanQueryParamSchema,
+  memberLimit: z.coerce.number().int().min(1).max(100).default(50),
+  memberOffset: z.coerce.number().int().min(0).default(0),
 })
 
 export const billingUsageDataSchema = z
@@ -158,6 +164,13 @@ export const organizationBillingDataSchema = z
     averageUsagePerMember: z.number(),
     billingPeriodStart: z.string().nullable(),
     billingPeriodEnd: z.string().nullable(),
+    membersTotal: z.number().int().min(0),
+    memberPagination: z.object({
+      total: z.number().int().min(0),
+      limit: z.number().int().min(1).max(100),
+      offset: z.number().int().min(0),
+      hasMore: z.boolean(),
+    }),
     members: z.array(organizationBillingMemberSchema),
     billingBlocked: z.boolean(),
     billingBlockedReason: z.enum(['payment_failed', 'dispute']).nullable(),
@@ -194,6 +207,8 @@ export const usageQuerySchema = z.object({
   context: z.enum(['user', 'organization']).optional().default('user'),
   userId: z.string().optional(),
   organizationId: z.string().optional(),
+  memberLimit: z.coerce.number().int().min(1).max(100).default(50),
+  memberOffset: z.coerce.number().int().min(0).default(0),
 })
 
 export const updateUsageLimitBodySchema = z
@@ -226,11 +241,6 @@ export const organizationUsageLimitApiResponseSchema = z
   })
   .passthrough()
 
-export const purchaseCreditsBodySchema = z.object({
-  amount: z.number().min(10).max(1000),
-  requestId: z.string().uuid(),
-})
-
 export const billingPortalBodySchema = z.object({
   context: z.enum(['user', 'organization']).optional().default('user'),
   organizationId: z.string().min(1).optional(),
@@ -253,6 +263,8 @@ export const invoiceItemSchema = z.object({
   amountPaid: z.number(),
   currency: z.string(),
   status: z.string().nullable(),
+  /** Primary line-item / invoice description, e.g. "Usage overage" or the plan name. */
+  description: z.string().nullable(),
   hostedInvoiceUrl: z.string().nullable(),
   invoicePdf: z.string().nullable(),
 })
@@ -332,16 +344,6 @@ export const updateUsageLimitContract = defineRouteContract({
   response: {
     mode: 'json',
     schema: z.union([usageLimitApiResponseSchema, organizationUsageLimitApiResponseSchema]),
-  },
-})
-
-export const purchaseCreditsContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/billing/credits',
-  body: purchaseCreditsBodySchema,
-  response: {
-    mode: 'json',
-    schema: successResponseSchema,
   },
 })
 

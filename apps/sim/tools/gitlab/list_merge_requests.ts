@@ -10,6 +10,7 @@ export const gitlabListMergeRequestsTool: ToolConfig<
   GitLabListMergeRequestsResponse
 > = {
   id: 'gitlab_list_merge_requests',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab List Merge Requests',
   description: 'List merge requests in a GitLab project',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabListMergeRequestsTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     state: {
       type: 'string',

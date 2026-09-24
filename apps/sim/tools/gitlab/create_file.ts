@@ -4,6 +4,7 @@ import type { ToolConfig } from '@/tools/types'
 
 export const gitlabCreateFileTool: ToolConfig<GitLabCreateFileParams, GitLabCreateFileResponse> = {
   id: 'gitlab_create_file',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Create File',
   description: 'Create a new file in a GitLab project repository',
   version: '1.0.0',
@@ -25,7 +26,7 @@ export const gitlabCreateFileTool: ToolConfig<GitLabCreateFileParams, GitLabCrea
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     filePath: {
       type: 'string',
@@ -44,6 +45,30 @@ export const gitlabCreateFileTool: ToolConfig<GitLabCreateFileParams, GitLabCrea
       required: true,
       visibility: 'user-or-llm',
       description: 'File content',
+    },
+    startBranch: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Name of the base branch to create the target branch from, if it does not exist',
+    },
+    authorName: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Commit author name (defaults to the token user)',
+    },
+    authorEmail: {
+      type: 'string',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Commit author email (defaults to the token user)',
+    },
+    executeFilemode: {
+      type: 'boolean',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Enable the execute flag on the file',
     },
     commitMessage: {
       type: 'string',
@@ -64,12 +89,21 @@ export const gitlabCreateFileTool: ToolConfig<GitLabCreateFileParams, GitLabCrea
       'Content-Type': 'application/json',
       'PRIVATE-TOKEN': params.accessToken,
     }),
-    body: (params) => ({
-      branch: params.branch,
-      content: params.content,
-      commit_message: params.commitMessage,
-      encoding: 'text',
-    }),
+    body: (params) => {
+      const body: Record<string, unknown> = {
+        branch: params.branch,
+        content: params.content,
+        commit_message: params.commitMessage,
+        encoding: 'text',
+      }
+
+      if (params.startBranch) body.start_branch = params.startBranch
+      if (params.authorName) body.author_name = params.authorName
+      if (params.authorEmail) body.author_email = params.authorEmail
+      if (params.executeFilemode !== undefined) body.execute_filemode = params.executeFilemode
+
+      return body
+    },
   },
 
   transformResponse: async (response) => {

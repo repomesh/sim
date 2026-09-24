@@ -4,6 +4,7 @@ import type { ToolConfig } from '@/tools/types'
 
 export const gitlabPlayJobTool: ToolConfig<GitLabPlayJobParams, GitLabPlayJobResponse> = {
   id: 'gitlab_play_job',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Play Job',
   description: 'Trigger (play) a manual GitLab job',
   version: '1.0.0',
@@ -25,13 +26,19 @@ export const gitlabPlayJobTool: ToolConfig<GitLabPlayJobParams, GitLabPlayJobRes
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     jobId: {
       type: 'number',
       required: true,
       visibility: 'user-or-llm',
       description: 'Job ID',
+    },
+    jobVariables: {
+      type: 'array',
+      required: false,
+      visibility: 'user-or-llm',
+      description: 'Variables for the manual job (array of objects with key and value)',
     },
   },
 
@@ -42,8 +49,16 @@ export const gitlabPlayJobTool: ToolConfig<GitLabPlayJobParams, GitLabPlayJobRes
     },
     method: 'POST',
     headers: (params) => ({
+      'Content-Type': 'application/json',
       'PRIVATE-TOKEN': params.accessToken,
     }),
+    body: (params) => {
+      const body: Record<string, unknown> = {}
+      if (params.jobVariables && params.jobVariables.length > 0) {
+        body.job_variables_attributes = params.jobVariables
+      }
+      return body
+    },
   },
 
   transformResponse: async (response) => {

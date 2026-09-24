@@ -1,8 +1,14 @@
 /**
  * @vitest-environment node
  */
-import { hybridAuthMockFns, permissionsMock, permissionsMockFns } from '@sim/testing'
-import { getErrorMessage } from '@sim/utils/errors'
+import {
+  hybridAuthMockFns,
+  permissionGroupScopeMock,
+  permissionGroupScopeMockFns,
+  permissionsMock,
+  permissionsMockFns,
+  resetPermissionGroupScopeMock,
+} from '@sim/testing'
 import type { NextRequest } from 'next/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -32,24 +38,43 @@ vi.mock('@/lib/table/rows/service', () => ({
 vi.mock('@/lib/table/billing', () => ({ getWorkspaceTableLimits: mockGetLimits }))
 vi.mock('@/app/api/table/utils', async () => {
   const { NextResponse } = await import('next/server')
+  const { asOrchestrationError, messageForOrchestrationError, statusForOrchestrationError } =
+    await import('@/lib/core/orchestration/types')
   return {
-    normalizeColumn: (column: unknown) => column,
     csvProxyBodyCapResponse: () => null,
     multipartErrorResponse: (error: { code: string; message: string }) =>
       NextResponse.json(
         { error: error.message },
         { status: error.code === 'FILE_TOO_LARGE' ? 413 : 400 }
       ),
-    rowWriteErrorResponse: (error: unknown) => {
-      const message = getErrorMessage(error)
-      return message.includes('row limit')
-        ? NextResponse.json({ error: message }, { status: 400 })
+    orchestrationOutcomeErrorResponse: (
+      outcome: { error?: string; errorCode?: OrchestrationErrorCode; lock?: string },
+      fallback: string
+    ) =>
+      NextResponse.json(
+        {
+          error: messageForOrchestrationError(outcome, fallback),
+          ...(outcome.lock ? { lock: outcome.lock } : {}),
+        },
+        { status: statusForOrchestrationError(outcome.errorCode) }
+      ),
+    orchestrationErrorResponse: (error: unknown) => {
+      const classified = asOrchestrationError(error)
+      return classified
+        ? NextResponse.json(
+            { error: classified.message },
+            { status: statusForOrchestrationError(classified.code) }
+          )
         : null
     },
   }
 })
 vi.mock('@/lib/workspaces/permissions/utils', () => permissionsMock)
+vi.mock('@/lib/permission-groups/config-scope.server', () => permissionGroupScopeMock)
 
+import { OrchestrationError, type OrchestrationErrorCode } from '@/lib/core/orchestration/types'
+import { DEFAULT_PERMISSION_GROUP_CONFIG } from '@/lib/permission-groups/fields'
+import { TableLockedError } from '@/lib/table/mutation-locks'
 import { POST } from '@/app/api/table/import-csv/route'
 
 type Part =
@@ -109,6 +134,7 @@ function uploadParts(csv: string): Part[] {
 describe('POST /api/table/import-csv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetPermissionGroupScopeMock()
     hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
       success: true,
       userId: 'user-1',
@@ -184,7 +210,10 @@ describe('POST /api/table/import-csv', () => {
 
   it('returns 400 with the reason when an insert exceeds the plan row limit', async () => {
     mockBatchInsertRows.mockRejectedValueOnce(
-      new Error('This table has reached its row limit (1,000 rows) on your current plan.')
+      new OrchestrationError(
+        'validation',
+        'This table has reached its row limit (1,000 rows) on your current plan.'
+      )
     )
     const response = await POST(makeRequest(uploadParts(csvWithRows(250))))
     const data = await response.json()
@@ -204,6 +233,19 @@ describe('POST /api/table/import-csv', () => {
     expect(mockDeleteTable).toHaveBeenCalledWith('tbl_1', expect.any(String))
   })
 
+  it('names the lock that rejected the import on a 423', async () => {
+    // The lock kind is the only thing that tells a client which lock to clear; rendering the
+    // outcome by hand is how the field gets dropped from one route and not its sibling.
+    mockBatchInsertRows.mockRejectedValueOnce(new TableLockedError('insert'))
+
+    const response = await POST(makeRequest(uploadParts(csvWithRows(250))))
+    const data = await response.json()
+
+    expect(response.status).toBe(423)
+    expect(data.lock).toBe('insert')
+    expect(data.error).toMatch(/lock/i)
+  })
+
   it('returns 401 when unauthenticated', async () => {
     hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({ success: false })
     const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
@@ -214,5 +256,88 @@ describe('POST /api/table/import-csv', () => {
     permissionsMockFns.mockGetUserEntityPermissions.mockResolvedValue('read')
     const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
     expect(response.status).toBe(403)
+  })
+
+  /**
+   * A CSV import creates a table, so `tables.create` governs it. A group that
+   * only sets `disableTableCreation` leaves Tables visible and usable, which is
+   * exactly the configuration a `tables.use` gate would let through.
+   */
+  it('refuses the import when the group disables table creation', async () => {
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disableTableCreation: true,
+    })
+
+    const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
+
+    expect(response.status).toBe(403)
+    expect((await response.json()).details).toEqual({
+      code: 'PERMISSION_GROUP_CAPABILITY_BLOCKED',
+    })
+    expect(mockCreateTable).not.toHaveBeenCalled()
+  })
+
+  it('refuses the import when the group hides Tables entirely', async () => {
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      hideTablesTab: true,
+    })
+
+    const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
+
+    expect(response.status).toBe(403)
+    expect(mockCreateTable).not.toHaveBeenCalled()
+  })
+
+  /**
+   * `checkSessionOrInternalAuth` also accepts an internal JWT, whose user id is
+   * the run's actor rather than someone asking for a table. Gating on it would
+   * refuse an executor call for a bystander's group, and dispatching under it
+   * would run the table's cells with that bystander's capabilities.
+   */
+  it('leaves an internal-JWT import ungoverned rather than gating on the run actor', async () => {
+    hybridAuthMockFns.mockCheckSessionOrInternalAuth.mockResolvedValue({
+      success: true,
+      userId: 'billing-owner',
+      authType: 'internal_jwt',
+    })
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      disableTableCreation: true,
+    })
+
+    const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
+
+    expect(response.status).toBe(200)
+    expect(permissionGroupScopeMockFns.mockResolvePermissionGroupConfig).not.toHaveBeenCalled()
+    expect(mockBatchInsertRows).toHaveBeenCalledWith(
+      expect.objectContaining({ capabilityGovernedUserId: null }),
+      expect.anything(),
+      expect.any(String)
+    )
+  })
+
+  it('dispatches a session import under the person it gated', async () => {
+    const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
+
+    expect(response.status).toBe(200)
+    expect(mockBatchInsertRows).toHaveBeenCalledWith(
+      expect.objectContaining({ capabilityGovernedUserId: 'user-1' }),
+      expect.anything(),
+      expect.any(String)
+    )
+  })
+
+  it('lets the import through when the group withholds something else', async () => {
+    permissionGroupScopeMockFns.mockResolvePermissionGroupConfig.mockResolvedValue({
+      ...DEFAULT_PERMISSION_GROUP_CONFIG,
+      hideKnowledgeBaseTab: true,
+    })
+
+    const response = await POST(makeRequest(uploadParts(csvWithRows(3))))
+
+    expect(response.status).toBe(200)
+    expect(mockCreateTable).toHaveBeenCalledTimes(1)
   })
 })

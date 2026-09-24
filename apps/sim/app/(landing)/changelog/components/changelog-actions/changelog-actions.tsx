@@ -1,7 +1,8 @@
 'use client'
 
 import { ChipLink } from '@sim/emcn'
-import { BookOpen, Github, Rss } from 'lucide-react'
+import { BookOpen, Rss } from '@sim/emcn/icons'
+import { GithubOutlineIcon } from '@/components/icons'
 
 /**
  * Changelog hero actions - the GitHub / Documentation / RSS pill links shown
@@ -15,14 +16,16 @@ export function ChangelogActions() {
     <div className='flex flex-wrap items-center gap-1'>
       <ChipLink
         variant='primary'
+        shape='round'
         href='https://github.com/simstudioai/sim/releases'
         target='_blank'
         rel='noopener noreferrer'
-        leftIcon={Github}
+        leftIcon={GithubOutlineIcon}
       >
         View on GitHub
       </ChipLink>
       <ChipLink
+        shape='round'
         href='https://docs.sim.ai'
         target='_blank'
         rel='noopener noreferrer'
@@ -30,7 +33,7 @@ export function ChangelogActions() {
       >
         Documentation
       </ChipLink>
-      <ChipLink href='/changelog.xml' leftIcon={Rss}>
+      <ChipLink shape='round' href='/changelog.xml' leftIcon={Rss}>
         RSS Feed
       </ChipLink>
     </div>

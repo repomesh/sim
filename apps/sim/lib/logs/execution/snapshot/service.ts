@@ -1,9 +1,10 @@
-import { db } from '@sim/db'
+import { dbFor } from '@sim/db'
 import { workflowExecutionLogs, workflowExecutionSnapshots } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { sha256Hex } from '@sim/security/hash'
 import { generateId } from '@sim/utils/id'
 import { and, eq, inArray, lt, notExists, sql } from 'drizzle-orm'
+import { consumeRowBudget, type RowBudget } from '@/lib/cleanup/batch-delete'
 import type {
   SnapshotService as ISnapshotService,
   SnapshotCreationResult,
@@ -51,7 +52,7 @@ export class SnapshotService implements ISnapshotService {
      * out-of-line storage is reused, so the per-execution write drops from the
      * full blob to a tiny heap tuple.
      */
-    const [upsertedSnapshot] = await db
+    const [upsertedSnapshot] = await dbFor('exec')
       .insert(workflowExecutionSnapshots)
       .values(snapshotData)
       .onConflictDoUpdate({
@@ -81,7 +82,7 @@ export class SnapshotService implements ISnapshotService {
   }
 
   async getSnapshot(id: string): Promise<WorkflowExecutionSnapshot | null> {
-    const [snapshot] = await db
+    const [snapshot] = await dbFor('exec')
       .select()
       .from(workflowExecutionSnapshots)
       .where(eq(workflowExecutionSnapshots.id, id))
@@ -102,7 +103,9 @@ export class SnapshotService implements ISnapshotService {
     return sha256Hex(stateString)
   }
 
-  async cleanupOrphanedSnapshots(olderThanDays: number): Promise<number> {
+  /** Only invoked from the cleanup-logs background job, so it runs on the cleanup pool. */
+  async cleanupOrphanedSnapshots(olderThanDays: number, budget?: RowBudget): Promise<number> {
+    const cleanupDb = dbFor('cleanup')
     const cutoffDate = new Date()
     cutoffDate.setDate(cutoffDate.getDate() - olderThanDays)
 
@@ -113,32 +116,34 @@ export class SnapshotService implements ISnapshotService {
     let stoppedEarly = false
 
     for (let batch = 0; batch < MAX_BATCHES; batch++) {
-      const candidates = await db
+      if (budget?.remaining === 0) break
+      const candidates = await cleanupDb
         .select({ id: workflowExecutionSnapshots.id })
         .from(workflowExecutionSnapshots)
         .where(
           and(
             lt(workflowExecutionSnapshots.createdAt, cutoffDate),
             notExists(
-              db
+              cleanupDb
                 .select({ one: sql`1` })
                 .from(workflowExecutionLogs)
                 .where(eq(workflowExecutionLogs.stateSnapshotId, workflowExecutionSnapshots.id))
             )
           )
         )
-        .limit(BATCH_SIZE)
+        .limit(Math.min(BATCH_SIZE, budget?.remaining ?? BATCH_SIZE))
 
       if (candidates.length === 0) break
 
+      consumeRowBudget(budget, candidates.length)
       const ids = candidates.map((c) => c.id)
-      const deleted = await db
+      const deleted = await cleanupDb
         .delete(workflowExecutionSnapshots)
         .where(
           and(
             inArray(workflowExecutionSnapshots.id, ids),
             notExists(
-              db
+              cleanupDb
                 .select({ one: sql`1` })
                 .from(workflowExecutionLogs)
                 .where(eq(workflowExecutionLogs.stateSnapshotId, workflowExecutionSnapshots.id))

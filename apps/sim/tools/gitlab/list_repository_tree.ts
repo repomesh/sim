@@ -10,6 +10,7 @@ export const gitlabListRepositoryTreeTool: ToolConfig<
   GitLabListRepositoryTreeResponse
 > = {
   id: 'gitlab_list_repository_tree',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab List Repository Tree',
   description: 'List files and directories in a GitLab project repository',
   version: '1.0.0',
@@ -31,7 +32,7 @@ export const gitlabListRepositoryTreeTool: ToolConfig<
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     path: {
       type: 'string',

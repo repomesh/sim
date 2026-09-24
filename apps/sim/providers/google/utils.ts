@@ -16,6 +16,14 @@ import { createLogger } from '@sim/logger'
 import { toError } from '@sim/utils/errors'
 import { isRecordLike } from '@sim/utils/object'
 import { buildGeminiMessageParts } from '@/providers/attachments'
+import { captureProviderConversationStep } from '@/providers/conversation-history'
+import {
+  getNativeConversationMessage,
+  retainConversationMessageSource,
+} from '@/providers/conversation-metadata'
+import type { GeminiUsage } from '@/providers/gemini/types'
+import { splitGeminiUsage } from '@/providers/gemini/usage'
+import type { AgentStreamEvent } from '@/providers/stream-events'
 import type { ProviderRequest } from '@/providers/types'
 import { trackForcedToolUsage } from '@/providers/utils'
 
@@ -35,23 +43,6 @@ export function ensureStructResponse(value: unknown): Record<string, unknown> {
     return value
   }
   return { value }
-}
-
-/**
- * Usage metadata for Google Gemini responses
- */
-export interface GeminiUsage {
-  promptTokenCount: number
-  candidatesTokenCount: number
-  totalTokenCount: number
-}
-
-/**
- * Parsed function call from Gemini response
- */
-interface ParsedFunctionCall {
-  name: string
-  args: Record<string, unknown>
 }
 
 /**
@@ -93,40 +84,6 @@ export function extractTextContent(candidate: Candidate | undefined): string {
 }
 
 /**
- * Extracts the first function call from a Gemini response candidate
- */
-export function extractFunctionCall(candidate: Candidate | undefined): ParsedFunctionCall | null {
-  if (!candidate?.content?.parts) return null
-
-  for (const part of candidate.content.parts) {
-    if (part.functionCall) {
-      return {
-        name: part.functionCall.name ?? '',
-        args: (part.functionCall.args ?? {}) as Record<string, unknown>,
-      }
-    }
-  }
-
-  return null
-}
-
-/**
- * Extracts the full Part containing the function call (preserves thoughtSignature)
- * @deprecated Use extractAllFunctionCallParts for proper multi-tool handling
- */
-export function extractFunctionCallPart(candidate: Candidate | undefined): Part | null {
-  if (!candidate?.content?.parts) return null
-
-  for (const part of candidate.content.parts) {
-    if (part.functionCall) {
-      return part
-    }
-  }
-
-  return null
-}
-
-/**
  * Extracts ALL Parts containing function calls from a candidate.
  * Gemini can return multiple function calls in a single response,
  * and all should be executed before continuing the conversation.
@@ -141,6 +98,10 @@ export function extractAllFunctionCallParts(candidate: Candidate | undefined): P
  * Converts usage metadata from SDK response to our format.
  * Per Gemini docs, total = promptTokenCount + candidatesTokenCount + toolUsePromptTokenCount + thoughtsTokenCount
  * We include toolUsePromptTokenCount in input and thoughtsTokenCount in output for correct billing.
+ *
+ * `cachedContentTokenCount` is carried through unchanged — it stays a subset of
+ * the reported `promptTokenCount`, and callers subtract it when they need the
+ * tokens billed at the base input rate.
  */
 export function convertUsageMetadata(
   usageMetadata: GenerateContentResponseUsageMetadata | undefined
@@ -152,6 +113,7 @@ export function convertUsageMetadata(
   return {
     promptTokenCount,
     candidatesTokenCount,
+    cachedContentTokenCount: usageMetadata?.cachedContentTokenCount ?? 0,
     totalTokenCount: usageMetadata?.totalTokenCount ?? 0,
   }
 }
@@ -177,6 +139,7 @@ export function convertToGeminiFormat(
   systemInstruction: Content | undefined
 } {
   const contents: Content[] = []
+  const nativeCallIds = new Map<string, string | undefined>()
   let systemInstruction: Content | undefined
 
   if (request.systemPrompt) {
@@ -196,21 +159,33 @@ export function convertToGeminiFormat(
           systemInstruction.parts[0].text = `${systemInstruction.parts[0].text}\n${message.content}`
         }
       } else if (message.role === 'user' || message.role === 'assistant') {
+        const nativeMessage = getNativeConversationMessage(message, 'gemini')
+        if (isRecordLike(nativeMessage) && Array.isArray(nativeMessage.parts)) {
+          const functionCalls =
+            (nativeMessage as Content).parts?.flatMap((part) =>
+              part.functionCall ? [part.functionCall] : []
+            ) ?? []
+          message.tool_calls?.forEach((call, index) => {
+            if (functionCalls[index]) nativeCallIds.set(call.id, functionCalls[index].id)
+          })
+          contents.push(retainConversationMessageSource(message, nativeMessage as Content))
+          continue
+        }
         const geminiRole = message.role === 'user' ? 'user' : 'model'
         const parts = buildGeminiMessageParts(message.content, message.files, providerId) as Part[]
-
-        if (parts.length > 0) {
-          contents.push({ role: geminiRole, parts })
-        }
 
         if (message.role === 'assistant' && message.tool_calls?.length) {
           const functionCalls = message.tool_calls.map((toolCall) => ({
             functionCall: {
+              id: toolCall.id,
               name: toolCall.function?.name,
               args: JSON.parse(toolCall.function?.arguments || '{}') as Record<string, unknown>,
             },
           }))
-          contents.push({ role: 'model', parts: functionCalls })
+          parts.push(...functionCalls)
+        }
+        if (parts.length > 0) {
+          contents.push(retainConversationMessageSource(message, { role: geminiRole, parts }))
         }
       } else if (message.role === 'tool') {
         if (!message.name) {
@@ -224,18 +199,22 @@ export function convertToGeminiFormat(
         } catch {
           responseData = { output: message.content }
         }
-        contents.push({
-          role: 'user',
-          parts: [
-            {
-              functionResponse: {
-                id: message.tool_call_id,
-                name: message.name,
-                response: responseData,
-              },
-            },
-          ],
-        })
+        const part: Part = {
+          functionResponse: {
+            id:
+              message.tool_call_id && nativeCallIds.has(message.tool_call_id)
+                ? nativeCallIds.get(message.tool_call_id)
+                : message.tool_call_id,
+            name: message.name,
+            response: responseData,
+          },
+        }
+        const previous = contents.at(-1)
+        if (previous?.role === 'user' && previous.parts?.every((part) => part.functionResponse)) {
+          previous.parts.push(part)
+        } else {
+          contents.push({ role: 'user', parts: [part] })
+        }
       }
     }
   }
@@ -280,38 +259,99 @@ export function convertToGeminiFormat(
 }
 
 /**
- * Creates a ReadableStream from a Google Gemini streaming response
+ * Creates an agent-events-v1 stream from a Google Gemini streaming response.
+ * Thought parts (`part.thought === true`) → thinking_delta; other text → text_delta.
+ * Capability-honest: thinking only appears when includeThoughts was requested.
  */
 export function createReadableStreamFromGeminiStream(
   stream: AsyncGenerator<GenerateContentResponse>,
-  onComplete?: (content: string, usage: GeminiUsage) => void
-): ReadableStream<Uint8Array> {
+  onComplete?: (content: string, usage: GeminiUsage, thinking?: string) => void,
+  request?: ProviderRequest
+): ReadableStream<AgentStreamEvent> {
   let fullContent = ''
-  let usage: GeminiUsage = { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 }
+  let fullThinking = ''
+  const modelParts: Part[] = []
+  let usage: GeminiUsage = {
+    promptTokenCount: 0,
+    candidatesTokenCount: 0,
+    cachedContentTokenCount: 0,
+    totalTokenCount: 0,
+  }
+  let cancelled = false
+  let streamIterator: AsyncIterator<GenerateContentResponse> | undefined
 
   return new ReadableStream({
     async start(controller) {
       try {
-        for await (const chunk of stream) {
+        streamIterator = stream[Symbol.asyncIterator]()
+        while (true) {
+          const next = await streamIterator.next()
+          if (next.done || cancelled) break
+          const chunk = next.value
+          if (chunk.promptFeedback?.blockReason) {
+            throw new Error(
+              `Gemini prompt blocked: ${chunk.promptFeedback.blockReason}${
+                chunk.promptFeedback.blockReasonMessage
+                  ? ` (${chunk.promptFeedback.blockReasonMessage})`
+                  : ''
+              }`
+            )
+          }
           if (chunk.usageMetadata) {
             usage = convertUsageMetadata(chunk.usageMetadata)
           }
 
+          const parts = chunk.candidates?.[0]?.content?.parts
+          if (Array.isArray(parts)) {
+            modelParts.push(...parts)
+            for (const part of parts) {
+              if (!part.text) continue
+              if (part.thought === true) {
+                fullThinking += part.text
+                controller.enqueue({ type: 'thinking_delta', text: part.text })
+              } else {
+                fullContent += part.text
+                controller.enqueue({ type: 'text_delta', text: part.text, turn: 'final' })
+              }
+            }
+            continue
+          }
+
+          // Fallback when parts are not exposed — answer text only (no false thinking).
           const text = chunk.text
           if (text) {
             fullContent += text
-            controller.enqueue(new TextEncoder().encode(text))
+            modelParts.push({ text })
+            controller.enqueue({ type: 'text_delta', text, turn: 'final' })
           }
         }
 
-        onComplete?.(fullContent, usage)
+        if (cancelled) return
+        if (request) {
+          await captureProviderConversationStep(
+            request,
+            'gemini',
+            {
+              role: 'model',
+              parts: modelParts,
+            },
+            splitGeminiUsage(usage)
+          )
+        }
+        onComplete?.(fullContent, usage, fullThinking || undefined)
         controller.close()
       } catch (error) {
-        logger.error('Error reading Google Gemini stream', {
-          error: toError(error).message,
-        })
-        controller.error(error)
+        if (!cancelled) {
+          logger.error('Error reading Google Gemini stream', {
+            error: toError(error).message,
+          })
+          controller.error(error)
+        }
       }
+    },
+    async cancel() {
+      cancelled = true
+      await streamIterator?.return?.()
     },
   })
 }

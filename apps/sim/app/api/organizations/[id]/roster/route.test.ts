@@ -1,111 +1,52 @@
 /**
  * @vitest-environment node
  */
-import { createMockRequest, createSession, loggerMock } from '@sim/testing'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  invitation,
+  invitationWorkspaceGrant,
+  member,
+  permissions,
+  workspace,
+} from '@sim/db/schema'
+import {
+  authMockFns,
+  createMockRequest,
+  createSession,
+  queueTableRows,
+  resetDbChainMock,
+} from '@sim/testing'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockDbState, mockExpireStaleInvitations, mockGetSession } = vi.hoisted(() => ({
-  mockDbState: {
-    selectResults: [] as unknown[][],
-  },
+const {
+  mockExpireStaleInvitations,
+  mockGetOrgPermissionConfig,
+  mockGetUserPermissionConfig,
+  mockResolveVerifiedContext,
+} = vi.hoisted(() => ({
   mockExpireStaleInvitations: vi.fn(),
-  mockGetSession: vi.fn(),
+  mockGetOrgPermissionConfig: vi.fn(),
+  mockGetUserPermissionConfig: vi.fn(),
+  mockResolveVerifiedContext: vi.fn(),
 }))
 
-function createSelectChain() {
-  const chain = {
-    from: vi.fn(),
-    innerJoin: vi.fn(),
-    leftJoin: vi.fn(),
-    where: vi.fn(),
-    limit: vi.fn(),
-    then: vi.fn(),
-  }
-  chain.from.mockReturnValue(chain)
-  chain.innerJoin.mockReturnValue(chain)
-  chain.leftJoin.mockReturnValue(chain)
-  chain.where.mockReturnValue(chain)
-  chain.limit.mockImplementation(() => Promise.resolve(mockDbState.selectResults.shift() ?? []))
-  chain.then.mockImplementation((resolve: (rows: unknown[]) => unknown) =>
-    Promise.resolve(resolve(mockDbState.selectResults.shift() ?? []))
-  )
-  return chain
-}
-
-vi.mock('@sim/db', () => ({
-  db: {
-    select: vi.fn(() => createSelectChain()),
-  },
+vi.mock('@/lib/permission-groups/resolve.server', () => ({
+  getUserPermissionConfig: mockGetUserPermissionConfig,
+  getUserPermissionConfigForOrganization: mockGetOrgPermissionConfig,
+  resolveVerifiedUserAccessControlContext: mockResolveVerifiedContext,
 }))
-
-vi.mock('@sim/db/schema', () => ({
-  invitation: {
-    id: 'invitation.id',
-    email: 'invitation.email',
-    role: 'invitation.role',
-    kind: 'invitation.kind',
-    membershipIntent: 'invitation.membershipIntent',
-    organizationId: 'invitation.organizationId',
-    status: 'invitation.status',
-    createdAt: 'invitation.createdAt',
-    expiresAt: 'invitation.expiresAt',
-  },
-  invitationWorkspaceGrant: {
-    invitationId: 'invitationWorkspaceGrant.invitationId',
-    workspaceId: 'invitationWorkspaceGrant.workspaceId',
-    permission: 'invitationWorkspaceGrant.permission',
-  },
-  member: {
-    id: 'member.id',
-    organizationId: 'member.organizationId',
-    userId: 'member.userId',
-    role: 'member.role',
-    createdAt: 'member.createdAt',
-  },
-  permissions: {
-    userId: 'permissions.userId',
-    entityId: 'permissions.entityId',
-    entityType: 'permissions.entityType',
-    permissionType: 'permissions.permissionType',
-    createdAt: 'permissions.createdAt',
-  },
-  user: {
-    id: 'user.id',
-    name: 'user.name',
-    email: 'user.email',
-    image: 'user.image',
-  },
-  workspace: {
-    id: 'workspace.id',
-    name: 'workspace.name',
-    organizationId: 'workspace.organizationId',
-    archivedAt: 'workspace.archivedAt',
-  },
-}))
-
-vi.mock('@sim/logger', () => loggerMock)
 
 vi.mock('@sim/platform-authz/workspace', () => ({
   isOrgAdminRole: (role: string | null | undefined) => role === 'owner' || role === 'admin',
-}))
-
-vi.mock('drizzle-orm', () => ({
-  and: vi.fn((...conditions: unknown[]) => ({ type: 'and', conditions })),
-  eq: vi.fn((field: unknown, value: unknown) => ({ field, value })),
-  inArray: vi.fn((field: unknown, values: unknown[]) => ({ field, values })),
-  isNull: vi.fn((field: unknown) => ({ type: 'isNull', field })),
-  sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values })),
-}))
-
-vi.mock('@/lib/auth', () => ({
-  getSession: mockGetSession,
 }))
 
 vi.mock('@/lib/invitations/core', () => ({
   expireStalePendingInvitationsForOrganization: mockExpireStaleInvitations,
 }))
 
+import { capabilityRefusal } from '@/lib/permission-groups/capability-assertions'
 import { GET } from '@/app/api/organizations/[id]/roster/route'
+
+const mockGetSession = authMockFns.mockGetSession
 
 const MEMBER_ROWS = [
   {
@@ -116,6 +57,7 @@ const MEMBER_ROWS = [
     userName: 'Admin User',
     userEmail: 'admin@example.com',
     userImage: null,
+    userSuspendedAt: null,
   },
   {
     memberId: 'member-reader',
@@ -125,19 +67,40 @@ const MEMBER_ROWS = [
     userName: 'Reader User',
     userEmail: 'reader@example.com',
     userImage: 'https://example.com/reader.png',
+    userSuspendedAt: null,
   },
 ]
+
+afterAll(resetDbChainMock)
 
 describe('GET /api/organizations/[id]/roster', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockDbState.selectResults = []
+    resetDbChainMock()
     mockExpireStaleInvitations.mockResolvedValue(undefined)
+    mockGetOrgPermissionConfig.mockResolvedValue(null)
+  })
+
+  it('refuses a member whose permission group hides the member directory', async () => {
+    mockGetSession.mockResolvedValue(createSession({ userId: 'user-reader' }))
+    mockGetOrgPermissionConfig.mockResolvedValue({ hideOrgMemberDirectory: true })
+    queueTableRows(member, [{ role: 'member' }])
+
+    const response = await GET(
+      createMockRequest('GET', undefined, {}, 'http://localhost/api/organizations/org-1/roster'),
+      { params: Promise.resolve({ id: 'org-1' }) }
+    )
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({
+      error: capabilityRefusal('organization.member_directory'),
+    })
   })
 
   it('returns a redacted roster to a target-organization member', async () => {
     mockGetSession.mockResolvedValue(createSession({ userId: 'user-reader' }))
-    mockDbState.selectResults = [[{ role: 'member' }], MEMBER_ROWS]
+    queueTableRows(member, [{ role: 'member' }])
+    queueTableRows(member, MEMBER_ROWS)
 
     const response = await GET(
       createMockRequest('GET', undefined, {}, 'http://localhost/api/organizations/org-1/roster'),
@@ -157,6 +120,7 @@ describe('GET /api/organizations/[id]/roster', () => {
             name: 'Admin User',
             email: 'admin@example.com',
             image: null,
+            suspendedAt: null,
             workspaces: [],
           },
           {
@@ -167,6 +131,7 @@ describe('GET /api/organizations/[id]/roster', () => {
             name: 'Reader User',
             email: 'reader@example.com',
             image: 'https://example.com/reader.png',
+            suspendedAt: null,
             workspaces: [],
           },
         ],
@@ -179,7 +144,6 @@ describe('GET /api/organizations/[id]/roster', () => {
 
   it('denies a workspace collaborator who is not a target-organization member', async () => {
     mockGetSession.mockResolvedValue(createSession({ userId: 'external-user' }))
-    mockDbState.selectResults = [[]]
 
     const response = await GET(
       createMockRequest('GET', undefined, {}, 'http://localhost/api/organizations/org-1/roster'),
@@ -195,37 +159,40 @@ describe('GET /api/organizations/[id]/roster', () => {
 
   it('preserves the full management roster for organization admins', async () => {
     mockGetSession.mockResolvedValue(createSession({ userId: 'user-admin' }))
-    mockDbState.selectResults = [
-      [{ role: 'admin' }],
-      MEMBER_ROWS,
-      [{ id: 'workspace-1', name: 'Workspace One' }],
-      [{ userId: 'user-reader', workspaceId: 'workspace-1', permission: 'write' }],
-      [
-        {
-          userId: 'external-user',
-          userName: 'External User',
-          userEmail: 'external@example.com',
-          userImage: null,
-          workspaceId: 'workspace-1',
-          permission: 'read',
-          createdAt: new Date('2026-03-01T00:00:00.000Z'),
-        },
-      ],
-      [
-        {
-          id: 'invitation-1',
-          email: 'pending@example.com',
-          role: 'member',
-          kind: 'workspace',
-          membershipIntent: 'external',
-          createdAt: new Date('2026-04-01T00:00:00.000Z'),
-          expiresAt: new Date('2026-04-08T00:00:00.000Z'),
-          inviteeName: null,
-          inviteeImage: null,
-        },
-      ],
-      [{ invitationId: 'invitation-1', workspaceId: 'workspace-1', permission: 'read' }],
-    ]
+    queueTableRows(member, [{ role: 'admin' }])
+    queueTableRows(member, MEMBER_ROWS)
+    queueTableRows(workspace, [{ id: 'workspace-1', name: 'Workspace One' }])
+    queueTableRows(permissions, [
+      { userId: 'user-reader', workspaceId: 'workspace-1', permission: 'write' },
+    ])
+    queueTableRows(permissions, [
+      {
+        userId: 'external-user',
+        userName: 'External User',
+        userEmail: 'external@example.com',
+        userImage: null,
+        userSuspendedAt: null,
+        workspaceId: 'workspace-1',
+        permission: 'read',
+        createdAt: new Date('2026-03-01T00:00:00.000Z'),
+      },
+    ])
+    queueTableRows(invitation, [
+      {
+        id: 'invitation-1',
+        email: 'pending@example.com',
+        role: 'member',
+        kind: 'workspace',
+        membershipIntent: 'external',
+        createdAt: new Date('2026-04-01T00:00:00.000Z'),
+        expiresAt: new Date('2026-04-08T00:00:00.000Z'),
+        inviteeName: null,
+        inviteeImage: null,
+      },
+    ])
+    queueTableRows(invitationWorkspaceGrant, [
+      { invitationId: 'invitation-1', workspaceId: 'workspace-1', permission: 'read' },
+    ])
 
     const response = await GET(
       createMockRequest('GET', undefined, {}, 'http://localhost/api/organizations/org-1/roster'),
@@ -244,6 +211,8 @@ describe('GET /api/organizations/[id]/roster', () => {
               workspaceId: 'workspace-1',
               workspaceName: 'Workspace One',
               permission: 'admin',
+              roleSource: 'org-admin',
+              isBilledAccount: false,
             },
           ],
         }),
@@ -263,6 +232,8 @@ describe('GET /api/organizations/[id]/roster', () => {
             workspaceId: 'workspace-1',
             workspaceName: 'Workspace One',
             permission: 'read',
+            roleSource: 'explicit',
+            isBilledAccount: false,
           },
         ],
       }),

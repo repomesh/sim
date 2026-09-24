@@ -1,4 +1,6 @@
 import { generateId } from '@sim/utils/id'
+import { isPlainRecord } from '@sim/utils/object'
+import { compactRetrievalCitations } from '@/lib/copilot/chat/retrieval-citations'
 import {
   mergeAndRedactPersistedBlocks,
   redactSensitiveContent,
@@ -19,6 +21,9 @@ import type {
   LocalToolCallStatus,
   OrchestratorResult,
 } from '@/lib/copilot/request/types'
+import { RETIRED_BROWSER_REQUEST_TAKEOVER_ID } from '@/lib/copilot/tools/retired-tools'
+import { normalizeToolActivityDescription } from '@/lib/copilot/tools/tool-display'
+import type { BrowserTextSelection, TerminalTextSelection } from '@/stores/panel/types'
 
 export type PersistedToolState = LocalToolCallStatus | MothershipStreamV1ToolOutcome | 'interrupted'
 
@@ -32,17 +37,27 @@ interface PersistedToolCall {
   calledBy?: string
   durationMs?: number
   display?: { title?: string }
+  activityDescription?: string
 }
 
 export interface PersistedContentBlock {
   type: MothershipStreamV1EventType
   lane?: MothershipStreamV1StreamScope['lane']
+  /**
+   * Subagent name on lane text blocks. The span-tree parser needs a name to
+   * create a group for content whose `subagent` start block is missing (resume
+   * legs re-emit text without re-emitting start); without it the prose is
+   * silently dropped on reload.
+   */
+  agent?: string
   channel?: MothershipStreamV1TextChannel
   phase?: MothershipStreamV1ToolPhase
   kind?: MothershipStreamV1SpanPayloadKind
   lifecycle?: MothershipStreamV1SpanLifecycleEvent
   status?: MothershipStreamV1CompletionStatus
   content?: string
+  /** Orchestrator-chosen display name on a subagent start block. */
+  name?: string
   toolCall?: PersistedToolCall
   timestamp?: number
   endedAt?: number
@@ -68,11 +83,48 @@ interface PersistedMessageContext {
   fileId?: string
   folderId?: string
   chatId?: string
+  blockType?: string
+  skillId?: string
+  serverId?: string
+  /**
+   * Source names for `file_selection` / `table_selection` chips. Persisted
+   * because the rendered chip reads them — the label carries a location suffix
+   * (`notes.md:12-40`), so the file icon cannot derive an extension from it.
+   *
+   * The rest of a selection's payload (`text`, `rowIds`, `columnIds`, line
+   * numbers) is deliberately NOT persisted: it exists to resolve the selection
+   * server-side when the message is sent, is never read when re-rendering a past
+   * message, and would put a selection-sized blob in every stored message.
+   */
+  fileName?: string
+  tableName?: string
+  tabId?: string
+  terminalId?: string
+  selection?: BrowserTextSelection | TerminalTextSelection
+}
+
+function copyTextSelection(
+  selection: BrowserTextSelection | TerminalTextSelection | undefined
+): BrowserTextSelection | TerminalTextSelection | undefined {
+  if (!selection) return undefined
+  if ('startLine' in selection) {
+    return {
+      text: selection.text,
+      startLine: selection.startLine,
+      endLine: selection.endLine,
+    }
+  }
+  return {
+    text: selection.text,
+    ...(selection.url ? { url: selection.url } : {}),
+    ...(selection.title ? { title: selection.title } : {}),
+  }
 }
 
 export interface PersistedMessage {
   id: string
   role: 'user' | 'assistant'
+  requestMode?: 'agent' | 'assistant'
   content: string
   timestamp: string
   requestId?: string
@@ -82,10 +134,11 @@ export interface PersistedMessage {
 }
 
 /**
- * Drop the `output` of every persisted tool result, keeping `success` and
- * `error`. Tool outputs are never rendered (the chat thread shows only the tool
- * name/title/status) and never replayed to the model (the upstream copilot
- * service owns conversation memory), so storing them only bloats
+ * Drop persisted tool outputs, keeping `success` and `error`. The one narrow
+ * UI-state exceptions are bounded retrieval citations and a browser takeover's user-authored instruction, which
+ * restores its answered question recap after reload. Other outputs are never
+ * rendered or replayed to the model (the upstream service owns conversation
+ * memory), so storing them only bloats
  * `copilot_messages.content` — a single `get_workflow_logs`/`run_workflow`
  * result can reach hundreds of MB and stall task loads.
  *
@@ -101,17 +154,34 @@ export function stripToolResultOutput(message: PersistedMessage): PersistedMessa
     const toolCall = block.toolCall
     const result = toolCall?.result
     if (!toolCall || !result || typeof result !== 'object' || !('output' in result)) return block
+    const output = result.output
+    const citations = result.success ? compactRetrievalCitations(toolCall.name, output) : undefined
+    const userInstruction =
+      toolCall.name === RETIRED_BROWSER_REQUEST_TAKEOVER_ID && isPlainRecord(output)
+        ? output.userInstruction
+        : undefined
+    const normalizedInstruction = typeof userInstruction === 'string' ? userInstruction.trim() : ''
+    if (
+      normalizedInstruction &&
+      isPlainRecord(output) &&
+      Object.keys(output).length === 1 &&
+      output.userInstruction === normalizedInstruction
+    ) {
+      return block
+    }
     changed = true
-    const strippedResult: { success: boolean; error?: string } = { success: result.success }
+    const strippedResult: { success: boolean; output?: unknown; error?: string } = {
+      success: result.success,
+      ...(citations ? { output: citations } : {}),
+      ...(normalizedInstruction ? { output: { userInstruction: normalizedInstruction } } : {}),
+    }
     if (result.error !== undefined) strippedResult.error = result.error
     return { ...block, toolCall: { ...toolCall, result: strippedResult } }
   })
   return changed ? { ...message, contentBlocks } : message
 }
 
-// ---------------------------------------------------------------------------
 // Write: OrchestratorResult → PersistedMessage
-// ---------------------------------------------------------------------------
 
 function resolveToolState(block: ContentBlock): PersistedToolState {
   const tc = block.toolCall
@@ -181,6 +251,7 @@ function mapContentBlockBody(block: ContentBlock): PersistedContentBlock {
         kind: MothershipStreamV1SpanPayloadKind.subagent,
         lifecycle: MothershipStreamV1SpanLifecycleEvent.start,
         content: block.content,
+        ...(block.subagentName ? { name: block.subagentName } : {}),
       }
     case 'subagent_text':
       return {
@@ -188,6 +259,7 @@ function mapContentBlockBody(block: ContentBlock): PersistedContentBlock {
         lane: 'subagent',
         channel: MothershipStreamV1TextChannel.assistant,
         content: block.content,
+        ...(block.subagent ? { agent: block.subagent } : {}),
       }
     case 'subagent_thinking':
       return {
@@ -195,6 +267,7 @@ function mapContentBlockBody(block: ContentBlock): PersistedContentBlock {
         lane: 'subagent',
         channel: MothershipStreamV1TextChannel.thinking,
         content: block.content,
+        ...(block.subagent ? { agent: block.subagent } : {}),
       }
     case 'tool_call': {
       if (!block.toolCall) {
@@ -213,10 +286,14 @@ function mapContentBlockBody(block: ContentBlock): PersistedContentBlock {
 
       const redactedResult = redactToolCallResult(block.toolCall.name, block.toolCall.result)
 
+      const activityDescription = normalizeToolActivityDescription(
+        block.toolCall.activityDescription
+      )
       const toolCall: PersistedToolCall = {
         id: block.toolCall.id,
         name: block.toolCall.name,
         state,
+        ...(activityDescription ? { activityDescription } : {}),
         ...(isSubagentTool && isNonTerminal ? {} : { result: redactedResult }),
         ...(isSubagentTool && isNonTerminal
           ? {}
@@ -246,11 +323,13 @@ function mapContentBlockBody(block: ContentBlock): PersistedContentBlock {
 
 export function buildPersistedAssistantMessage(
   result: OrchestratorResult,
-  requestId?: string
+  requestId?: string,
+  requestMode?: 'agent' | 'assistant'
 ): PersistedMessage {
   const message: PersistedMessage = {
     id: generateId(),
     role: 'assistant',
+    ...(requestMode ? { requestMode } : {}),
     content: redactSensitiveContent(result.content),
     timestamp: new Date().toISOString(),
   }
@@ -260,7 +339,17 @@ export function buildPersistedAssistantMessage(
   }
 
   if (result.contentBlocks.length > 0) {
-    message.contentBlocks = mergeAndRedactPersistedBlocks(result.contentBlocks.map(mapContentBlock))
+    // Reasoning is display-transient and never rendered, so it is never
+    // persisted either: storing it bloats whale chats and lets the persisted
+    // turn diverge from the streamed one (the refresh-vs-switch mismatch).
+    // This is the single write-side choke point for assistant blocks, so the
+    // guarantee holds for every terminal path (complete, cancelled, error).
+    const withoutThinking = result.contentBlocks.filter(
+      (block) => block.type !== 'thinking' && block.type !== 'subagent_thinking'
+    )
+    if (withoutThinking.length > 0) {
+      message.contentBlocks = mergeAndRedactPersistedBlocks(withoutThinking.map(mapContentBlock))
+    }
   }
 
   return message
@@ -306,6 +395,7 @@ export function withStoppedContentBlock(message: PersistedMessage): PersistedMes
 }
 
 export interface UserMessageParams {
+  requestMode?: 'agent' | 'assistant'
   id: string
   content: string
   fileAttachments?: PersistedFileAttachment[]
@@ -316,6 +406,7 @@ export function buildPersistedUserMessage(params: UserMessageParams): PersistedM
   const message: PersistedMessage = {
     id: params.id,
     role: 'user',
+    ...(params.requestMode ? { requestMode: params.requestMode } : {}),
     content: params.content,
     timestamp: new Date().toISOString(),
   }
@@ -334,23 +425,33 @@ export function buildPersistedUserMessage(params: UserMessageParams): PersistedM
       ...(c.fileId ? { fileId: c.fileId } : {}),
       ...(c.folderId ? { folderId: c.folderId } : {}),
       ...(c.chatId ? { chatId: c.chatId } : {}),
+      ...(c.blockType ? { blockType: c.blockType } : {}),
+      ...(c.skillId ? { skillId: c.skillId } : {}),
+      ...(c.serverId ? { serverId: c.serverId } : {}),
+      ...(c.fileName ? { fileName: c.fileName } : {}),
+      ...(c.tableName ? { tableName: c.tableName } : {}),
+      ...(c.tabId ? { tabId: c.tabId } : {}),
+      ...(c.terminalId ? { terminalId: c.terminalId } : {}),
+      ...(c.selection ? { selection: copyTextSelection(c.selection) } : {}),
     }))
   }
 
   return message
 }
 
-// ---------------------------------------------------------------------------
 // Read: raw JSONB → PersistedMessage
 // Handles both canonical (type: 'tool', 'text', 'span', 'complete') and
 // legacy (type: 'tool_call', 'thinking', 'subagent', 'stopped') blocks.
-// ---------------------------------------------------------------------------
 
 const CANONICAL_BLOCK_TYPES: Set<string> = new Set(Object.values(MothershipStreamV1EventType))
 
 interface RawBlock {
   type: string
   lane?: string
+  agent?: string
+  /** Orchestrator-chosen subagent display name (legacy blocks store it as `subagentName`). */
+  name?: string
+  subagentName?: string
   content?: string
   /** Go persists text blocks with key "text" instead of "content" */
   text?: string
@@ -371,6 +472,7 @@ interface RawBlock {
     params?: Record<string, unknown>
     result?: { success: boolean; output?: unknown; error?: string }
     display?: { text?: string; title?: string; phaseLabel?: string }
+    activityDescription?: string
     calledBy?: string
     durationMs?: number
     error?: string
@@ -398,6 +500,7 @@ const OUTCOME_NORMALIZATION: Record<string, PersistedToolState> = {
   interrupted: 'interrupted',
   pending: 'pending',
   executing: 'executing',
+  awaiting_approval: 'awaiting_approval',
 }
 
 function normalizeToolState(state: string | undefined): PersistedToolState {
@@ -416,6 +519,8 @@ function normalizeCanonicalBlock(block: RawBlock): PersistedContentBlock {
   if (block.lane === 'subagent') {
     result.lane = block.lane
   }
+  if (block.agent) result.agent = block.agent
+  if (block.name) result.name = block.name
   const blockContent = block.content ?? block.text
   if (blockContent !== undefined) result.content = blockContent
   if (block.channel) result.channel = block.channel as MothershipStreamV1TextChannel
@@ -425,10 +530,12 @@ function normalizeCanonicalBlock(block: RawBlock): PersistedContentBlock {
   if (block.status) result.status = block.status as MothershipStreamV1CompletionStatus
   if (block.parentToolCallId) result.parentToolCallId = block.parentToolCallId
   if (block.toolCall) {
+    const activityDescription = normalizeToolActivityDescription(block.toolCall.activityDescription)
     result.toolCall = {
       id: block.toolCall.id ?? '',
       name: block.toolCall.name ?? '',
       state: normalizeToolState(block.toolCall.state),
+      ...(activityDescription ? { activityDescription } : {}),
       ...(block.toolCall.params ? { params: block.toolCall.params } : {}),
       ...(block.toolCall.result ? { result: block.toolCall.result } : {}),
       ...(block.toolCall.calledBy ? { calledBy: block.toolCall.calledBy } : {}),
@@ -451,6 +558,7 @@ function normalizeCanonicalBlock(block: RawBlock): PersistedContentBlock {
 
 function normalizeLegacyBlock(block: RawBlock): PersistedContentBlock {
   if (block.type === 'tool_call' && block.toolCall) {
+    const activityDescription = normalizeToolActivityDescription(block.toolCall.activityDescription)
     return {
       type: MothershipStreamV1EventType.tool,
       phase: MothershipStreamV1ToolPhase.call,
@@ -458,6 +566,7 @@ function normalizeLegacyBlock(block: RawBlock): PersistedContentBlock {
         id: block.toolCall.id ?? '',
         name: block.toolCall.name ?? '',
         state: normalizeToolState(block.toolCall.state),
+        ...(activityDescription ? { activityDescription } : {}),
         ...(block.toolCall.params ? { params: block.toolCall.params } : {}),
         ...(block.toolCall.result ? { result: block.toolCall.result } : {}),
         ...(block.toolCall.calledBy ? { calledBy: block.toolCall.calledBy } : {}),
@@ -497,6 +606,7 @@ function normalizeLegacyBlock(block: RawBlock): PersistedContentBlock {
       kind: MothershipStreamV1SpanPayloadKind.subagent,
       lifecycle: MothershipStreamV1SpanLifecycleEvent.start,
       content: block.content,
+      ...(block.subagentName ? { name: block.subagentName } : {}),
     }
   }
 
@@ -607,6 +717,9 @@ export function normalizeMessage(raw: Record<string, unknown>): PersistedMessage
     timestamp: (raw.timestamp as string) ?? new Date().toISOString(),
   }
 
+  if (raw.requestMode === 'assistant' || raw.requestMode === 'agent')
+    msg.requestMode = raw.requestMode
+
   if (raw.requestId && typeof raw.requestId === 'string') {
     msg.requestId = raw.requestId
   }
@@ -649,6 +762,14 @@ export function normalizeMessage(raw: Record<string, unknown>): PersistedMessage
       ...(c.fileId ? { fileId: c.fileId } : {}),
       ...(c.folderId ? { folderId: c.folderId } : {}),
       ...(c.chatId ? { chatId: c.chatId } : {}),
+      ...(c.blockType ? { blockType: c.blockType } : {}),
+      ...(c.skillId ? { skillId: c.skillId } : {}),
+      ...(c.serverId ? { serverId: c.serverId } : {}),
+      ...(c.fileName ? { fileName: c.fileName } : {}),
+      ...(c.tableName ? { tableName: c.tableName } : {}),
+      ...(c.tabId ? { tabId: c.tabId } : {}),
+      ...(c.terminalId ? { terminalId: c.terminalId } : {}),
+      ...(c.selection ? { selection: copyTextSelection(c.selection) } : {}),
     }))
   }
 

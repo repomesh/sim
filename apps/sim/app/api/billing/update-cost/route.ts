@@ -14,7 +14,7 @@ import {
   COPILOT_BILLING_PROTOCOL_HEADER,
   type CopilotBillingProtocol,
   requireAccountBillingDecisionHeader,
-  requireBillingAttributionHeader,
+  requireBillingCallbackAttribution,
   resolveLegacyV0BillingAttribution,
   toBillingContext,
 } from '@/lib/billing/core/billing-attribution'
@@ -34,7 +34,7 @@ import { TraceAttr } from '@/lib/copilot/generated/trace-attributes-v1'
 import { TraceSpan } from '@/lib/copilot/generated/trace-spans-v1'
 import { checkInternalApiKey } from '@/lib/copilot/request/http'
 import { withIncomingGoSpan } from '@/lib/copilot/request/otel'
-import { isBillingEnabled, isCopilotBillingProtocolRequired } from '@/lib/core/config/env-flags'
+import { isBillingEnabled, isHosted } from '@/lib/core/config/env-flags'
 import { generateRequestId } from '@/lib/core/utils/request'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 
@@ -156,14 +156,23 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
 
     if (!parsed.success) return parsed.response
 
-    const { userId, cost, model, inputTokens, outputTokens, source, idempotencyKey, workspaceId } =
-      parsed.data.body
+    const {
+      userId,
+      cost,
+      model,
+      inputTokens,
+      outputTokens,
+      source,
+      idempotencyKey,
+      workspaceId,
+      organizationId,
+    } = parsed.data.body
     const requestedProtocol = parsed.data.headers?.[COPILOT_BILLING_PROTOCOL_HEADER]
     const billingRequestId = parsed.data.headers?.[BILLING_REQUEST_ID_HEADER]
     const suppliedAttributionHeader = parsed.data.headers?.[BILLING_ATTRIBUTION_HEADER]
     const suppliedAccountDecisionHeader = parsed.data.headers?.[BILLING_ACCOUNT_DECISION_HEADER]
     const isMarkerlessLegacy = requestedProtocol === undefined
-    if (isMarkerlessLegacy && isCopilotBillingProtocolRequired) {
+    if (isMarkerlessLegacy && isHosted) {
       return invalidBillingProtocolResponse(requestId, span)
     }
     const protocol: CopilotBillingProtocol = requestedProtocol ?? COPILOT_BILLING_PROTOCOL.legacy
@@ -178,9 +187,14 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
       (isModernProtocol &&
         (!billingRequestId || !idempotencyKey || billingRequestId !== idempotencyKey)) ||
       (protocol === COPILOT_BILLING_PROTOCOL.legacy && billingRequestId) ||
-      (isExplicitLegacyProtocol && (!workspaceId || !suppliedAttributionHeader)) ||
+      (isExplicitLegacyProtocol && !suppliedAttributionHeader) ||
       (isMarkerlessLegacy &&
-        Boolean(billingRequestId || suppliedAttributionHeader || suppliedAccountDecisionHeader)) ||
+        Boolean(
+          organizationId ||
+            billingRequestId ||
+            suppliedAttributionHeader ||
+            suppliedAccountDecisionHeader
+        )) ||
       (isAttributedProtocol && !suppliedAttributionHeader) ||
       (isDirectProtocol && !suppliedAccountDecisionHeader) ||
       (isDirectProtocol && Boolean(suppliedAttributionHeader)) ||
@@ -212,12 +226,10 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
     let suppliedAccountDecision: AccountBillingDecision | undefined
     try {
       if (suppliedAttributionHeader) {
-        if (!workspaceId) {
-          return invalidBillingProtocolResponse(requestId, span)
-        }
-        suppliedBillingAttribution = requireBillingAttributionHeader(req.headers, {
+        suppliedBillingAttribution = requireBillingCallbackAttribution(req.headers, {
           actorUserId: userId,
           workspaceId,
+          ...(organizationId ? { organizationId } : {}),
         })
       }
       if (suppliedAccountDecisionHeader) {
@@ -229,11 +241,9 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
 
     let billingAttribution = suppliedBillingAttribution
     /**
-     * Old Go creates its random idempotency key after admission and returns no
-     * protocol or payer envelope. The markerless legacy-v0 path therefore
-     * re-resolves a locally known workspace at callback time. This mutable
-     * compatibility semantic is intentionally unreachable from modern
-     * attributed-v1/direct-v1 callbacks.
+     * Local self-hosted markerless callbacks have no immutable payer envelope,
+     * so they re-resolve a locally known workspace at callback time. Hosted
+     * attributed-v1/direct-v1 callbacks can never reach this mutable path.
      */
     if (isMarkerlessLegacy && workspaceId) {
       billingAttribution =
@@ -258,7 +268,7 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
         mismatchedFields.push('actor')
       }
       if (
-        (isAttributedProtocol && billingAttribution.workspaceId !== workspaceId) ||
+        (isAttributedProtocol && billingAttribution.workspaceId !== (workspaceId ?? null)) ||
         (!isAttributedProtocol && workspaceId && billingAttribution.workspaceId !== workspaceId)
       ) {
         mismatchedFields.push('workspace')
@@ -271,7 +281,9 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
       }
     }
 
-    const resolvedWorkspaceId = isDirectProtocol ? undefined : billingAttribution?.workspaceId
+    const resolvedWorkspaceId = isDirectProtocol
+      ? undefined
+      : (billingAttribution?.workspaceId ?? undefined)
     const billingContext = billingAttribution
       ? toBillingContext(billingAttribution)
       : accountDecision
@@ -280,6 +292,9 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
             billingPeriod: {
               start: new Date(accountDecision.billingPeriod.start),
               end: new Date(accountDecision.billingPeriod.end),
+              ...(accountDecision.billingPeriod.source
+                ? { source: accountDecision.billingPeriod.source }
+                : {}),
             },
           }
         : undefined
@@ -297,6 +312,7 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
      * Every accepted callback has a stable key, so the maximum cumulative cost
      * converges on one ledger event without underbilling or double-billing.
      */
+    const usageStartedAt = Date.now()
     const result = await recordCumulativeUsage({
       userId,
       workspaceId: resolvedWorkspaceId,
@@ -315,6 +331,7 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
       billedDelta: result.delta,
       newTotal: result.total,
       billed: result.billed,
+      durationMs: Date.now() - usageStartedAt,
     })
 
     // Reconcile the payer's ledger-backed threshold after every cumulative
@@ -395,6 +412,38 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
       )
     }
 
+    const pgCode = getPostgresErrorCode(error)
+    const pgConstraint = getPostgresConstraintName(error)
+    const reconciliationOutcome =
+      error instanceof ThresholdSettlementError && !error.retryable
+        ? BILLING_CALLBACK_OUTCOME.billingPeriodElapsed
+        : pgCode === '23503' && pgConstraint === 'usage_log_user_id_user_id_fk'
+          ? BILLING_CALLBACK_OUTCOME.billingUserNotFound
+          : undefined
+
+    /** Old markerless clients treat every 409 as a successful duplicate. */
+    if (reconciliationOutcome && !isMarkerlessLegacy) {
+      logger.warn(`[${requestId}] Billing callback requires reconciliation`, {
+        code: reconciliationOutcome.code,
+        duration,
+        billingProtocol:
+          req.headers.get(COPILOT_BILLING_PROTOCOL_HEADER) ?? COPILOT_BILLING_PROTOCOL.legacy,
+      })
+      span.setAttribute(TraceAttr.BillingOutcome, BillingRouteOutcome.ReconciliationRequired)
+      span.setAttribute(TraceAttr.HttpStatusCode, 409)
+      span.setAttribute(TraceAttr.BillingDurationMs, duration)
+      return NextResponse.json(
+        {
+          success: false,
+          code: reconciliationOutcome.code,
+          error: reconciliationOutcome.message,
+          retryable: false,
+          requestId,
+        },
+        { status: 409 }
+      )
+    }
+
     if (error instanceof ThresholdSettlementError) {
       logger.error(`[${requestId}] Retryable threshold settlement failure`, {
         settlementErrorCode: error.code,
@@ -424,8 +473,6 @@ async function updateCostInner(req: NextRequest, span: Span): Promise<NextRespon
     // lock timeout) — Drizzle's "Failed query" wrapper alone cannot
     // distinguish them, which made the dead-workspace incident undiagnosable
     // from logs.
-    const pgCode = getPostgresErrorCode(error)
-    const pgConstraint = getPostgresConstraintName(error)
     logger.error(`[${requestId}] Cost update failed`, {
       error: toError(error).message,
       ...(pgCode && { pgCode }),

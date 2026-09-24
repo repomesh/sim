@@ -1,9 +1,18 @@
+import { truncate } from '@sim/utils/string'
 import type { GitLabGetJobLogParams, GitLabGetJobLogResponse } from '@/tools/gitlab/types'
 import { getGitLabApiBase } from '@/tools/gitlab/utils'
 import type { ToolConfig } from '@/tools/types'
 
+/**
+ * Job traces can reach ~100 MB on gitlab.com (more on self-managed); cap what
+ * is returned into the workflow payload so a huge trace cannot blow up the
+ * execution log. 200k characters comfortably covers failure diagnosis.
+ */
+const MAX_LOG_CHARS = 200_000
+
 export const gitlabGetJobLogTool: ToolConfig<GitLabGetJobLogParams, GitLabGetJobLogResponse> = {
   id: 'gitlab_get_job_log',
+  personalToken: { provider: 'gitlab', tokenParam: 'accessToken', hostParam: 'host' },
   name: 'GitLab Get Job Log',
   description: 'Get the log (trace) of a GitLab job',
   version: '1.0.0',
@@ -25,7 +34,7 @@ export const gitlabGetJobLogTool: ToolConfig<GitLabGetJobLogParams, GitLabGetJob
       type: 'string',
       required: true,
       visibility: 'user-or-llm',
-      description: 'Project ID or URL-encoded path',
+      description: 'Project ID or path (e.g. mygroup/myproject)',
     },
     jobId: {
       type: 'number',
@@ -56,12 +65,13 @@ export const gitlabGetJobLogTool: ToolConfig<GitLabGetJobLogParams, GitLabGetJob
       }
     }
 
-    const log = await response.text()
+    const fullLog = await response.text()
 
     return {
       success: true,
       output: {
-        log,
+        log: truncate(fullLog, MAX_LOG_CHARS),
+        truncated: fullLog.length > MAX_LOG_CHARS,
       },
     }
   },
@@ -69,7 +79,11 @@ export const gitlabGetJobLogTool: ToolConfig<GitLabGetJobLogParams, GitLabGetJob
   outputs: {
     log: {
       type: 'string',
-      description: 'The job log (trace) output',
+      description: 'The job log (trace) output, truncated to 200k characters',
+    },
+    truncated: {
+      type: 'boolean',
+      description: 'Whether the log was truncated',
     },
   },
 }
