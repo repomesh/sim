@@ -8,7 +8,12 @@ import {
   workspace,
 } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
-import { describeError, getErrorMessage } from '@sim/utils/errors'
+import {
+  describeError,
+  getErrorMessage,
+  getPostgresConstraintName,
+  getPostgresErrorCode,
+} from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { and, eq, inArray, sql } from 'drizzle-orm'
 import { checkUsageStatus as checkResolvedUsageStatus } from '@/lib/billing/calculations/usage-monitor'
@@ -50,6 +55,11 @@ import {
 } from '@/lib/logs/execution/progress-markers'
 import { snapshotService } from '@/lib/logs/execution/snapshot/service'
 import { traceSpansHaveHandledErrors } from '@/lib/logs/execution/trace-spans/handled-errors'
+import {
+  stripLegacyToolCallContent,
+  stripModelToolCallArguments,
+  summarizeTraceSpansWithoutIo,
+} from '@/lib/logs/execution/trace-spans/summarize'
 import { traceSpansIndicateFailure } from '@/lib/logs/execution/trace-spans/trace-spans'
 import {
   copyTraceSpansWithoutCosts,
@@ -67,7 +77,6 @@ import type {
   ExecutionLoggerService as IExecutionLoggerService,
   TraceSpan,
   WorkflowExecutionLog,
-  WorkflowExecutionSnapshot,
   WorkflowState,
 } from '@/lib/logs/types'
 import { emitExecutionCompletedEvent } from '@/lib/workspace-events/emitter'
@@ -90,6 +99,9 @@ const EXECUTION_LOG_IDLE_TIMEOUT_MS = 5_000
 // Bounds the wait for the per-execution usage-reconcile advisory lock. Generous
 // (favor waiting over dropping a charge); only trips on a pathological lock hold.
 const USAGE_RECONCILE_LOCK_TIMEOUT_MS = 10_000
+const FOREIGN_KEY_VIOLATION = '23503'
+/** The log's snapshot foreign key as Postgres names it (identifiers are cut at 63 bytes). */
+const STATE_SNAPSHOT_FOREIGN_KEY = 'workflow_execution_logs_state_snapshot_id_workflow_execution_sn'
 
 type ExecutionData = WorkflowExecutionLog['executionData']
 
@@ -195,12 +207,6 @@ function retainBoundedTraceContent<T>(value: T, maxBytes = MAX_TRACE_IO_BYTES): 
   return size !== undefined && size <= maxBytes ? value : undefined
 }
 
-function stripModelToolCallArguments(
-  calls: NonNullable<TraceSpan['modelToolCalls']>
-): NonNullable<TraceSpan['modelToolCalls']> {
-  return calls.map(({ arguments: _arguments, ...call }) => call as (typeof calls)[number])
-}
-
 function compactModelToolCalls(
   calls: NonNullable<TraceSpan['modelToolCalls']>
 ): NonNullable<TraceSpan['modelToolCalls']> | undefined {
@@ -226,12 +232,6 @@ function compactLegacyToolCalls(
   return retainBoundedTraceContent(compacted)
 }
 
-function stripLegacyToolCallContent(
-  calls: NonNullable<TraceSpan['toolCalls']>
-): NonNullable<TraceSpan['toolCalls']> {
-  return calls.map(({ input: _input, output: _output, error: _error, ...call }) => call)
-}
-
 function compactProviderTiming(
   providerTiming: NonNullable<TraceSpan['providerTiming']>
 ): NonNullable<TraceSpan['providerTiming']> {
@@ -248,26 +248,6 @@ function compactProviderTiming(
               toolCalls: compactModelToolCalls(toolCalls) ?? stripModelToolCallArguments(toolCalls),
             }
           : {}),
-      })
-    ),
-  }
-}
-
-function stripProviderTimingContent(
-  providerTiming: NonNullable<TraceSpan['providerTiming']>
-): NonNullable<TraceSpan['providerTiming']> {
-  return {
-    ...providerTiming,
-    segments: providerTiming.segments.map(
-      ({
-        assistantContent: _assistantContent,
-        thinkingContent: _thinkingContent,
-        errorMessage: _errorMessage,
-        toolCalls,
-        ...segment
-      }) => ({
-        ...segment,
-        ...(toolCalls ? { toolCalls: stripModelToolCallArguments(toolCalls) } : {}),
       })
     ),
   }
@@ -314,33 +294,6 @@ function summarizeTraceSpansForExecutionData(traceSpans?: TraceSpan[]): TraceSpa
     if (providerTiming) summarized.providerTiming = compactProviderTiming(providerTiming)
 
     return summarized
-  })
-}
-
-function summarizeTraceSpansWithoutIo(traceSpans?: TraceSpan[]): TraceSpan[] | undefined {
-  if (!traceSpans) {
-    return traceSpans
-  }
-
-  return traceSpans.map((span) => {
-    const {
-      input: _input,
-      output: _output,
-      children,
-      thinking: _thinking,
-      errorMessage: _errorMessage,
-      modelToolCalls,
-      toolCalls,
-      providerTiming,
-      ...rest
-    } = span
-    return {
-      ...rest,
-      ...(modelToolCalls ? { modelToolCalls: stripModelToolCallArguments(modelToolCalls) } : {}),
-      ...(toolCalls ? { toolCalls: stripLegacyToolCallContent(toolCalls) } : {}),
-      ...(providerTiming ? { providerTiming: stripProviderTimingContent(providerTiming) } : {}),
-      ...(children?.length ? { children: summarizeTraceSpansWithoutIo(children) } : {}),
-    }
   })
 }
 
@@ -652,6 +605,11 @@ export class ExecutionLogger implements IExecutionLoggerService {
     }
   }
 
+  /**
+   * Creates the execution's `running` log row, pointing it at the (deduplicated)
+   * workflow-state snapshot. Idempotent per execution id: when the row already
+   * exists — a retried job or a resumed start — only its deadline is refreshed.
+   */
   async startWorkflowExecution(params: {
     workflowId: string
     workspaceId: string
@@ -663,10 +621,7 @@ export class ExecutionLogger implements IExecutionLoggerService {
     workflowState: WorkflowState
     deploymentVersionId?: string
     executionDeadlineAt?: Date
-  }): Promise<{
-    workflowLog: WorkflowExecutionLog
-    snapshot: WorkflowExecutionSnapshot
-  }> {
+  }): Promise<void> {
     const {
       workflowId,
       workspaceId,
@@ -682,99 +637,74 @@ export class ExecutionLogger implements IExecutionLoggerService {
 
     execLog.debug('Starting workflow execution')
 
-    // Check if execution log already exists (idempotency check)
-    const existingLog = await execDb
-      .select()
-      .from(workflowExecutionLogs)
-      .where(eq(workflowExecutionLogs.executionId, executionId))
-      .limit(1)
+    const insertRunningLog = async (stateSnapshotId: string) => {
+      const [inserted] = await execDb
+        .insert(workflowExecutionLogs)
+        .values({
+          id: generateId(),
+          workflowId,
+          workspaceId,
+          executionId,
+          stateSnapshotId,
+          deploymentVersionId: deploymentVersionId ?? null,
+          level: 'info',
+          status: 'running',
+          trigger: trigger.type,
+          startedAt: new Date(),
+          endedAt: null,
+          totalDurationMs: null,
+          executionDeadlineAt: executionDeadlineAt ?? null,
+          executionData: {
+            secretProjectionVersion: SECRET_PROJECTION_VERSION,
+            environment,
+            trigger,
+            ...(billingAttribution ? { billingAttribution } : {}),
+            ...(trigger.data?.correlation ? { correlation: trigger.data.correlation } : {}),
+            hasTraceSpans: false,
+            traceSpanCount: 0,
+          },
+        })
+        .onConflictDoNothing({ target: workflowExecutionLogs.executionId })
+        .returning({ id: workflowExecutionLogs.id })
+      return inserted
+    }
 
-    if (existingLog.length > 0) {
-      execLog.debug('Execution log already exists, skipping duplicate INSERT (idempotent)')
-      await execDb
-        .update(workflowExecutionLogs)
-        .set({ executionDeadlineAt: executionDeadlineAt ?? null })
-        .where(
-          and(
-            eq(workflowExecutionLogs.executionId, executionId),
-            sql`${workflowExecutionLogs.status} IN ('pending', 'running')`
-          )
+    let snapshot = await snapshotService.resolveSnapshot(workflowId, workflowState)
+    let inserted: { id: string } | undefined
+    try {
+      inserted = await insertRunningLog(snapshot.id)
+    } catch (error) {
+      if (
+        getPostgresErrorCode(error) !== FOREIGN_KEY_VIOLATION ||
+        getPostgresConstraintName(error) !== STATE_SNAPSHOT_FOREIGN_KEY
+      ) {
+        throw error
+      }
+      /**
+       * A snapshot resolved before the insert can be deleted underneath it by
+       * orphan cleanup when no log references it yet. Resolve it again from the
+       * database, which recreates the row if it is gone.
+       */
+      snapshot = await snapshotService.resolveSnapshot(workflowId, workflowState, { fresh: true })
+      inserted = await insertRunningLog(snapshot.id)
+    }
+
+    if (inserted) {
+      snapshotService.rememberReferencedSnapshot(snapshot)
+      execLog.debug('Created workflow log', { logId: inserted.id })
+      return
+    }
+
+    execLog.debug('Execution log already exists, skipping duplicate INSERT (idempotent)')
+    await execDb
+      .update(workflowExecutionLogs)
+      .set({ executionDeadlineAt: executionDeadlineAt ?? null })
+      .where(
+        and(
+          eq(workflowExecutionLogs.executionId, executionId),
+          sql`${workflowExecutionLogs.status} IN ('pending', 'running')`
         )
-      const snapshot = await snapshotService.getSnapshot(existingLog[0].stateSnapshotId)
-      if (!snapshot) {
-        throw new Error(`Snapshot ${existingLog[0].stateSnapshotId} not found for existing log`)
-      }
-      return {
-        workflowLog: {
-          id: existingLog[0].id,
-          workflowId: existingLog[0].workflowId,
-          executionId: existingLog[0].executionId,
-          stateSnapshotId: existingLog[0].stateSnapshotId,
-          level: existingLog[0].level as 'info' | 'error',
-          trigger: existingLog[0].trigger as ExecutionTrigger['type'],
-          startedAt: existingLog[0].startedAt.toISOString(),
-          endedAt: existingLog[0].endedAt?.toISOString() || existingLog[0].startedAt.toISOString(),
-          totalDurationMs: existingLog[0].totalDurationMs || 0,
-          executionData: existingLog[0].executionData as WorkflowExecutionLog['executionData'],
-          createdAt: existingLog[0].createdAt.toISOString(),
-        },
-        snapshot,
-      }
-    }
-
-    const snapshotResult = await snapshotService.createSnapshotWithDeduplication(
-      workflowId,
-      workflowState
-    )
-
-    const startTime = new Date()
-
-    const [workflowLog] = await execDb
-      .insert(workflowExecutionLogs)
-      .values({
-        id: generateId(),
-        workflowId,
-        workspaceId,
-        executionId,
-        stateSnapshotId: snapshotResult.snapshot.id,
-        deploymentVersionId: deploymentVersionId ?? null,
-        level: 'info',
-        status: 'running',
-        trigger: trigger.type,
-        startedAt: startTime,
-        endedAt: null,
-        totalDurationMs: null,
-        executionDeadlineAt: executionDeadlineAt ?? null,
-        executionData: {
-          secretProjectionVersion: SECRET_PROJECTION_VERSION,
-          environment,
-          trigger,
-          ...(billingAttribution ? { billingAttribution } : {}),
-          ...(trigger.data?.correlation ? { correlation: trigger.data.correlation } : {}),
-          hasTraceSpans: false,
-          traceSpanCount: 0,
-        },
-      })
-      .returning()
-
-    execLog.debug('Created workflow log', { logId: workflowLog.id })
-
-    return {
-      workflowLog: {
-        id: workflowLog.id,
-        workflowId: workflowLog.workflowId,
-        executionId: workflowLog.executionId,
-        stateSnapshotId: workflowLog.stateSnapshotId,
-        level: workflowLog.level as 'info' | 'error',
-        trigger: workflowLog.trigger as ExecutionTrigger['type'],
-        startedAt: workflowLog.startedAt.toISOString(),
-        endedAt: workflowLog.endedAt?.toISOString() || workflowLog.startedAt.toISOString(),
-        totalDurationMs: workflowLog.totalDurationMs || 0,
-        executionData: workflowLog.executionData as WorkflowExecutionLog['executionData'],
-        createdAt: workflowLog.createdAt.toISOString(),
-      },
-      snapshot: snapshotResult.snapshot,
-    }
+      )
   }
 
   /**
