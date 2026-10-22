@@ -72,7 +72,9 @@ const WorkspaceInventorySchema = z.object({
   tables: z.array(InventoryNamed),
   knowledgeBases: z.array(InventoryNamed),
   files: z.array(z.object({ path: z.string(), size: z.number().optional() })),
-  skills: z.array(z.object({ name: z.string() })),
+  skills: z.array(
+    z.object({ id: z.string().optional(), name: z.string(), description: z.string().optional() }),
+  ),
   customTools: z.array(z.object({ id: z.string(), title: z.string() })),
   mcpServers: z.array(InventoryNamed),
   credentials: z.array(
@@ -301,6 +303,13 @@ export const TOOL_DEADLINE_SETTLE_MARGIN_MS = 90_000;
 /** The `clientCapabilities` token a Sim sends when it honors `StreamToolDeadline`. */
 export const TOOL_DEADLINE_CAPABILITY = "tool-deadline";
 
+/**
+ * The `clientCapabilities` token a Sim sends when this turn may copy files within or between
+ * workspaces it can reach (`files copy`) without negotiated file owners, so also where Projects
+ * are off.
+ */
+export const WORKSPACE_FILE_COPY_CAPABILITY = "workspace-file-copy";
+
 /** POST /api/mothership — the chat request sim sends. */
 export interface ChatRequest extends StreamResponseReceipt {
   fileOwnerProtocolVersion?: 1 | undefined;
@@ -346,14 +355,16 @@ export interface ChatRequest extends StreamResponseReceipt {
    * grace windows and run tools server-side immediately. ABSENT = older/unknown caller —
    * dispatch keeps its conservative grace (deploy-skew safe: a stale tab that predates
    * this field still gets waited on). Known capability: "workflow-tool-pickup". Sim also
-   * declares its own {@link TOOL_DEADLINE_CAPABILITY} here.
+   * declares its own {@link TOOL_DEADLINE_CAPABILITY} and {@link WORKSPACE_FILE_COPY_CAPABILITY}
+   * here.
    */
   clientCapabilities?: string[] | undefined;
   /**
    * What exists in the workspace, by name and id, so the agent orients without a round
    * of listings per world (an orientation turn on dev spent nine tool rounds and ~20K
-   * tokens learning this). Names and ids only — never a tree, never contents — and each
-   * world capped; a capped world is named in `truncated` so the agent lists it itself.
+   * tokens learning this). Names, ids and skill descriptions — never a tree, never
+   * contents — and each world capped; a capped world is named in `truncated` so the agent
+   * lists it itself.
    * Rendered as a request-local trailing message, never into the transcript.
    */
   inventory?: WorkspaceInventory | undefined;
@@ -366,7 +377,11 @@ export interface WorkspaceInventory {
   knowledgeBases: { id: string; name: string }[];
   /** `files/...` paths as the CLI prints them. */
   files: { path: string; size?: number | undefined }[];
-  skills: { name: string }[];
+  /**
+   * The skill catalog: the agent loads a matching skill with `skills get <id>`. `id` and
+   * `description` are optional so either side can ship first.
+   */
+  skills: { id?: string | undefined; name: string; description?: string | undefined }[];
   customTools: { id: string; title: string }[];
   mcpServers: { id: string; name: string }[];
   credentials: { id: string; name: string; provider?: string | undefined; type?: string | undefined }[];
