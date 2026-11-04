@@ -35,7 +35,7 @@ import { InputToolbar } from '@/app/workspace/[workspaceId]/home/components/user
 import type { ModelSelectorOptions } from '@/app/workspace/[workspaceId]/home/components/user-input/components/model-selector'
 import { usePromptHistory } from '@/app/workspace/[workspaceId]/home/components/user-input/hooks/use-prompt-history'
 import { handleMothershipAddContextEvent } from '@/app/workspace/[workspaceId]/home/components/user-input/mothership-context-event'
-import { useChatPlanGate } from '@/app/workspace/[workspaceId]/home/hooks/use-chat-plan-gate'
+import { useChatPlanRequired } from '@/app/workspace/[workspaceId]/home/hooks/use-chat-plan-required'
 import type {
   ChatMessage,
   FileAttachmentForApi,
@@ -50,6 +50,7 @@ import { useHydrated } from '@/hooks/use-hydrated'
 import { isMobileViewport } from '@/hooks/use-is-mobile'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 import { useVoiceInput } from '@/hooks/use-voice-input'
+import { useChatPlanModalStore } from '@/stores/modals/chat-plan/store'
 import { type DraftPayload, useMothershipDraftsStore } from '@/stores/mothership-drafts/store'
 import type { ChatContext } from '@/stores/panel'
 
@@ -318,6 +319,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
   }, [editor.contexts])
 
   const hasAdditionalAttachments = Boolean(attachments)
+  const chatPlanRequired = useChatPlanRequired()
   const canSubmit =
     (editor.value.trim().length > 0 || hasFiles || hasAdditionalAttachments) &&
     !isSending &&
@@ -510,9 +512,6 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     textareaRef.current?.focus()
   }
 
-  /** Refuses a send the workspace plan excludes here, before `onSubmit`, so the draft survives. */
-  const stopSendWithoutChatPlan = useChatPlanGate()
-
   /** Empties the text, chips, attachments, transcript, and the saved draft in one step. */
   const clearComposer = useCallback(() => {
     history.reset()
@@ -533,7 +532,10 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
   }, [resetTranscript, history.reset])
 
   const handleSubmit = useCallback(() => {
-    if (stopSendWithoutChatPlan()) return
+    if (chatPlanRequired) {
+      useChatPlanModalStore.getState().open(workspaceId)
+      return
+    }
     const currentFiles = filesRef.current
     const currentEditor = editorRef.current
 
@@ -559,7 +561,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     )
     if (accepted === false) return
     clearComposer()
-  }, [stopSendWithoutChatPlan, onSubmit, clearComposer])
+  }, [chatPlanRequired, workspaceId, onSubmit, clearComposer])
 
   /**
    * Enter policy for the editor: mirror canSubmit's uploading guard (Enter
