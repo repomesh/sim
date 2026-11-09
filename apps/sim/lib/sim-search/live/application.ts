@@ -273,6 +273,18 @@ const ACCOUNT_START_FLOOR_MS = 1500
 /** Candidates verified at once; each verification is one or more provider requests. */
 const VERIFY_CONCURRENCY = 5
 const MAX_ACCOUNTS = 20
+
+/** Account status when a merge cut results that its cursor would skip. */
+export const LIVE_MORE_RANKED_BELOW_MESSAGE =
+  'More matches ranked below the returned results. Search this account alone to see them.'
+/** Account status on every date-sorted search. */
+export const LIVE_DATE_ORDER_MESSAGE =
+  'Date order covers retrieved results; follow continuation before claiming an overall earliest or latest match.'
+/** Account status when the search deadline arrives before the account gets its turn. */
+export const LIVE_NOT_STARTED_MESSAGE =
+  'Not searched before the search deadline. Search this account alone or narrow the query.'
+/** Account status for each eligible account beyond {@link MAX_ACCOUNTS}. */
+export const LIVE_OVER_ACCOUNT_LIMIT_MESSAGE = `Not searched: one search covers at most ${MAX_ACCOUNTS} accounts. Search this source or account alone.`
 /** Previews center on the query's longest matching term, like indexed passages. */
 const PREVIEW_CHARACTERS = 1800
 /** Characters one read returns, the same page budget indexed document reads use. */
@@ -654,9 +666,7 @@ const liveKnowledgeSearch = defineAuthorizedKnowledgeUseCase({
             undatedExcluded
               ? 'Some results lacked date metadata and were excluded; date coverage is incomplete.'
               : undefined,
-            dateSorted
-              ? 'Date order covers retrieved results; follow continuation before claiming an overall earliest or latest match.'
-              : undefined,
+            dateSorted ? LIVE_DATE_ORDER_MESSAGE : undefined,
             moreUnreachable
               ? 'More matches exist than this search could return. Narrow the query or target one source.'
               : undefined,
@@ -803,7 +813,7 @@ const liveKnowledgeSearch = defineAuthorizedKnowledgeUseCase({
             failed(
               new NativeSearchError(
                 'timeout',
-                'Not searched before the search deadline. Search this account alone or narrow the query.',
+                LIVE_NOT_STARTED_MESSAGE,
                 undefined,
                 undefined,
                 'not_started'
@@ -894,10 +904,7 @@ const liveKnowledgeSearch = defineAuthorizedKnowledgeUseCase({
       const { nextCursor: _, ...rest } = status
       return {
         ...rest,
-        message: joinMessages([
-          status.message,
-          'More matches ranked below the returned results. Search this account alone to see them.',
-        ]),
+        message: joinMessages([status.message, LIVE_MORE_RANKED_BELOW_MESSAGE]),
       }
     })
     /** Live coverage guides the providers this call searched or tried to search. */
@@ -917,7 +924,7 @@ const liveKnowledgeSearch = defineAuthorizedKnowledgeUseCase({
           displayName: account.displayName,
           ...(queryIndex === undefined ? {} : { queryIndex }),
           status: 'unavailable',
-          message: `Not searched: one search covers at most ${MAX_ACCOUNTS} accounts. Search this source or account alone.`,
+          message: LIVE_OVER_ACCOUNT_LIMIT_MESSAGE,
         })
     }
     for (const [queryIndex, query] of (queries ?? []).entries()) {
@@ -1041,6 +1048,11 @@ export const readLiveDocument = defineAuthorizedKnowledgeUseCase({
     if (input.organizationId) await requireOrganizationSearchAvailable(input.organizationId)
     if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 8)
       throw new OrchestrationError('validation', 'Invalid document read limit')
+    if (input.startChunkIndex && input.startChunkIndex !== 0)
+      throw new OrchestrationError(
+        'validation',
+        'Live documents use chunk index zero; continue using next.startOffset'
+      )
     const reference = readLiveReference(
       input.documentId,
       liveReferenceOwner(userId, resourceScopeKey(resourceScopeFromOwner(input)))
@@ -1107,11 +1119,6 @@ export const readLiveDocument = defineAuthorizedKnowledgeUseCase({
     if (!matchesLiveFilters(document, input.documentId, reference.provider, input.filters))
       throw new OrchestrationError('not_found', 'Document is outside the selected search filters')
     const content = safeContent(document.content, input.resultSecretRegistry)
-    if (input.startChunkIndex && input.startChunkIndex !== 0)
-      throw new OrchestrationError(
-        'validation',
-        'Live documents use chunk index zero; continue using next.startOffset'
-      )
     const start = input.startOffset ?? 0
     if (!Number.isSafeInteger(start) || start < 0 || start > content.length)
       throw new OrchestrationError(
