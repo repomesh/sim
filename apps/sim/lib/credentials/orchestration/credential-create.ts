@@ -29,6 +29,7 @@ import {
 } from '@/lib/credentials/service-account-secret'
 import { isTokenServiceAccountProviderId } from '@/lib/credentials/token-service-accounts/descriptors'
 import { TokenServiceAccountValidationError } from '@/lib/credentials/token-service-accounts/errors'
+import { releasePendingWorkloadIdentitySubject } from '@/lib/credentials/workload-identity/pending-subjects'
 import {
   assertWorkloadIdentitySubjectUnclaimed,
   KeylessCredentialRefusedError,
@@ -286,6 +287,7 @@ export async function createCredentialRecord(
     let resolvedEnvOwnerUserId: string | null = null
     let resolvedEncryptedServiceAccountKey: string | null = null
     let resolvedWorkloadIdentitySubject: string | undefined
+    let resolvedTokenExpiresAt: Date | null = null
     const extraAuditMetadata: Record<string, unknown> = {}
 
     if (type === 'oauth') {
@@ -353,6 +355,7 @@ export async function createCredentialRecord(
         if (!resolvedDisplayName) resolvedDisplayName = secret.displayName
         resolvedEncryptedServiceAccountKey = secret.encryptedServiceAccountKey
         resolvedWorkloadIdentitySubject = secret.newWorkloadIdentitySubject
+        resolvedTokenExpiresAt = secret.tokenExpiresAt ?? null
         Object.assign(extraAuditMetadata, secret.auditMetadata)
       } catch (error) {
         if (error instanceof KeylessCredentialRefusedError) return keylessFailure(error)
@@ -559,10 +562,14 @@ export async function createCredentialRecord(
         envKey: resolvedEnvKey,
         envOwnerUserId: resolvedEnvOwnerUserId,
         encryptedServiceAccountKey: resolvedEncryptedServiceAccountKey,
+        accessTokenExpiresAt: resolvedTokenExpiresAt,
         createdBy: userId,
         createdAt: now,
         updatedAt: now,
       })
+      if (resolvedWorkloadIdentitySubject) {
+        await releasePendingWorkloadIdentitySubject(tx, resolvedWorkloadIdentitySubject)
+      }
 
       if ((type === 'env_workspace' || type === 'service_account') && currentContext.ownerId) {
         for (const memberUserId of currentContext.memberUserIds) {

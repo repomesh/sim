@@ -22,6 +22,7 @@ import {
   recordOrganizationSearchMcpActivity,
   type SearchMcpActivityInput,
 } from '@/lib/knowledge/mcp/activity'
+import { shareReadBudget } from '@/lib/knowledge/mcp/read-budget'
 import {
   KNOWLEDGE_MCP_READ_ONLY,
   type KnowledgeMcpToolRunner,
@@ -298,7 +299,7 @@ export function createKnowledgeMcpServer(context: KnowledgeMcpContext): McpServe
                 ...options,
                 documentId: id,
                 organizationId,
-                scaledWindow: { documentsInCall: documentId ? 1 : batch.length },
+                scaledWindow: true,
                 resultSecretRegistry: registry,
                 signal,
               },
@@ -315,7 +316,12 @@ export function createKnowledgeMcpServer(context: KnowledgeMcpContext): McpServe
               } catch (error) {
                 signal.throwIfAborted()
                 const message = await callerErrorMessage(error)
-                if (!message)
+                if (message)
+                  logger.info('Knowledge MCP batched read returned an error', {
+                    operation: knowledgeOperations.readDocument.id,
+                    reason: message,
+                  })
+                else
                   logger.error('Knowledge MCP batched read failed', {
                     operation: knowledgeOperations.readDocument.id,
                     error,
@@ -327,7 +333,7 @@ export function createKnowledgeMcpServer(context: KnowledgeMcpContext): McpServe
               }
             }
           )
-          return projectResult({ documents }, registry)
+          return projectResult({ documents: shareReadBudget(documents) }, registry)
         },
         Math.max(1, batch.length)
       )

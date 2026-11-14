@@ -27,6 +27,14 @@ import {
 } from '@/lib/credentials/client-credential-accounts/server'
 import { invalidateCoordinatedClientToken } from '@/lib/credentials/coordinated-client-token'
 import {
+  DATABASE_CONNECTION_DESCRIPTORS,
+  type DatabaseConnectionProviderId,
+} from '@/lib/credentials/database-connections/descriptors'
+import {
+  DatabaseConnectionVerificationError,
+  verifyAndEncryptDatabaseConnection,
+} from '@/lib/credentials/database-connections/server'
+import {
   DatabricksCredentialError,
   verifyAndEncryptDatabricksCredential,
 } from '@/lib/credentials/databricks-service-account.server'
@@ -49,16 +57,21 @@ import {
 import type { AtlassianProduct } from '@/lib/credentials/service-account-fields'
 import {
   SnowflakeCredentialError,
-  verifyAndEncryptSnowflakeKeylessCredential,
+  verifyAndEncryptSnowflakeConnection,
 } from '@/lib/credentials/snowflake-service-account.server'
 import { getTokenClientCredentialMinter } from '@/lib/credentials/token-service-accounts/client-credentials'
 import {
   CLIENT_CREDENTIALS_AUTH_METHOD,
   getTokenServiceAccountDescriptor,
+  isTokenServiceAccountFieldRequired,
   isTokenServiceAccountProviderId,
   SNOWFLAKE_SERVICE_ACCOUNT_PROVIDER_ID,
+  TOKEN_AUTH_METHOD,
   TOKEN_SERVICE_ACCOUNT_SECRET_TYPE,
+  type TokenServiceAccountAuthMethod,
   type TokenServiceAccountDescriptor,
+  type TokenServiceAccountField,
+  tokenFieldBelongsToAuthMethod,
 } from '@/lib/credentials/token-service-accounts/descriptors'
 import { TokenServiceAccountValidationError } from '@/lib/credentials/token-service-accounts/errors'
 import {
@@ -131,6 +144,11 @@ export interface ServiceAccountSecretResult {
   principal: ServiceAccountPrincipal | null
   /** Slack custom bot: the derived bot user id (for reaction self-drop). */
   botUserId?: string
+  /**
+   * When the vendor stops accepting the saved token, for a pasted token whose vendor states it at
+   * verification. Absent when the token never expires or the vendor does not say.
+   */
+  tokenExpiresAt?: Date
   /**
    * Keyless AWS, Databricks, Snowflake, Microsoft app, or Google: a subject this save binds that
    * the credential did not already hold, which must not belong to another credential of the owner.
@@ -374,7 +392,10 @@ async function buildGoogleServiceAccountSecret(
   }
 }
 
-/** A keyless Google Cloud credential: Workload Identity Federation, no stored key. */
+/**
+ * A keyless Google credential: Workload Identity Federation, no stored key,
+ * optionally with domain-wide delegation to one Workspace user.
+ */
 async function buildGoogleWorkloadIdentitySecret(
   serviceAccountJson: string,
   owner: ServiceAccountSecretFields['owner']
@@ -400,6 +421,12 @@ async function buildGoogleWorkloadIdentitySecret(
     auditMetadata: {
       googleClientEmail: result.serviceAccountEmail,
       googleWorkloadIdentityProvider: result.workloadIdentityProvider,
+      ...(result.delegation
+        ? {
+            googleDelegatedUser: result.delegation.user,
+            googleDelegatedServices: result.delegation.services.join(','),
+          }
+        : {}),
       ...serviceAccountPrincipalMetadata(principal),
     },
     principal,
@@ -524,6 +551,37 @@ async function buildOracleDatabaseServiceAccountSecret(
   }
 }
 
+/**
+ * Builds a saved PostgreSQL, MySQL, or SQL Server connection: the submitted
+ * connection JSON is proven with `SELECT 1` and stored encrypted.
+ */
+function databaseConnectionSecretBuilder(
+  providerId: DatabaseConnectionProviderId
+): ServiceAccountSecretBuilder {
+  const { label } = DATABASE_CONNECTION_DESCRIPTORS[providerId]
+  return async (fields) => {
+    if (!fields.serviceAccountJson)
+      throw new ServiceAccountSecretError(`${label} connection configuration is required`)
+    let result
+    try {
+      result = await verifyAndEncryptDatabaseConnection(providerId, fields.serviceAccountJson)
+    } catch (error) {
+      if (!(error instanceof DatabaseConnectionVerificationError)) throw error
+      throw new ServiceAccountSecretError(
+        `Could not verify the ${label} connection. Check the connection details, network access, and database permissions.`
+      )
+    }
+    const principal: ServiceAccountPrincipal = { kind: 'user', id: result.username }
+    return {
+      providerId,
+      encryptedServiceAccountKey: result.encryptedServiceAccountKey,
+      displayName: result.displayName,
+      auditMetadata: serviceAccountPrincipalMetadata(principal),
+      principal,
+    }
+  }
+}
+
 async function buildOciApiKeyServiceAccountSecret(
   fields: ServiceAccountSecretFields
 ): Promise<ServiceAccountSecretResult> {
@@ -578,30 +636,40 @@ async function buildTokenServiceAccountSecret(
   const apiToken = descriptor.fields.find((field) => field.id === 'apiToken')?.preserveWhitespace
     ? fields.apiToken
     : fields.apiToken?.trim()
-  const domain = fields.domain?.trim()
-  const requiresDomain = descriptor.fields.some((field) => field.id === 'domain')
+  const domainField = tokenModeField(descriptor, 'domain', TOKEN_AUTH_METHOD)
+  const domain = fields.domain?.trim() || domainField?.defaultValue
+  const requiresDomain = Boolean(
+    domainField && isTokenServiceAccountFieldRequired(domainField, TOKEN_AUTH_METHOD)
+  )
   const providerWorkspaceId = fields.providerWorkspaceId?.trim()
-  const requiresWorkspace = descriptor.fields.some((field) => field.id === 'providerWorkspaceId')
+  const workspaceField = tokenModeField(descriptor, 'providerWorkspaceId', TOKEN_AUTH_METHOD)
+  const requiresWorkspace = Boolean(
+    workspaceField && isTokenServiceAccountFieldRequired(workspaceField, TOKEN_AUTH_METHOD)
+  )
   if (
     !apiToken ||
     !apiToken.trim() ||
     (requiresDomain && !domain) ||
     (requiresWorkspace && !providerWorkspaceId)
   ) {
-    const required = descriptor.fields.map((field) => field.id).join(' and ')
+    const requiredFields = descriptor.fields.filter((field) =>
+      isTokenServiceAccountFieldRequired(field, TOKEN_AUTH_METHOD)
+    )
     throw new ServiceAccountSecretError(
-      `${required} ${descriptor.fields.length > 1 ? 'are' : 'is'} required for ${descriptor.serviceLabel} service account credentials`
+      `${requiredFields.map((field) => field.id).join(' and ')} ${requiredFields.length > 1 ? 'are' : 'is'} required for ${descriptor.serviceLabel} service account credentials`
     )
   }
   const validation = await validator({ apiToken, domain, providerWorkspaceId })
+  const storedDomain = validation.normalizedDomain ?? domain
+  const storedWorkspaceId = validation.normalizedWorkspaceId ?? providerWorkspaceId
   const principalMetadata = serviceAccountPrincipalMetadata(validation.principal)
   const blob: TokenServiceAccountSecretBlob = {
     type: TOKEN_SERVICE_ACCOUNT_SECRET_TYPE,
     providerId,
     apiToken,
-    ...(requiresDomain ? { domain: validation.normalizedDomain ?? domain } : {}),
-    ...(requiresWorkspace
-      ? { providerWorkspaceId: validation.normalizedWorkspaceId ?? providerWorkspaceId }
+    ...(domainField && (requiresDomain || storedDomain) ? { domain: storedDomain } : {}),
+    ...(workspaceField && (requiresWorkspace || storedWorkspaceId)
+      ? { providerWorkspaceId: storedWorkspaceId }
       : {}),
     metadata: { ...validation.storedMetadata, ...principalMetadata },
   }
@@ -612,7 +680,19 @@ async function buildTokenServiceAccountSecret(
     displayName: validation.displayName,
     auditMetadata: { ...validation.auditMetadata, ...principalMetadata },
     principal: validation.principal,
+    ...(validation.expiresAt ? { tokenExpiresAt: validation.expiresAt } : {}),
   }
+}
+
+/** The descriptor field with this id that the given sign-in mode shows and stores. */
+function tokenModeField(
+  descriptor: TokenServiceAccountDescriptor,
+  id: TokenServiceAccountField['id'],
+  authMethod: TokenServiceAccountAuthMethod
+): TokenServiceAccountField | undefined {
+  return descriptor.fields.find(
+    (field) => field.id === id && tokenFieldBelongsToAuthMethod(field, authMethod)
+  )
 }
 
 /**
@@ -634,19 +714,22 @@ async function buildTokenClientCredentialSecret(
   }
   const clientId = fields.clientId?.trim()
   const clientSecret = fields.clientSecret?.trim()
-  const domain = fields.domain?.trim()
-  const requiresDomain = descriptor.fields.some((field) => field.id === 'domain')
+  const domainField = tokenModeField(descriptor, 'domain', CLIENT_CREDENTIALS_AUTH_METHOD)
+  const domain = domainField ? fields.domain?.trim() || domainField.defaultValue : undefined
+  const requiresDomain = Boolean(
+    domainField && isTokenServiceAccountFieldRequired(domainField, CLIENT_CREDENTIALS_AUTH_METHOD)
+  )
   if (!clientId || !clientSecret || (requiresDomain && !domain)) {
     throw new ServiceAccountSecretError(
       `clientId, clientSecret${requiresDomain ? ', and domain are' : ' are'} required for ${descriptor.serviceLabel} client credentials`
     )
   }
   const validation = await proveMintedToken(
-    () => mint({ clientId, clientSecret, ...(requiresDomain ? { domain } : {}) }),
+    () => mint({ clientId, clientSecret, ...(domain ? { domain } : {}) }),
     (accessToken) =>
       validator({
         apiToken: accessToken,
-        ...(requiresDomain ? { domain } : {}),
+        ...(domain ? { domain } : {}),
         authMethod: CLIENT_CREDENTIALS_AUTH_METHOD,
       })
   )
@@ -657,7 +740,7 @@ async function buildTokenClientCredentialSecret(
     authMethod: CLIENT_CREDENTIALS_AUTH_METHOD,
     clientId,
     clientSecret,
-    ...(requiresDomain ? { domain: validation.normalizedDomain ?? domain } : {}),
+    ...(domain ? { domain: validation.normalizedDomain ?? domain } : {}),
     metadata: { ...validation.storedMetadata, ...principalMetadata },
   }
   const { encrypted } = await encryptSecret(JSON.stringify(blob))
@@ -672,9 +755,10 @@ async function buildTokenClientCredentialSecret(
 
 /**
  * Builds a Snowflake secret. A JSON configuration is the keyless mode (no
- * stored secret); otherwise the pasted programmatic access token goes through
- * the token-paste builder exactly as before. Snowflake's own refusals keep the
- * shared validation codes so callers report them like any token check.
+ * stored secret) or the key-pair mode, as its `authType` says; otherwise the
+ * pasted programmatic access token goes through the token-paste builder
+ * exactly as before. Snowflake's own refusals keep the shared validation codes
+ * so callers report them like any token check.
  */
 async function buildSnowflakeServiceAccountSecret(
   fields: ServiceAccountSecretFields
@@ -684,12 +768,12 @@ async function buildSnowflakeServiceAccountSecret(
   }
   if (fields.apiToken) {
     throw new ServiceAccountSecretError(
-      'Send either a programmatic access token or a keyless configuration, not both'
+      'Send either a programmatic access token or a connection configuration, not both'
     )
   }
   if (!fields.owner) throw new ServiceAccountSecretError('Snowflake credential owner is required')
   try {
-    const result = await verifyAndEncryptSnowflakeKeylessCredential(
+    const result = await verifyAndEncryptSnowflakeConnection(
       fields.serviceAccountJson,
       fields.owner
     )
@@ -802,6 +886,12 @@ const SERVICE_ACCOUNT_SECRET_BUILDERS: Record<string, ServiceAccountSecretBuilde
   [DATABRICKS_SERVICE_ACCOUNT_PROVIDER_ID]: buildDatabricksServiceAccountSecret,
   [MICROSOFT_APP_SERVICE_ACCOUNT_PROVIDER_ID]: buildMicrosoftAppServiceAccountSecret,
   [SNOWFLAKE_SERVICE_ACCOUNT_PROVIDER_ID]: buildSnowflakeServiceAccountSecret,
+  ...Object.fromEntries(
+    Object.values(DATABASE_CONNECTION_DESCRIPTORS).map(({ providerId }) => [
+      providerId,
+      databaseConnectionSecretBuilder(providerId),
+    ])
+  ),
 }
 
 /**

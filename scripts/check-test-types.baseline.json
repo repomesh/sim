@@ -648,9 +648,6 @@
   "apps/sim/blocks/blocks/gitlab.test.ts": {
     "TS18048": 7
   },
-  "apps/sim/blocks/blocks/google_drive.test.ts": {
-    "TS18048": 1
-  },
   "apps/sim/blocks/blocks/instagram.test.ts": {
     "TS18048": 1
   },
@@ -661,18 +658,12 @@
   "apps/sim/blocks/blocks/mem0.test.ts": {
     "TS18048": 1
   },
-  "apps/sim/blocks/blocks/microsoft_ad.test.ts": {
-    "TS18048": 1
-  },
   "apps/sim/blocks/blocks/mintlify.test.ts": {
     "TS18048": 1
   },
   "apps/sim/blocks/blocks/mssql.test.ts": {
     "TS18048": 1,
     "TS2339": 2
-  },
-  "apps/sim/blocks/blocks/outlook.test.ts": {
-    "TS18048": 2
   },
   "apps/sim/blocks/blocks/slack.test.ts": {
     "TS2339": 1
@@ -795,7 +786,7 @@
   },
   "apps/sim/executor/handlers/agent/handler.test.ts": {
     "TS18046": 2,
-    "TS2339": 3,
+    "TS2339": 1,
     "TS2345": 1,
     "TS2352": 1,
     "TS7006": 1

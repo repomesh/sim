@@ -1,6 +1,8 @@
 import type { HexGetDataConnectionParams, HexGetDataConnectionResponse } from '@/tools/hex/types'
+import { HEX_HOST_PARAM, hexApiBase } from '@/tools/hex/utils'
 import { HEX_CREDENTIAL_OAUTH } from '@/tools/shared/saved-credentials'
 import type { ToolConfig } from '@/tools/types'
+import { safeUrlPathSegment } from '@/tools/url-path'
 
 export const getDataConnectionTool: ToolConfig<
   HexGetDataConnectionParams,
@@ -14,6 +16,7 @@ export const getDataConnectionTool: ToolConfig<
   oauth: HEX_CREDENTIAL_OAUTH,
 
   params: {
+    host: HEX_HOST_PARAM,
     apiKey: {
       type: 'string',
       required: true,
@@ -30,7 +33,7 @@ export const getDataConnectionTool: ToolConfig<
 
   request: {
     url: (params) =>
-      `https://app.hex.tech/api/v1/data-connections/${params.dataConnectionId.trim()}`,
+      `${hexApiBase(params.host)}/data-connections/${safeUrlPathSegment(params.dataConnectionId, 'dataConnectionId')}`,
     method: 'GET',
     headers: (params) => ({
       Authorization: `Bearer ${params.apiKey}`,

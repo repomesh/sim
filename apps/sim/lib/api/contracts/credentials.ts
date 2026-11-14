@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { organizationIdSchema, workspaceIdSchema } from '@/lib/api/contracts/primitives'
 import { defineRouteContract } from '@/lib/api/contracts/types'
+import { MICROSOFT_CLOUD_IDS } from '@/lib/credentials/microsoft-clouds'
 import {
   ATLASSIAN_PRODUCTS,
   getMissingServiceAccountFields,
@@ -61,6 +62,8 @@ export const workspaceCredentialSchema = z.object({
   envKey: z.string().nullable(),
   envOwnerUserId: z.string().nullable(),
   instanceUrl: z.string().url().optional(),
+  /** ISO time the saved token stops working, when its vendor stated one; absent when it never expires or is unknown. */
+  expiresAt: z.string().optional(),
   createdBy: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -574,6 +577,18 @@ export const createWorkspaceCredentialContract = defineRouteContract({
  */
 /** The reconnected credential's stored auth mode, so the dialog reopens on it. */
 const reconnectAuthTypeSchema = z.enum(WORKLOAD_IDENTITY_AUTH_TYPE_LIST).optional()
+/** A reconnected Microsoft app credential's national cloud, absent for the global cloud. */
+const reconnectCloudSchema = z.enum(MICROSOFT_CLOUD_IDS).optional()
+
+/** A reconnected keyless credential's custom audience; absent when it uses the default. */
+const reconnectAudienceSchema = z.string().optional()
+
+/** A reconnected keyless Google credential's domain-wide delegation, so the dialog keeps it. */
+const reconnectDelegationSchema = z
+  .object({ user: z.string(), services: z.array(z.string()) })
+  .optional()
+
+export type ReconnectDelegation = NonNullable<z.output<typeof reconnectDelegationSchema>>
 
 export const workloadIdentitySubjectGrantShape = {
   issuer: z
@@ -583,7 +598,7 @@ export const workloadIdentitySubjectGrantShape = {
     .string()
     .optional()
     .describe(
-      "The `aud` claim the cloud must accept. Absent for Google Cloud, whose audience is each credential's own workload identity pool provider."
+      "The default `aud` claim the cloud must accept; a keyless config's optional `audience` replaces it. Absent for Google Cloud, whose default audience is each credential's own workload identity pool provider."
     ),
   subject: z
     .string()
@@ -598,6 +613,12 @@ export const workloadIdentitySubjectGrantShape = {
   expiresAt: z
     .string()
     .describe('ISO 8601 timestamp after which `subjectProof` can no longer create a credential.'),
+  subjectIssuedAt: z.string().describe('ISO 8601 timestamp when Sim first issued `subject`.'),
+  subjectHeldUntil: z
+    .string()
+    .describe(
+      'ISO 8601 timestamp until which Sim holds `subject` for you if no credential saves it. Renewing the proof restarts the hold; once a credential saves the subject, it is no longer held.'
+    ),
 } as const
 
 export const prepareWorkloadIdentityContract = defineRouteContract({
@@ -608,16 +629,32 @@ export const prepareWorkloadIdentityContract = defineRouteContract({
     provider: z.enum(WORKLOAD_IDENTITY_PROVIDERS),
     /** The credential being reconnected, so the dialog opens on its current mode. */
     credentialId: z.string().min(1).max(255).optional(),
+    /** Issue a new subject instead of the one Sim is already holding for this person. */
+    newSubject: z.boolean().optional(),
   }),
   response: {
     mode: 'json',
     schema: z.discriminatedUnion('available', [
       /** This deployment has no workload-identity signing key; offer key-based modes only. */
-      z.object({ available: z.literal(false), reconnectAuthType: reconnectAuthTypeSchema }),
+      z.object({
+        available: z.literal(false),
+        reconnectAuthType: reconnectAuthTypeSchema,
+        reconnectDelegation: reconnectDelegationSchema,
+        reconnectCloud: reconnectCloudSchema,
+        reconnectAudience: reconnectAudienceSchema,
+      }),
       z.object({
         available: z.literal(true),
         ...workloadIdentitySubjectGrantShape,
+        /** Absent when Sim does not hold the subject: a reconnect that keeps its own. */
+        subjectIssuedAt: workloadIdentitySubjectGrantShape.subjectIssuedAt.optional(),
+        subjectHeldUntil: workloadIdentitySubjectGrantShape.subjectHeldUntil.optional(),
+        /** Whether `subject` was issued earlier, so a trust configuration may already allow it. */
+        subjectReused: z.boolean().optional(),
         reconnectAuthType: reconnectAuthTypeSchema,
+        reconnectDelegation: reconnectDelegationSchema,
+        reconnectCloud: reconnectCloudSchema,
+        reconnectAudience: reconnectAudienceSchema,
       }),
     ]),
   },

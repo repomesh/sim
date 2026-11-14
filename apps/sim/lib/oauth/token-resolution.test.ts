@@ -789,19 +789,77 @@ describe('keyless Google Cloud credential refusals', () => {
       oauth: { required: true, provider: 'google-drive' },
     })
     mockResolveServiceAccountToken.mockReset()
+  })
+
+  it('falls back to a provider-neutral message when the refusal carries none', async () => {
     mockResolveServiceAccountToken.mockRejectedValue(
       new TokenServiceAccountValidationError('unsupported_use', 400)
     )
-  })
-
-  it('tells the caller to use a JSON key instead of asking to reconnect', async () => {
     const result = await resolveCredentialAccessToken({
       requestId: 'google-keyless',
       credentialId: 'google-keyless-1',
       toolId: 'google-drive-tool',
       authenticate,
     })
-    expect(result).toMatchObject({ ok: false, status: 400, code: 'unsupported_use' })
-    expect(result.ok ? '' : result.error).toMatch(/use a JSON key credential instead/)
+    expect(result).toMatchObject({
+      ok: false,
+      status: 400,
+      code: 'unsupported_use',
+      error: 'This credential cannot be used here',
+    })
+  })
+
+  it('tells the caller to fix the host when egress refuses it, instead of a generic 401', async () => {
+    mockResolveServiceAccountToken.mockRejectedValue(
+      new TokenServiceAccountValidationError('host_not_allowed', 400)
+    )
+    const result = await resolveCredentialAccessToken({
+      requestId: 'servicenow-host',
+      credentialId: 'google-keyless-1',
+      toolId: 'google-drive-tool',
+      authenticate,
+    })
+    expect(result).toMatchObject({ ok: false, status: 400, code: 'host_not_allowed' })
+  })
+})
+
+describe('Microsoft app credential cloud refusals', () => {
+  const authenticate = async () => INTERNAL_AUTH
+
+  beforeEach(() => {
+    mockAuthorizeCredentialUseForAuth.mockResolvedValue({
+      ok: true,
+      requesterUserId: 'user-1',
+      credentialOwnerUserId: 'owner-1',
+    })
+    mockResolveOAuthAccountId.mockResolvedValue({
+      credentialType: 'service_account',
+      credentialId: 'microsoft-app-gov',
+      providerId: 'microsoft-app-service-account',
+      accountId: '',
+      workspaceId: 'workspace-1',
+      usedCredentialTable: true,
+    })
+    mockGetToolMetadata.mockReturnValue({
+      id: 'powerbi-tool',
+      params: {},
+      oauth: { required: true, provider: 'microsoft-powerbi' },
+    })
+    mockResolveServiceAccountToken.mockReset()
+    mockResolveServiceAccountToken.mockRejectedValue(
+      new TokenServiceAccountValidationError('cloud_mismatch', 400)
+    )
+  })
+
+  it('names the cloud mismatch instead of asking to reconnect the credential', async () => {
+    const result = await resolveCredentialAccessToken({
+      requestId: 'microsoft-cloud',
+      credentialId: 'microsoft-app-gov',
+      toolId: 'powerbi-tool',
+      authenticate,
+    })
+    expect(result).toMatchObject({ ok: false, status: 400, code: 'cloud_mismatch' })
+    expect(result.ok ? '' : result.error).toMatch(/Microsoft cloud/)
+    expect(result.ok ? '' : result.error).not.toMatch(/reconnect/)
   })
 })

@@ -780,9 +780,13 @@ Keyless (workload identity) credentials take two steps.
 
 Step 1: run `sim credentials keyless-subject <providerId> --output json` and configure your cloud to trust the printed issuer, audience, and subject. Its requiredConfigFields lists the values your provider's keylessConfig still needs.
 
+The printed audience is the default. To have Sim sign tokens for your own audience instead, set audience in keylessConfig and trust that value. Google Cloud prints no audience: its default is the credential's own workload identity pool provider.
+
 Step 2: add those values to keylessConfig and pass it to `sim credentials create <providerId> --credentials @file`.
 
-The proof expires after 24 hours and works only for the user who requested it, with the same providerId. If creation reports WORKLOAD_IDENTITY_PROOF_EXPIRED, WORKLOAD_IDENTITY_PROOF_INVALID, WORKLOAD_IDENTITY_SUBJECT_REQUIRED, WORKLOAD_IDENTITY_SUBJECT_IN_USE, run step 1 again, trust the new subject, and retry.
+The proof expires after 24 hours and works only for the user who requested it, with the same providerId. Sim holds the subject for you for 30 days until a credential saves it, so a trust configuration that takes longer to apply still works: renew the proof with `sim credentials keyless-subject <providerId> --subject <subject>`. The subject stays the same, and each renewal restarts the 30 days. Sim holds up to 20 unsaved subjects per person and provider in a workspace; issuing more drops the one shown least recently.
+
+If creation reports WORKLOAD_IDENTITY_PROOF_EXPIRED, renew the proof and retry. If it reports WORKLOAD_IDENTITY_PROOF_INVALID, WORKLOAD_IDENTITY_SUBJECT_REQUIRED, WORKLOAD_IDENTITY_SUBJECT_IN_USE, run step 1 again, trust the new subject, and retry.
 
 **Examples**
 
@@ -799,7 +803,7 @@ API request and response schemas: [createServiceAccountCredential](/api-referenc
 Issue the subject and proof for a new keyless (workload identity) credential (OAuth login or personal API key required)
 
 ```bash
-sim credentials keyless-subject <providerId>
+sim credentials keyless-subject <providerId> [options]
 ```
 
 **Arguments**
@@ -812,13 +816,27 @@ sim credentials keyless-subject <providerId>
 
 </CommandTable>
 
+**Options**
+
+<CommandTable>
+
+| Option | Required | Description |
+| --- | --- | --- |
+| `--subject <subject>` | No | Renew the proof for a subject Sim issued to you earlier, instead of issuing a new one. |
+
+</CommandTable>
+
 Keyless (workload identity) credentials take two steps.
 
 Step 1: run `sim credentials keyless-subject <providerId> --output json` and configure your cloud to trust the printed issuer, audience, and subject. Its requiredConfigFields lists the values your provider's keylessConfig still needs.
 
+The printed audience is the default. To have Sim sign tokens for your own audience instead, set audience in keylessConfig and trust that value. Google Cloud prints no audience: its default is the credential's own workload identity pool provider.
+
 Step 2: add those values to keylessConfig and pass it to `sim credentials create <providerId> --credentials @file`.
 
-The proof expires after 24 hours and works only for the user who requested it, with the same providerId. If creation reports WORKLOAD_IDENTITY_PROOF_EXPIRED, WORKLOAD_IDENTITY_PROOF_INVALID, WORKLOAD_IDENTITY_SUBJECT_REQUIRED, WORKLOAD_IDENTITY_SUBJECT_IN_USE, run step 1 again, trust the new subject, and retry.
+The proof expires after 24 hours and works only for the user who requested it, with the same providerId. Sim holds the subject for you for 30 days until a credential saves it, so a trust configuration that takes longer to apply still works: renew the proof with `sim credentials keyless-subject <providerId> --subject <subject>`. The subject stays the same, and each renewal restarts the 30 days. Sim holds up to 20 unsaved subjects per person and provider in a workspace; issuing more drops the one shown least recently.
+
+If creation reports WORKLOAD_IDENTITY_PROOF_EXPIRED, renew the proof and retry. If it reports WORKLOAD_IDENTITY_PROOF_INVALID, WORKLOAD_IDENTITY_SUBJECT_REQUIRED, WORKLOAD_IDENTITY_SUBJECT_IN_USE, run step 1 again, trust the new subject, and retry.
 
 **Examples**
 
@@ -2645,7 +2663,7 @@ sim knowledge connectors create <knowledgeBaseId> [options]
 | Option | Required | Description |
 | --- | --- | --- |
 | `--connector-type <value>` | Yes | Registered connector type. |
-| `--credential-id <value>` | No | OAuth credential identifier for connector types whose `auth.mode` is `oauth` (see connector types); omit it for `apiKey` connectors. |
+| `--credential-id <value>` | No | OAuth credential identifier for connector types whose `auth.mode` is `oauth` (see connector types), or a saved credential for an `apiKey` connector type that declares `auth.savedCredential` (such as Amazon S3 with a saved AWS credential); otherwise omit it for `apiKey` connectors. |
 | `--api-key <value>` | No | Write-only API key for connector types whose `auth.mode` is `apiKey` (see connector types), or a personal access token for an OAuth connector that also accepts one, such as GitHub. Send it instead of `credentialId`. Pass a raw key, or a secret reference written as the whole value `{{SECRET_NAME}}`, which the server resolves; `$SECRET_NAME` is not a reference. |
 | `--source-config <json\|@file>` | Yes | Connector-specific source selection and filtering configuration. (JSON, or @path / @- to read a file or stdin). |
 | `--sync-interval-minutes <value>` | No | Scheduled synchronization interval in minutes; zero disables scheduling. Defaults to 1440. |

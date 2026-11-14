@@ -45,6 +45,8 @@ const DESTINATION_PARAM =
 const OPERATION_PAYLOAD_PARAMS: Readonly<Record<string, readonly string[]>> = {
   // The page the remote browser opens; the token goes to api.browser-use.com.
   browser_use_run_task: ['startUrl'],
+  // A CB Insights profile URL resolved by the lookup, sent in the body to api.cbinsights.com.
+  cbinsights_lookup_organizations: ['profileUrl'],
   // A label CrowdStrike records on the RTR session; the token goes to the credential's Falcon cloud.
   crowdstrike_init_rtr_session: ['origin'],
   // A guild id the operation never sends; it posts only to the channel's discord.com endpoint.
@@ -245,13 +247,12 @@ export function savedCredentialContractErrors(
   tools: SavedCredentialToolLookup
 ): string[] {
   const errors: string[] = []
-  const picker = block.subBlocks.find(isSavedCredentialPicker)
-  // A legacy block shares its successor's tools but takes the secret inline.
-  if (!picker && legacies.length === 0) return errors
   const takesSavedCredential = (block.tools?.access ?? []).some(
     (toolId) => (tools.metadata(toolId)?.oauth?.credentialSuppliedParams?.length ?? 0) > 0
   )
-  if (!takesSavedCredential && !picker) return errors
+  const picker = block.subBlocks.find(isSavedCredentialPicker)
+  // A legacy block shares its successor's tools but takes the secret inline.
+  if (!picker && (legacies.length === 0 || !takesSavedCredential)) return errors
   if (!picker?.serviceId) {
     errors.push(
       `Block "${block.type}": its tools take a saved credential but it has no service-account picker with a serviceId and canonicalParamId 'oauthCredential'.`
@@ -300,7 +301,14 @@ export function savedCredentialContractErrors(
       }
       continue
     }
-    if (oauth.credentialKind !== 'service-account') {
+    if (picker.credentialKind === 'any' && oauth.credentialKind) {
+      errors.push(
+        `Block "${block.type}" → tool "${toolId}": picker accepts both credential kinds but the tool only accepts "${oauth.credentialKind}".`
+      )
+    } else if (
+      picker.credentialKind === 'service-account' &&
+      oauth.credentialKind !== 'service-account'
+    ) {
       errors.push(
         `Block "${block.type}" → tool "${toolId}": accepts "${oauth.credentialKind ?? 'any'}" credentials, not the picker's service-account credential.`
       )

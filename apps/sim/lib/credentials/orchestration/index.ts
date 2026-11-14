@@ -49,8 +49,12 @@ import {
   ServiceAccountSecretError,
   verifyAndBuildServiceAccountSecret,
 } from '@/lib/credentials/service-account-secret'
-import { SNOWFLAKE_SERVICE_ACCOUNT_PROVIDER_ID } from '@/lib/credentials/token-service-accounts/descriptors'
+import {
+  getTokenServiceAccountDomainDefault,
+  SNOWFLAKE_SERVICE_ACCOUNT_PROVIDER_ID,
+} from '@/lib/credentials/token-service-accounts/descriptors'
 import { TokenServiceAccountValidationError } from '@/lib/credentials/token-service-accounts/errors'
+import { releasePendingWorkloadIdentitySubject } from '@/lib/credentials/workload-identity/pending-subjects'
 import {
   assertReconnectedSubjectUnclaimed,
   KeylessCredentialRefusedError,
@@ -159,7 +163,7 @@ async function readStoredSecretBlob(credentialId: string): Promise<Record<string
  */
 function readStoredField(
   blob: Record<string, unknown> | null,
-  field: 'dataCenter' | 'scope' | 'authMethod' | 'username' | 'atlassianProduct'
+  field: 'dataCenter' | 'scope' | 'authMethod' | 'username' | 'atlassianProduct' | 'domain'
 ): string | undefined {
   const value = blob?.[field]
   return typeof value === 'string' && value ? value : undefined
@@ -364,6 +368,10 @@ export async function updateCredentialRecord(
         providerId === ATLASSIAN_SERVICE_ACCOUNT_PROVIDER_ID &&
         params.atlassianProduct === undefined
       const needsStoredUsername = params.username === undefined && isMultiGrantProvider
+      // A token provider's defaulted region or host is left blank on a reconnect that keeps it;
+      // filling the default instead would move an EU or sandbox credential to the default host.
+      const needsStoredDomain =
+        !params.domain?.trim() && getTokenServiceAccountDomainDefault(providerId) !== undefined
       // A keyless AWS role, Databricks principal, Microsoft app, Google service account, or
       // Snowflake service user keeps its trusted subject across reconnects.
       const needsStoredBoundSubject =
@@ -389,6 +397,7 @@ export async function updateCredentialRecord(
         needsStoredScope ||
         needsStoredAuthMethod ||
         needsStoredUsername ||
+        needsStoredDomain ||
         needsStoredIdentity ||
         needsStoredAtlassianProduct ||
         needsStoredBoundSubject
@@ -445,7 +454,7 @@ export async function updateCredentialRecord(
           signingSecret: params.signingSecret,
           botToken: params.botToken,
           apiToken: params.apiToken,
-          domain: params.domain,
+          domain: needsStoredDomain ? readStoredField(storedBlob, 'domain') : params.domain,
           providerWorkspaceId: params.providerWorkspaceId,
           atlassianProduct: needsStoredAtlassianProduct
             ? readStoredField(storedBlob, 'atlassianProduct') === 'confluence'
@@ -480,6 +489,8 @@ export async function updateCredentialRecord(
           },
         })
         updates.encryptedServiceAccountKey = secret.encryptedServiceAccountKey
+        // The replaced token's expiry never outlives it: a token that states none clears it.
+        updates.accessTokenExpiresAt = secret.tokenExpiresAt ?? null
         rotatedSlackBotUserId = secret.botUserId
         rotatedAuditMetadata = secret.auditMetadata
         if (needsStoredBoundSubject) rotatedKeylessSecret = secret.encryptedServiceAccountKey
@@ -550,12 +561,13 @@ export async function updateCredentialRecord(
       const rotatedSecret = rotatedKeylessSecret
       try {
         await db.transaction(async (tx) => {
-          await assertReconnectedSubjectUnclaimed(tx, {
+          const subject = await assertReconnectedSubjectUnclaimed(tx, {
             rotatedSecret,
             scope: resourceScopeFromOwner(params.credential),
             credentialId: params.credentialId,
           })
           await tx.update(credential).set(updates).where(eq(credential.id, params.credentialId))
+          if (subject) await releasePendingWorkloadIdentitySubject(tx, subject)
         })
       } catch (error) {
         if (error instanceof KeylessCredentialRefusedError) return keylessFailure(error)

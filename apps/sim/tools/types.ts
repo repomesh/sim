@@ -160,6 +160,12 @@ export interface OAuthConfig {
    */
   credentialParams?: Readonly<Record<string, CredentialParamSource>>
   /**
+   * Mapped params a credential of this provider may lack because one of its sign-in modes has no
+   * such field (a ServiceNow client-credentials connection has no username). The executor clears
+   * such a param instead of failing, so it is never left to the caller either.
+   */
+  optionalCredentialParams?: readonly string[]
+  /**
    * Inline secrets a saved client-credential account replaces with the token
    * it mints (`credentialParams.accessToken`): the tool authenticates with the
    * token and never reads them. Listed in `credentialSuppliedParams` too.

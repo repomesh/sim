@@ -1,7 +1,9 @@
 import type { HexRunProjectParams, HexRunProjectResponse } from '@/tools/hex/types'
 import { HEX_RUN_OUTPUT_PROPERTIES } from '@/tools/hex/types'
+import { HEX_HOST_PARAM, hexApiBase } from '@/tools/hex/utils'
 import { HEX_CREDENTIAL_OAUTH } from '@/tools/shared/saved-credentials'
 import type { ToolConfig } from '@/tools/types'
+import { safeUrlPathSegment } from '@/tools/url-path'
 
 export const runProjectTool: ToolConfig<HexRunProjectParams, HexRunProjectResponse> = {
   id: 'hex_run_project',
@@ -12,6 +14,7 @@ export const runProjectTool: ToolConfig<HexRunProjectParams, HexRunProjectRespon
   oauth: HEX_CREDENTIAL_OAUTH,
 
   params: {
+    host: HEX_HOST_PARAM,
     apiKey: {
       type: 'string',
       required: true,
@@ -70,7 +73,8 @@ export const runProjectTool: ToolConfig<HexRunProjectParams, HexRunProjectRespon
   },
 
   request: {
-    url: (params) => `https://app.hex.tech/api/v1/projects/${params.projectId.trim()}/runs`,
+    url: (params) =>
+      `${hexApiBase(params.host)}/projects/${safeUrlPathSegment(params.projectId, 'projectId')}/runs`,
     method: 'POST',
     headers: (params) => ({
       Authorization: `Bearer ${params.apiKey}`,

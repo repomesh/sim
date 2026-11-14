@@ -163,6 +163,9 @@ describe('hostSteeringParams', () => {
 /** Any real service-account provider: the fixture tool's URL builder, not the provider, is under test. */
 const PROVIDER = 'jama'
 
+/** A provider with a saved-credential policy whose picker also accepts OAuth accounts. */
+const MIXED_PROVIDER = 'apollo'
+
 /** A native token block: a service-account picker and one tool, no legacy block. */
 function nativeBlock(toolId: string): BlockConfig {
   return {
@@ -238,6 +241,30 @@ describe('savedCredentialContractErrors', () => {
 
     expect(errors).toEqual([expect.stringContaining('accepts "any" credentials')])
   })
+
+  it.each([undefined, 'oauth', 'service-account'] as const)(
+    'a mixed picker requires its tool to accept both credential kinds: %s',
+    (credentialKind) => {
+      const block = nativeBlock('probe_fixture')
+      block.subBlocks[0].credentialKind = 'any'
+      block.subBlocks[0].serviceId = MIXED_PROVIDER
+      const errors = savedCredentialContractErrors(
+        block,
+        [],
+        nativeHostTool({
+          required: true,
+          provider: MIXED_PROVIDER,
+          credentialKind,
+          credentialParams: { accessToken: 'accessToken' },
+          credentialSuppliedParams: ['accessToken'],
+          authoritativeParams: ['instanceUrl'],
+        })
+      )
+      expect(errors).toEqual(
+        credentialKind ? [expect.stringContaining('picker accepts both credential kinds')] : []
+      )
+    }
+  )
 
   it('fails a native block whose tool has no credential policy, so its token is never filled', () => {
     const errors = savedCredentialContractErrors(

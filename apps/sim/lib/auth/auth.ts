@@ -5,6 +5,7 @@ import { db } from '@sim/db'
 import * as schema from '@sim/db/schema'
 import { createLogger, setRequestAuth } from '@sim/logger'
 import { getErrorMessage, toError } from '@sim/utils/errors'
+import { isRecordLike } from '@sim/utils/object'
 import { type BetterAuthOptions, betterAuth, type User } from 'better-auth'
 import {
   APIError,
@@ -35,8 +36,6 @@ import {
   renderWelcomeEmail,
 } from '@/components/emails'
 import { readAttributionProperties } from '@/lib/analytics/attribution'
-import { FREEBUFF_CLICK_ID_COOKIE } from '@/lib/analytics/freebuff'
-import { reportFreebuffConversion } from '@/lib/analytics/freebuff.server'
 import { getAccessControlConfig, isEmailBlockedByAccessControl } from '@/lib/auth/access-control'
 import { enqueueAdminRemovedChatCleanup } from '@/lib/auth/admin-removal-chat-cleanup'
 import { holdAdminRemovalStops, stopAdminRemovedRuns } from '@/lib/auth/admin-removal-stops'
@@ -159,6 +158,7 @@ import { validateSignupEmailMx } from '@/lib/messaging/email/validation.server'
 import { isEmailVerificationEffectivelyEnabled } from '@/lib/messaging/email/verification'
 import { scheduleLifecycleEmail } from '@/lib/messaging/lifecycle'
 import { APP_ENTRY_PATH } from '@/lib/navigation/paths'
+import { formatApolloAuthorizationUrl } from '@/lib/oauth/apollo'
 import { clearRecordedRevocation } from '@/lib/oauth/credential-service'
 import {
   getMicrosoftRefreshTokenExpiry,
@@ -370,23 +370,6 @@ export const auth = betterAuth({
           logger.info('[databaseHooks.user.create.after] User created, initializing stats', {
             userId: user.id,
           })
-
-          /**
-           * Only the marketing-consent-gated Freebuff tag writes the `bfcid`
-           * cookie, and `FreebuffClickIdGuard` deletes it once marketing consent
-           * is withdrawn or expires. Not awaited: the postback
-           * retries on its own and must never delay signup. The browser tag
-           * reports the same `eventId` on email signup and Freebuff dedupes.
-           */
-          const freebuffClickId = context?.getCookie(FREEBUFF_CLICK_ID_COOKIE)
-          if (freebuffClickId) {
-            void reportFreebuffConversion({
-              clickId: freebuffClickId,
-              eventType: 'signup_completed',
-              eventId: user.id,
-              occurredAt: user.createdAt,
-            })
-          }
 
           try {
             PlatformEvents.userSignedUp({
@@ -1242,6 +1225,13 @@ export const auth = betterAuth({
       }
     }),
     after: createAuthMiddleware(async (ctx) => {
+      if (ctx.path === '/oauth2/link' && ctx.body?.providerId === 'apollo') {
+        const returned = ctx.context.returned
+        if (isRecordLike(returned) && typeof returned.url === 'string') {
+          ctx.context.returned = { ...returned, url: formatApolloAuthorizationUrl(returned.url) }
+        }
+      }
+
       if (isBillingEnabled) await recordCustomerRestoreAfterHook(ctx)
 
       const recordFinalAuthenticationResult = async (

@@ -1,19 +1,26 @@
 import { isRecordLike } from '@sim/utils/object'
-import { readResponseJsonWithLimit } from '@/lib/core/utils/stream-limits'
+import { PayloadSizeLimitError, readResponseJsonWithLimit } from '@/lib/core/utils/stream-limits'
 import { VANTA_PERMISSION_OPTIONS } from '@/lib/credentials/client-credential-accounts/descriptors'
 import {
   invalidateCoordinatedClientToken,
   resolveCoordinatedClientToken,
 } from '@/lib/credentials/coordinated-client-token'
+import { REJECTED_TOKEN_MINIMUM_AGE_MS } from '@/lib/credentials/token-request-resilience'
 import {
   fetchProvider,
   isTransientProviderStatus,
   requireClientSecret,
   TokenServiceAccountValidationError,
+  throttledRetryAfterMs,
 } from '@/lib/credentials/token-service-accounts/errors'
 
 const SCOPES = VANTA_PERMISSION_OPTIONS.map((option) => option.value)
 const EXPIRY_BUFFER_MS = 30_000
+/**
+ * Vanta answers 429 when an application mints more than 5 tokens a minute, and every token it
+ * issues revokes the previous one, so a failing exchange is retried at most every 15 s (4 a minute).
+ */
+const MIN_EXCHANGE_INTERVAL_MS = 15_000
 const STEP = 'vanta_token_mint'
 
 export interface VantaClientTokenFields {
@@ -33,7 +40,11 @@ export interface VantaClientTokenResult {
   apiDomain: string
 }
 
-/** Expires only the rejected token; a concurrent replacement remains usable. */
+/**
+ * Expires only the rejected token; a concurrent replacement remains usable. A token minted within
+ * {@link REJECTED_TOKEN_MINIMUM_AGE_MS} is kept, since Vanta limits token mints and the 401 may
+ * come from the endpoint rather than the token.
+ */
 export async function invalidateVantaClientToken(
   accessToken: string,
   apiDomain: string
@@ -41,7 +52,10 @@ export async function invalidateVantaClientToken(
   if (apiDomain !== 'https://api.vanta.com' && apiDomain !== 'https://api.vanta-gov.com') {
     throw new Error('Invalid Vanta API domain')
   }
-  await invalidateCoordinatedClientToken(accessToken, { accessTokenDigestTag: apiDomain })
+  await invalidateCoordinatedClientToken(accessToken, {
+    accessTokenDigestTag: apiDomain,
+    minimumAgeMs: REJECTED_TOKEN_MINIMUM_AGE_MS,
+  })
 }
 
 function unavailable(reason: string): TokenServiceAccountValidationError {
@@ -91,14 +105,25 @@ async function exchangeToken(
         ? 'invalid_credentials'
         : 'provider_unavailable',
       response.status,
-      { step: STEP, reason: 'provider rejected token exchange' }
+      { step: STEP, reason: 'provider rejected token exchange' },
+      { retryAfterMs: throttledRetryAfterMs(response) }
     )
   }
-  const payload = await readResponseJsonWithLimit<unknown>(response, {
-    maxBytes: 64 * 1024,
-    label: 'Vanta authentication response',
-    signal,
-  })
+  let payload: unknown
+  try {
+    payload = await readResponseJsonWithLimit<unknown>(response, {
+      maxBytes: 64 * 1024,
+      label: 'Vanta authentication response',
+      signal,
+    })
+  } catch (error) {
+    signal?.throwIfAborted()
+    throw unavailable(
+      error instanceof SyntaxError || error instanceof PayloadSizeLimitError
+        ? 'provider returned an invalid token response'
+        : 'provider token response could not be read'
+    )
+  }
   if (
     !isRecordLike(payload) ||
     typeof payload.access_token !== 'string' ||
@@ -150,6 +175,7 @@ export async function resolveVantaClientToken(
     step: STEP,
     signal: options.signal,
     minRemainingMs: EXPIRY_BUFFER_MS,
+    minExchangeIntervalMs: MIN_EXCHANGE_INTERVAL_MS,
     failureKeyQualifier: scope,
     accessTokenDigestTag: apiDomain,
     pinnedState: {
