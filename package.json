@@ -88,6 +88,7 @@
     "check:route-verbs": "bun run scripts/check-route-verbs.ts",
     "check:unused-exports": "bun run scripts/check-unused-exports.ts",
     "check:explicit-any": "bun run scripts/check-explicit-any.ts",
+    "check:mapper-operation": "bun run scripts/check-mapper-operation.ts",
     "check:file-names": "bun run scripts/check-file-names.ts",
     "check:source-conventions": "bun run scripts/check-source-conventions.ts",
     "check:test-types": "bun run scripts/check-test-types.ts",
@@ -132,7 +133,8 @@
     "check:agent-stream-docs": "bun run scripts/sync-agent-stream-docs.ts --check",
     "prepare": "bun husky",
     "test:workflow-sync": "bun --no-env-file scripts/test-integration.ts lib/workspaces/__integration__",
-    "type-check": "turbo run type-check",
+    "type-check": "bun run type-check:scripts:esm && turbo run type-check",
+    "type-check:scripts:esm": "tsc --project scripts/tsconfig.mts.json",
     "release": "bun run scripts/create-single-release.ts",
     "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "check:agent-cli-boundary": "bun run scripts/check-agent-cli-boundary.ts"

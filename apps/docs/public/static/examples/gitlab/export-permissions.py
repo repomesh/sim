@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export one GitLab project's readers to Sim's permission CSVs (Python 3.10+)."""
+"""Export GitLab project or group readers to Sim's permission CSVs (Python 3.10+)."""
 
 import argparse
 import csv
@@ -14,12 +14,13 @@ import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 
-MAX_BYTES = 4 * 1024 * 1024
-MAX_ROWS = 100_000
+MAX_BYTES = 8 * 1024 * 1024
+MAX_ROWS = 500_000
+MAX_PROJECTS = 50_000
 EMAIL = re.compile(
     r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
@@ -73,6 +74,17 @@ class GitLab:
             raise ExportError("GitLab returned invalid JSON.") from None
 
 
+def resource_id(value):
+    raw = str(value).strip()
+    try:
+        decoded = unquote(raw, errors="strict")
+    except UnicodeDecodeError:
+        decoded = raw
+    if not decoded or decoded in (".", ".."):
+        raise ExportError("Use a valid GitLab project or group ID or full path.")
+    return quote(decoded, safe="")
+
+
 def identifier(value):
     if type(value) is not int or not 0 < value <= 9_007_199_254_740_991:
         raise ExportError("GitLab returned an invalid numeric identity.")
@@ -85,8 +97,29 @@ def active(record):
     return record["state"] == "active" and not record.get("locked", False)
 
 
-def export(client, project):
-    record, _ = client.get("projects/" + quote(project, safe=""))
+def verified_email(profile, user_id):
+    if not isinstance(profile, dict) or identifier(profile.get("id")) != user_id:
+        raise ExportError("GitLab returned a mismatched user identity.")
+    if not active(profile) or profile.get("bot", False):
+        return None
+    confirmed_at = profile.get("confirmed_at")
+    if not isinstance(confirmed_at, str):
+        return None
+    try:
+        datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    email = profile.get("email")
+    if not isinstance(email, str):
+        raise ExportError(f"User {user_id}: primary email is unavailable. The CI token needs directory email access.")
+    email = email.strip().lower()
+    if len(email) > 254 or not EMAIL.fullmatch(email):
+        raise ExportError(f"User {user_id}: primary email is invalid.")
+    return email
+
+
+def export(client, project, profiles):
+    record, _ = client.get("projects/" + resource_id(project))
     if not isinstance(record, dict):
         raise ExportError("GitLab returned an invalid project.")
     project_id = identifier(record.get("id"))
@@ -101,7 +134,7 @@ def export(client, project):
     today = datetime.now(timezone.utc).date()
     page = 1
     expected_total = None
-    while page <= 1000:
+    while page <= MAX_ROWS // 100 + 1:
         members, headers = client.get(f"projects/{project_id}/members/all",
                                       {"per_page": 100, "page": page})
         if not isinstance(members, list) or len(members) > 100:
@@ -109,7 +142,7 @@ def export(client, project):
         total = headers.get("X-Total")
         if total is not None:
             if not re.fullmatch(r"[0-9]{1,6}", total) or int(total) > MAX_ROWS:
-                raise ExportError("GitLab membership total is invalid or exceeds the 100,000-row limit.")
+                raise ExportError("GitLab membership total is invalid or exceeds the 500,000-row limit.")
             if expected_total is not None and int(total) != expected_total:
                 raise ExportError("GitLab membership total changed during pagination. Rerun the export.")
             expected_total = int(total)
@@ -121,7 +154,7 @@ def export(client, project):
                 raise ExportError("GitLab membership pagination repeated a user. Rerun the export.")
             seen_members.add(user_id)
             if len(seen_members) > MAX_ROWS:
-                raise ExportError("Project membership exceeds the 100,000-row limit.")
+                raise ExportError("Project membership exceeds the 500,000-row limit.")
             role = member.get("access_level")
             if type(role) is not int:
                 raise ExportError("GitLab returned a membership without an access level.")
@@ -135,26 +168,14 @@ def export(client, project):
                     raise ExportError("GitLab returned an invalid membership expiry.") from None
                 if expired:
                     continue
-            profile, _ = client.get(f"users/{user_id}")
-            if not isinstance(profile, dict) or identifier(profile.get("id")) != user_id:
-                raise ExportError("GitLab returned a mismatched user identity.")
-            if not active(profile) or profile.get("bot", False):
+            if user_id not in profiles:
+                profile, _ = client.get(f"users/{user_id}")
+                profiles[user_id] = verified_email(profile, user_id)
+                if len(profiles) > MAX_ROWS:
+                    raise ExportError("Group identities exceed the 500,000-row limit.")
+            email = profiles[user_id]
+            if email is None:
                 continue
-            confirmed_at = profile.get("confirmed_at")
-            if not isinstance(confirmed_at, str):
-                continue
-            try:
-                datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            email = profile.get("email")
-            if not isinstance(email, str):
-                raise ExportError(
-                    f"User {user_id}: primary email is unavailable. The CI token needs directory email access."
-                )
-            email = email.strip().lower()
-            if len(email) > 254 or not EMAIL.fullmatch(email):
-                raise ExportError(f"User {user_id}: primary email is invalid.")
             if email in emails and emails[email] != user_id:
                 raise ExportError("Multiple GitLab users share an email. Resolve the identity conflict first.")
             emails[email] = user_id
@@ -168,46 +189,123 @@ def export(client, project):
             raise ExportError("GitLab returned invalid membership pagination.")
         page = int(next_page)
     else:
-        raise ExportError("GitLab membership pagination exceeds 1,000 pages.")
+        raise ExportError("GitLab membership pagination exceeds its limit.")
     if expected_total is not None and len(seen_members) != expected_total:
         raise ExportError("Exported membership count does not match GitLab's total. Rerun the export.")
-    if not users:
-        raise ExportError("No eligible readers. Pause search in Sim; empty CSVs cannot revoke all grants.")
     return project_path, users
 
 
-def write_export(output, project_path, users):
-    files = {}
-    ordered = sorted(users)
-    for name, header, rows in [
-        ("users.csv", ["user_id", "email"], [(user_id, users[user_id]) for user_id in ordered]),
-        ("project-permissions.csv", ["project_path", "user_id"],
-         [(project_path, user_id) for user_id in ordered]),
-    ]:
-        buffer = io.StringIO(newline="")
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(header)
-        writer.writerows(rows)
-        files[name] = buffer.getvalue().encode("utf-8")
-        if len(files[name]) > MAX_BYTES:
-            raise ExportError(f"{name} exceeds Sim's 4 MiB CSV limit.")
+def group_projects(client, group, include_subgroups):
+    record, _ = client.get("groups/" + resource_id(group))
+    if not isinstance(record, dict):
+        raise ExportError("GitLab returned an invalid group.")
+    group_id = identifier(record.get("id"))
+    path = record.get("full_path")
+    if not isinstance(path, str) or not path or len(path) > 1024:
+        raise ExportError("GitLab did not return the group path.")
+    projects, seen_ids, seen_paths = [], set(), set()
+    expected_total = None
+    manifest_bytes = 2
+    for page in range(1, MAX_PROJECTS // 100 + 2):
+        rows, headers = client.get(f"groups/{group_id}/projects", {
+            "with_shared": "false", "include_subgroups": str(include_subgroups).lower(),
+            "per_page": 100, "page": page, "order_by": "id", "sort": "asc", "simple": "true",
+        })
+        if not isinstance(rows, list) or len(rows) > 100:
+            raise ExportError("GitLab returned an invalid group project page.")
+        total = headers.get("X-Total")
+        if total is not None:
+            if not re.fullmatch(r"[0-9]{1,6}", total) or int(total) > MAX_PROJECTS:
+                raise ExportError("GitLab group total is invalid or exceeds the 50,000-project limit.")
+            if expected_total is not None and expected_total != int(total):
+                raise ExportError("GitLab group project total changed during export.")
+            expected_total = int(total)
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ExportError("GitLab returned an invalid group project.")
+            project_id = identifier(row.get("id"))
+            project_path = row.get("path_with_namespace")
+            if not isinstance(project_path, str) or len(project_path) > 1024:
+                raise ExportError("GitLab returned an invalid project path.")
+            namespace = project_path.rpartition("/")[0] if isinstance(project_path, str) else ""
+            if not (namespace == path or (include_subgroups and namespace.startswith(path + "/"))):
+                raise ExportError("GitLab returned a project outside the configured group.")
+            if project_id in seen_ids or project_path in seen_paths:
+                raise ExportError("GitLab group pagination repeated a project.")
+            seen_ids.add(project_id)
+            seen_paths.add(project_path)
+            projects.append((project_id, project_path))
+            if len(projects) > MAX_PROJECTS:
+                raise ExportError("GitLab group exceeds the 50,000-project limit.")
+            manifest_bytes += len(json.dumps({"id": project_id, "path": project_path},
+                                            ensure_ascii=False, separators=(",", ":")).encode()) + 1
+            if manifest_bytes > 16 * 1024 * 1024:
+                raise ExportError("GitLab group project listing exceeds 16 MiB. Choose a narrower group.")
+        next_page = headers.get("X-Next-Page")
+        if next_page is None:
+            next_page = str(page + 1) if len(rows) == 100 else ""
+        if not next_page:
+            break
+        if not next_page.isdigit() or int(next_page) != page + 1 or not rows:
+            raise ExportError("GitLab returned invalid group pagination.")
+    else:
+        raise ExportError("GitLab group exceeded its pagination limit.")
+    if expected_total is not None and len(projects) != expected_total:
+        raise ExportError("GitLab group project total does not match the complete listing.")
+    if not projects:
+        raise ExportError("No accessible projects in the GitLab group.")
+    return sorted(projects)
+
+
+def write_export(output, grants, users):
+    def user_rows():
+        for user_id in sorted(users):
+            yield user_id, users[user_id]
+
     output.parent.mkdir(parents=True, exist_ok=True)
     # Publish the pair together, so an interrupted export cannot mix new and old CSVs.
     with tempfile.TemporaryDirectory(dir=output.parent, prefix=".gitlab-export-") as temporary:
-        for name, content in files.items():
+        for name, header, rows in [
+            ("project-permissions.csv", ["project_path", "user_id"], grants),
+            ("users.csv", ["user_id", "email"], user_rows()),
+        ]:
             path = Path(temporary) / name
-            path.write_bytes(content)
+            buffer = io.StringIO(newline="")
+            writer = csv.writer(buffer, lineterminator="\n")
+            writer.writerow(header)
+            size = 0
+            with path.open("wb") as handle:
+                handle.write(buffer.getvalue().encode("utf-8"))
+                size = handle.tell()
+                for count, row in enumerate(rows, 1):
+                    if count > MAX_ROWS:
+                        raise ExportError(f"{name} exceeds Sim's 500,000-row limit.")
+                    buffer.seek(0)
+                    buffer.truncate()
+                    writer.writerow(row)
+                    content = buffer.getvalue().encode("utf-8")
+                    size += len(content)
+                    if size > MAX_BYTES:
+                        raise ExportError(f"{name} exceeds Sim's 8 MiB CSV limit.")
+                    handle.write(content)
             path.chmod(0o600)
+        if not users:
+            raise ExportError("No eligible readers. Pause search in Sim; empty CSVs cannot revoke all grants.")
         os.rename(temporary, output)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gitlab-url", required=True, help="HTTPS instance URL, without /api/v4")
-    parser.add_argument("--project", required=True, help="Project ID or full namespace/project path")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--project", help="Project ID or full namespace/project path")
+    scope.add_argument("--group", help="Group ID or full namespace/group path")
+    parser.add_argument("--include-subgroups", action="store_true", help="Include descendant groups (requires --group)")
     parser.add_argument("--output-dir", default="gitlab-permissions", help="New directory for both CSVs")
     parser.add_argument("--requests-per-minute", type=int, default=60, help="Request-start ceiling (default: 60)")
     args = parser.parse_args()
+    if args.include_subgroups and not args.group:
+        parser.error("--include-subgroups requires --group.")
     token = os.environ.get("GITLAB_EXPORT_TOKEN", "")
     if not token or any(char.isspace() for char in token):
         parser.error("Set GITLAB_EXPORT_TOKEN to the CI export token.")
@@ -217,8 +315,23 @@ def main():
     if output.exists() or output.is_symlink():
         raise ExportError("Output directory already exists. Choose a new directory for a fresh export.")
     client = GitLab(args.gitlab_url, token, args.requests_per_minute)
-    project_path, users = export(client, args.project)
-    write_export(output, project_path, users)
+    projects = group_projects(client, args.group, args.include_subgroups) if args.group else [(args.project, None)]
+    profiles, users, emails = {}, {}, {}
+
+    def grants():
+        for project_id, expected_path in projects:
+            project_path, readers = export(client, str(project_id), profiles)
+            if expected_path is not None and expected_path != project_path:
+                raise ExportError("GitLab project identity changed during export. Rerun the export.")
+            for user_id in sorted(readers):
+                email = readers[user_id]
+                if email in emails and emails[email] != user_id:
+                    raise ExportError("Multiple GitLab users share an email. Resolve the identity conflict first.")
+                emails[email] = user_id
+                users[user_id] = email
+                yield project_path, user_id
+
+    write_export(output, grants(), users)
     print(f"Exported {len(users)} readers to {output}/users.csv and {output}/project-permissions.csv")
 
 
