@@ -18,6 +18,7 @@ import { getAsyncToolCall, upsertAsyncToolCall } from '@/lib/mothership/async-ru
 import {
   CLIENT_TOOL_RESULT_TIMEOUT_MS,
   COPILOT_WORKFLOW_TOOL_CLIENT_GRACE_MS,
+  COPILOT_WORKFLOW_TOOL_NO_VIEWER_GRACE_MS,
   DESKTOP_TOOL_PICKUP_GRACE_MS,
 } from '@/lib/mothership/constants'
 import {
@@ -237,6 +238,30 @@ function desktopClaimsLocalReads(
   desktopDeviceId: string | null
 ): boolean {
   return options?.desktopClaimsLocalReads === true || desktopDeviceId !== null
+}
+
+/**
+ * How long a workflow tool waits for a chat view to pick it up before the server runs it. The
+ * caller declared its executors at turn setup (ChatRequest.clientCapabilities): no pickup
+ * capability means no wait. With the capability, a turn no view is reading waits only for one
+ * that is re-attaching, and a view that attached by the end of that short wait (a reload) gets
+ * the rest of the full grace. The claim arbitration is the same either way.
+ */
+async function workflowToolPickupGrace(
+  options: OrchestratorOptions
+): Promise<{ graceMs: number; extendGrace?: () => Promise<number> }> {
+  if (options.clientToolPickupExpected === false) return { graceMs: 0 }
+  const hasClientViewer = options.hasClientViewer
+  if (!hasClientViewer) return { graceMs: COPILOT_WORKFLOW_TOOL_CLIENT_GRACE_MS }
+  const viewing = () => hasClientViewer().catch(() => true)
+  if (await viewing()) return { graceMs: COPILOT_WORKFLOW_TOOL_CLIENT_GRACE_MS }
+  return {
+    graceMs: COPILOT_WORKFLOW_TOOL_NO_VIEWER_GRACE_MS,
+    extendGrace: async () =>
+      (await viewing())
+        ? COPILOT_WORKFLOW_TOOL_CLIENT_GRACE_MS - COPILOT_WORKFLOW_TOOL_NO_VIEWER_GRACE_MS
+        : 0,
+  }
 }
 
 /**
@@ -1069,6 +1094,7 @@ async function dispatchToolExecution(
    */
   function waitForClientExecution(): Promise<AsyncCompletionSignal> {
     toolCall.status = 'executing'
+    const waitStartedAt = Date.now()
     const ownTimeoutMs = options.timeout || CLIENT_TOOL_RESULT_TIMEOUT_MS
     // Even past its deadline a wait lasts long enough to read a result the client already saved.
     const timeoutMs = Math.max(
@@ -1113,14 +1139,7 @@ async function dispatchToolExecution(
             workflowId: resolveWorkflowToolTargetId(args, execContext.workflowId),
             timeoutMs,
             deadlineAt: toolCall.deadlineAt,
-            // The caller declared its executors at turn setup (ChatRequest.clientCapabilities):
-            // no pickup capability → zero grace, the race resolves straight to the server
-            // claim. Same claim arbitration either way — the grace only encodes how long a
-            // client might plausibly appear.
-            graceMs:
-              options.clientToolPickupExpected === false
-                ? 0
-                : COPILOT_WORKFLOW_TOOL_CLIENT_GRACE_MS,
+            ...(await workflowToolPickupGrace(options)),
             ...(toolCall.waitTimeoutMs !== undefined
               ? { waitTimeoutMs: toolCall.waitTimeoutMs }
               : {}),
@@ -1198,6 +1217,12 @@ async function dispatchToolExecution(
         if (completion) {
           span.setAttribute(TraceAttr.ToolOutcome, completion.status)
         }
+        logger.info('Client tool execution settled', {
+          toolCallId,
+          toolName,
+          outcome: completion?.status ?? 'missing',
+          durationMs: Date.now() - waitStartedAt,
+        })
         const backgroundIsSuccess = toolName === 'run_workflow' && args?.async === true
         handleClientCompletion(context, toolCall, toolCallId, completion, backgroundIsSuccess)
         await emitSyntheticToolResult(
@@ -1213,6 +1238,7 @@ async function dispatchToolExecution(
       logger.error(`Client-executable ${scopeLabel}tool wait failed`, {
         toolCallId,
         toolName,
+        durationMs: Date.now() - waitStartedAt,
         error: toError(err).message,
       })
       return errorCompletion('Tool wait failed')
